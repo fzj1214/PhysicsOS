@@ -17,11 +17,7 @@ From a local checkout:
 pip install -e .
 ```
 
-With agent integrations:
-
-```bash
-pip install -e ".[agents]"
-```
+The default install includes the DeepAgents runtime, LangGraph, and the OpenAI-compatible model adapter, so `physicsos` can start the natural-language agent loop immediately after model credentials are configured.
 
 With Gmsh / meshio geometry tooling:
 
@@ -54,11 +50,7 @@ Local control commands are prefixed with `/`, for example `/paths`, `/login`, an
 The shell records user inputs, assistant outputs, and errors to a session file plus the global history file.
 Device-login tokens are stored under the user config directory, not in the repository.
 
-To enable the agent loop, install the agent extras and configure an OpenAI-compatible model:
-
-```bash
-pip install -e ".[agents]"
-```
+To enable model calls, configure an OpenAI-compatible model:
 
 ```powershell
 $env:PHYSICSOS_OPENAI_API_KEY="..."
