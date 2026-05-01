@@ -104,6 +104,16 @@ def _deepagents_model_params_args(argv: list[str]) -> list[str]:
 
 
 def _prepare_deepagents_env() -> None:
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
     if os.getenv("PHYSICSOS_OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = os.environ["PHYSICSOS_OPENAI_API_KEY"]
 

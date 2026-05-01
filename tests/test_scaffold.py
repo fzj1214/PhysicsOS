@@ -186,6 +186,8 @@ def test_cli_defaults_to_official_deepagents_cli(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PHYSICSOS_OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PHYSICSOS_OPENAI_BASE_URL", "https://api.tu-zi.com/v1")
     monkeypatch.setenv("PHYSICSOS_OPENAI_MODEL", "gpt-5.4")
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     with patch("deepagents_cli.cli_main", side_effect=fake_cli_main):
         assert _launch_deepagents_cli(["--message", "hello"]) == 0
@@ -194,8 +196,27 @@ def test_cli_defaults_to_official_deepagents_cli(monkeypatch, tmp_path) -> None:
     assert "--agent" in captured["argv"]
     assert "physicsos" in captured["argv"]
     assert __import__("os").environ["OPENAI_API_KEY"] == "test-key"
+    assert __import__("os").environ["PYTHONUTF8"] == "1"
+    assert __import__("os").environ["PYTHONIOENCODING"] == "utf-8"
     assert (tmp_path / ".deepagents" / "physicsos" / "AGENTS.md").exists()
     assert (tmp_path / ".deepagents" / "physicsos" / "agents" / "taps-agent" / "AGENTS.md").exists()
+
+
+def test_deepagents_env_keeps_explicit_python_encoding(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def fake_cli_main():
+        captured["argv"] = list(__import__("sys").argv)
+
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8:replace")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    with patch("deepagents_cli.cli_main", side_effect=fake_cli_main):
+        assert _launch_deepagents_cli(["--message", "hello"]) == 0
+
+    assert captured["argv"][0] == "deepagents"
+    assert __import__("os").environ["PYTHONUTF8"] == "0"
+    assert __import__("os").environ["PYTHONIOENCODING"] == "utf-8:replace"
 
 
 def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None:
