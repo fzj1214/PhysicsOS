@@ -1341,13 +1341,13 @@ triangle cell gradients -> sparse stiffness matrix -> Dirichlet Poisson solve
 Gmsh mesh -> mesh_graph encoding -> triangle P1/P2/P3 vector FEM-like linear-elasticity execution path
 constant-strain P1 / quadratic-cubic Lagrange P2-P3 triangle -> vector sparse stiffness matrix -> clamped-boundary displacement solve
 MaterialSpec -> TAPSCoefficientSpec -> backend material/source coefficients for elasticity
-Gmsh mesh -> mesh_graph encoding -> 2D first-order Nedelec EM curl-curl path
+Gmsh mesh -> mesh_graph encoding -> 2D first/second-order Nedelec EM curl-curl path
 edge DOFs + orientation signs -> H(curl) tangential continuity -> residual-checked EM edge-field artifact
-second-order Nedelec H(curl) scaffold -> two edge moment DOFs per edge + cell interior DOFs -> local curl-curl/mass assembly
+second-order Nedelec H(curl) executable scaffold -> two edge moment DOFs per edge + cell interior DOFs -> local curl-curl/mass assembly
 PhysicsProblem boundary_conditions -> TAPSBoundaryConditionSpec -> PEC/natural EM edge-boundary policy
 complex-valued EM coefficients -> `[real, imag]` JSON representation -> complex frequency-domain edge solve
 custom/robin EM boundary value dict -> absorbing impedance / port excitation -> boundary-edge Robin contribution
-mesh_graph boundary_edge_sets -> region_id-specific PEC / absorbing / port edge selection
+mesh_graph boundary_edge_sets -> region_id-specific PEC / absorbing / port edge selection -> matched high-order Nedelec boundary DOFs
 generated Gmsh physical groups -> meshio field_data/cell_data -> named boundary edge sets
 imported Gmsh .geo physical curves -> GeometrySpec boundaries + mesh_graph named boundary edge sets -> EM region-specific ports/walls
 mesh_graph physical_boundary_groups -> OpenFOAM patch / SU2 marker / FEniCSx facet-tag export hints
@@ -1768,6 +1768,7 @@ done: EM boundary-condition semantics for Nedelec edge DOFs: PEC tangential-zero
 done: complex-valued EM frequency-domain coefficient support with JSON `[real, imag]` artifacts and complex edge-field solve.
 done: EM absorbing/impedance/port boundary policies via structured boundary value dictionaries.
 done: region-specific EM boundary edge selection using mesh_graph `boundary_edge_sets` for bbox and Gmsh physical line groups.
+done: second-order Nedelec scaffold is wired into the executable EM curl-curl solve path with edge-moment/cell-interior DOFs and high-order boundary DOF selection.
 done: generated Gmsh rectangle physical groups propagate through meshio into named mesh_graph boundary edge sets.
 done: imported Gmsh `.geo` physical curve labels propagate into `GeometrySpec.boundaries`, `mesh_graph.boundary_edge_sets`, and EM port/wall edge selection.
 done: mesh_graph physical boundary metadata carries solver-native export hints for OpenFOAM patches, SU2 markers, and FEniCSx facet tags.
@@ -1777,7 +1778,7 @@ done: user-confirmed physical-group labeling artifacts separate weak suggestions
 done: standalone geometry labeler viewer tool can load boundary-labeling artifacts, rotate mesh/facet previews, select groups, and export confirmed labels without foamvm, database, or E2B.
 done: mesh conversion runner manifests can be prepared from backend mesh export manifests, inline source `.msh`, and dry-run/http submitted without local external conversion.
 done: foamvm/E2B runner dispatches `physicsos.mesh_conversion_job.v1` manifests, decodes inline `.msh`, writes boundary mapping artifacts, and runs approved converter commands inside E2B.
-next: promote second-order Nedelec scaffold into the executable EM solve path with high-order boundary DOF selection.
+next: extend the executable weak-form path beyond fixed PDE families by mapping weak-form IR terms onto reusable scalar/vector/H(curl) assembler blocks.
 ```
 
 PhysicsOS Cloud / foamvm scope:

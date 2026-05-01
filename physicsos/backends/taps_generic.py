@@ -291,6 +291,130 @@ def _em_boundary_edge_ids_for_policy(
     return selected
 
 
+def _graph_edge_tuples(graph: dict) -> list[tuple[int, int]]:
+    return [
+        (int(edge[0]), int(edge[1])) if int(edge[0]) < int(edge[1]) else (int(edge[1]), int(edge[0]))
+        for edge in graph.get("edges", [])
+        if isinstance(edge, list) and len(edge) >= 2
+    ]
+
+
+def _edge_tuples_for_boundary_region(
+    graph: dict,
+    geometric_edges: list[tuple[int, int]],
+    boundary_nodes: set[int],
+    region_id: str,
+) -> set[tuple[int, int]]:
+    graph_edges = _graph_edge_tuples(graph)
+    boundary_edge_sets = graph.get("boundary_edge_sets", {})
+    candidates = [
+        region_id,
+        region_id.replace("region:", "boundary:"),
+        region_id.replace("boundary:", ""),
+    ]
+    for candidate in candidates:
+        if candidate in boundary_edge_sets:
+            selected: set[tuple[int, int]] = set()
+            for edge_id in boundary_edge_sets[candidate]:
+                index = int(edge_id)
+                if 0 <= index < len(graph_edges):
+                    selected.add(graph_edges[index])
+            boundary_node_sets = graph.get("boundary_node_sets", {})
+            if candidate in boundary_node_sets:
+                node_set = {int(node) for node in boundary_node_sets[candidate]}
+                selected.update(edge for edge in geometric_edges if edge[0] in node_set and edge[1] in node_set)
+            return selected
+    if region_id in {"boundary", "all_boundaries", "external_boundary"}:
+        return {edge for edge in geometric_edges if edge[0] in boundary_nodes and edge[1] in boundary_nodes}
+    if region_id in {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}:
+        return {
+            graph_edges[int(edge_id)]
+            for edge_id in boundary_edge_sets.get(region_id, [])
+            if 0 <= int(edge_id) < len(graph_edges)
+        }
+    return {edge for edge in geometric_edges if edge[0] in boundary_nodes and edge[1] in boundary_nodes}
+
+
+def _em_boundary_edge_tuples_for_policy(
+    problem: TAPSProblem,
+    graph: dict,
+    geometric_edges: list[tuple[int, int]],
+    boundary_nodes: set[int],
+    policy: str,
+) -> set[tuple[int, int]]:
+    if not problem.boundary_conditions:
+        return {edge for edge in geometric_edges if edge[0] in boundary_nodes and edge[1] in boundary_nodes}
+    selected: set[tuple[int, int]] = set()
+    for boundary in problem.boundary_conditions:
+        field = boundary.field.lower()
+        if field not in {"e", "e_t", "et", "tangential_e", "electric_field"}:
+            continue
+        kind = boundary.kind.lower()
+        value_kind = boundary.value.get("kind", "").lower() if isinstance(boundary.value, dict) else ""
+        include = False
+        if policy.startswith("pec") and kind == "dirichlet" and _is_zero_boundary_value(boundary.value):
+            include = True
+        elif policy in {"absorbing", "impedance", "port"} and (value_kind == policy or kind in {"robin", "custom"}):
+            include = True
+        if include:
+            selected.update(_edge_tuples_for_boundary_region(graph, geometric_edges, boundary_nodes, boundary.region_id))
+    return selected
+
+
+def _nedelec_geometric_edges(dof_entities: list) -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for entity in dof_entities:
+        edge: tuple[int, int] | None = None
+        if isinstance(entity, tuple) and len(entity) >= 2:
+            edge = (int(entity[0]), int(entity[1]))
+        elif isinstance(entity, dict) and entity.get("kind") == "edge_moment" and isinstance(entity.get("edge"), list):
+            raw_edge = entity["edge"]
+            edge = (int(raw_edge[0]), int(raw_edge[1]))
+        if edge is None:
+            continue
+        edge = edge if edge[0] < edge[1] else (edge[1], edge[0])
+        if edge not in seen:
+            seen.add(edge)
+            edges.append(edge)
+    return edges
+
+
+def _nedelec_dof_ids_for_edges(dof_entities: list, selected_edges: set[tuple[int, int]]) -> set[int]:
+    selected = {edge if edge[0] < edge[1] else (edge[1], edge[0]) for edge in selected_edges}
+    dof_ids: set[int] = set()
+    for index, entity in enumerate(dof_entities):
+        edge: tuple[int, int] | None = None
+        if isinstance(entity, tuple) and len(entity) >= 2:
+            edge = (int(entity[0]), int(entity[1]))
+        elif isinstance(entity, dict) and entity.get("kind") == "edge_moment" and isinstance(entity.get("edge"), list):
+            raw_edge = entity["edge"]
+            edge = (int(raw_edge[0]), int(raw_edge[1]))
+        if edge is None:
+            continue
+        edge = edge if edge[0] < edge[1] else (edge[1], edge[0])
+        if edge in selected:
+            dof_ids.add(index)
+    return dof_ids
+
+
+def _nedelec_edges_for_dof_ids(dof_entities: list, dof_ids: set[int]) -> set[tuple[int, int]]:
+    edges: set[tuple[int, int]] = set()
+    for index, entity in enumerate(dof_entities):
+        if index not in dof_ids:
+            continue
+        edge: tuple[int, int] | None = None
+        if isinstance(entity, tuple) and len(entity) >= 2:
+            edge = (int(entity[0]), int(entity[1]))
+        elif isinstance(entity, dict) and entity.get("kind") == "edge_moment" and isinstance(entity.get("edge"), list):
+            raw_edge = entity["edge"]
+            edge = (int(raw_edge[0]), int(raw_edge[1]))
+        if edge is None:
+            continue
+        edges.add(edge if edge[0] < edge[1] else (edge[1], edge[0]))
+    return edges
+
+
 def _family(problem: TAPSProblem) -> str:
     if problem.weak_form is not None:
         return problem.weak_form.family.lower()
@@ -1765,62 +1889,101 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     curl_weight = 1.0 / (mu_r if abs(mu_r) > 1e-12 else 1e-12)
     mass_weight = wave_number * wave_number * eps_r
 
-    stiffness, edge_list, total_area, element_records = _assemble_triangle_nedelec_curl_curl(
+    stiffness, dof_entities, total_area, element_records = _assemble_triangle_nedelec_curl_curl(
         points,
         triangles,
         curl_weight=curl_weight,
         mass_weight=mass_weight,
     )
+    basis_order = 2 if any("order2" in str(element.get("basis", "")) for element in element_records) else 1
+    geometric_edges = _nedelec_geometric_edges(dof_entities)
     boundary_nodes = set(int(node) for node in graph.get("boundary_nodes", []))
     boundary_policy = _em_tangential_boundary_policy(taps_problem)
     boundary_parameters = _em_boundary_parameters(taps_problem)
+    active_boundary_edge_tuples = _em_boundary_edge_tuples_for_policy(taps_problem, graph, geometric_edges, boundary_nodes, boundary_policy)
+    active_boundary_dofs = _nedelec_dof_ids_for_edges(dof_entities, active_boundary_edge_tuples)
+    active_boundary_geometric_edges = _nedelec_edges_for_dof_ids(dof_entities, active_boundary_dofs)
+    active_boundary_edges = _em_boundary_edge_ids_for_policy(taps_problem, graph, geometric_edges, boundary_nodes, boundary_policy)
     if boundary_policy.startswith("pec"):
-        boundary_edges = _em_boundary_edge_ids_for_policy(taps_problem, graph, edge_list, boundary_nodes, boundary_policy)
+        boundary_dofs = active_boundary_dofs
     else:
-        boundary_edges = set()
-    active_boundary_edges = _em_boundary_edge_ids_for_policy(taps_problem, graph, edge_list, boundary_nodes, boundary_policy)
-    rhs = [0.0j if is_complex_frequency_domain else 0.0 for _ in edge_list]
-    for edge_id, (a, b) in enumerate(edge_list):
-        if edge_id in boundary_edges:
+        boundary_dofs = set()
+    rhs = [0.0j if is_complex_frequency_domain else 0.0 for _ in dof_entities]
+    for dof_id, dof_entity in enumerate(dof_entities):
+        if dof_id in boundary_dofs:
+            continue
+        if isinstance(dof_entity, tuple) and len(dof_entity) >= 2:
+            a, b = int(dof_entity[0]), int(dof_entity[1])
+            moment_scale = 1.0
+        elif isinstance(dof_entity, dict) and dof_entity.get("kind") == "edge_moment":
+            raw_edge = dof_entity.get("edge", [0, 0])
+            a, b = int(raw_edge[0]), int(raw_edge[1])
+            moment_scale = 1.0 / float(int(dof_entity.get("moment", 0)) + 1)
+        elif isinstance(dof_entity, dict) and dof_entity.get("kind") == "cell_interior":
+            raw_vertices = dof_entity.get("vertices", [0, 0, 0])
+            coords = [points[int(node)] for node in raw_vertices[:3]]
+            midpoint_x = sum(float(point[0]) for point in coords) / 3.0
+            midpoint_y = sum(float(point[1]) for point in coords) / 3.0
+            rhs[dof_id] = 0.1 * source_amplitude * math.sin(math.pi * midpoint_x) * math.sin(math.pi * midpoint_y)
+            continue
+        else:
             continue
         ax, ay = float(points[a][0]), float(points[a][1])
         bx, by = float(points[b][0]), float(points[b][1])
         length = math.sqrt((bx - ax) ** 2 + (by - ay) ** 2)
         midpoint_x = 0.5 * (ax + bx)
         midpoint_y = 0.5 * (ay + by)
-        rhs[edge_id] = source_amplitude * length * math.sin(math.pi * midpoint_x) * math.sin(math.pi * midpoint_y)
-        if boundary_policy in {"absorbing", "impedance", "port"} and edge_id in active_boundary_edges:
+        rhs[dof_id] = moment_scale * source_amplitude * length * math.sin(math.pi * midpoint_x) * math.sin(math.pi * midpoint_y)
+        if boundary_policy in {"absorbing", "impedance", "port"} and dof_id in active_boundary_dofs:
             impedance = boundary_parameters["impedance"] if abs(boundary_parameters["impedance"]) > 0.0 else 1.0 + 0.0j
-            stiffness[edge_id][edge_id] = stiffness[edge_id].get(edge_id, 0.0) + impedance * length
+            stiffness[dof_id][dof_id] = stiffness[dof_id].get(dof_id, 0.0) + impedance * length
             if boundary_policy == "port":
-                rhs[edge_id] += boundary_parameters["port_amplitude"] * length
+                rhs[dof_id] += moment_scale * boundary_parameters["port_amplitude"] * length
                 is_complex_frequency_domain = is_complex_frequency_domain or abs(boundary_parameters["port_amplitude"].imag) > 1e-14
             is_complex_frequency_domain = is_complex_frequency_domain or abs(impedance.imag) > 1e-14
     if is_complex_frequency_domain:
         complex_stiffness = [{col: complex(value) for col, value in row.items()} for row in stiffness]
         complex_rhs = [complex(value) for value in rhs]
-        solution, history = _dense_complex_solve(complex_stiffness, complex_rhs, boundary_edges)
-        final_residual = _complex_sparse_residual_norm(complex_stiffness, complex_rhs, solution, boundary_edges)
+        solution, history = _dense_complex_solve(complex_stiffness, complex_rhs, boundary_dofs)
+        final_residual = _complex_sparse_residual_norm(complex_stiffness, complex_rhs, solution, boundary_dofs)
     else:
         real_stiffness = [{col: float(value.real if isinstance(value, complex) else value) for col, value in row.items()} for row in stiffness]
         real_rhs = [float(value.real if isinstance(value, complex) else value) for value in rhs]
-        solution, history = _cg_sparse_solve(real_stiffness, real_rhs, boundary_edges, max_iterations=5000, tolerance=1e-8)
-        final_residual = _sparse_residual_norm(real_stiffness, real_rhs, solution, boundary_edges)
+        solution, history = _cg_sparse_solve(real_stiffness, real_rhs, boundary_dofs, max_iterations=5000, tolerance=1e-8)
+        final_residual = _sparse_residual_norm(real_stiffness, real_rhs, solution, boundary_dofs)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
     converged = final_residual < 1e-8 or final_update < 1e-10
 
     nonzero_entries = sum(len(row) for row in stiffness)
+    edge_dof_count = sum(
+        1 for entity in dof_entities if isinstance(entity, tuple) or (isinstance(entity, dict) and entity.get("kind") == "edge_moment")
+    )
+    cell_interior_dof_count = sum(1 for entity in dof_entities if isinstance(entity, dict) and entity.get("kind") == "cell_interior")
+    boundary_edge_tuples = {
+        tuple(entity["edge"])
+        for index, entity in enumerate(dof_entities)
+        if index in boundary_dofs and isinstance(entity, dict) and entity.get("kind") == "edge_moment"
+    }
+    dof_payload = [
+        {"kind": "edge", "edge": [int(entity[0]), int(entity[1])]} if isinstance(entity, tuple) else entity
+        for entity in dof_entities
+    ]
     operator_payload = {
-        "type": "triangle_nedelec_order1_em_curl_curl",
-        "basis_order": 1,
+        "type": f"triangle_nedelec_order{basis_order}_em_curl_curl",
+        "basis_order": basis_order,
         "assembly": "nedelec_first_kind_edge_element_hcurl",
         "operator": "int mu^-1 curl(v) curl(E) dOmega + int k0^2 eps v dot E dOmega = int v dot J dOmega",
         "source_mesh": graph.get("source_mesh"),
         "node_count": len(points),
-        "edge_dof_count": len(edge_list),
+        "dof_count": len(dof_entities),
+        "edge_dof_count": edge_dof_count,
+        "cell_interior_dof_count": cell_interior_dof_count,
         "triangle_count": len(triangles),
-        "boundary_edge_count": len(boundary_edges),
+        "boundary_edge_count": len(boundary_dofs) if basis_order == 1 else len(boundary_edge_tuples),
+        "boundary_dof_count": len(boundary_dofs),
         "active_boundary_edge_count": len(active_boundary_edges),
+        "active_boundary_geometric_edge_count": len(active_boundary_geometric_edges),
+        "active_boundary_dof_count": len(active_boundary_dofs),
         "total_area": total_area,
         "nonzero_entries": nonzero_entries,
         "material": {
@@ -1833,14 +1996,18 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
             "complex_frequency_domain": is_complex_frequency_domain,
         },
         "hcurl_scaffold": {
-            "status": "nedelec_order1_edge_element",
+            "status": "nedelec_order1_edge_element" if basis_order == 1 else "nedelec_order2_hierarchical_scaffold",
             "tangential_continuity": "global edge DOFs with orientation signs",
             "boundary_condition": boundary_policy,
             "edge_dofs_required": True,
+            "high_order_boundary_dofs": basis_order > 1,
         },
-        "edges": [[a, b] for a, b in edge_list],
-        "boundary_edges": sorted(boundary_edges),
+        "edges": [[a, b] for a, b in geometric_edges],
+        "dofs": dof_payload,
+        "boundary_dofs": sorted(boundary_dofs),
         "active_boundary_edges": sorted(active_boundary_edges),
+        "active_boundary_geometric_edges": [[a, b] for a, b in sorted(active_boundary_geometric_edges)],
+        "active_boundary_dofs": sorted(active_boundary_dofs),
         "elements": element_records,
         "stiffness_rows": _json_sparse_rows(stiffness),
         "rhs": _json_vector(rhs),
@@ -1848,9 +2015,10 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     solution_payload = {
         "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "E",
         "field_kind": "hcurl_edge_field",
-        "components": ["tangential_edge_dof"],
+        "components": ["tangential_edge_dof"] if basis_order == 1 else ["hcurl_dof"],
         "points": points,
-        "edges": [[a, b] for a, b in edge_list],
+        "edges": [[a, b] for a, b in geometric_edges],
+        "dofs": dof_payload,
         "values": _json_vector(solution),
     }
     residual_payload = {
@@ -1879,10 +2047,11 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
                 "normalized_fem_residual": final_residual,
                 "relative_update": final_update,
                 "fem_nodes": float(len(points)),
-                "fem_edge_dofs": float(len(edge_list)),
+                "fem_edge_dofs": float(edge_dof_count),
+                "fem_dofs": float(len(dof_entities)),
                 "fem_triangles": float(len(triangles)),
                 "fem_nonzeros": float(nonzero_entries),
-                "fem_basis_order": 1.0,
+                "fem_basis_order": float(basis_order),
             },
             rank=taps_problem.basis.tensor_rank,
             converged=converged,

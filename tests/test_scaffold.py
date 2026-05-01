@@ -971,6 +971,148 @@ def test_mesh_graph_taps_solves_em_curl_curl_nedelec() -> None:
     assert operator_payload["hcurl_scaffold"]["boundary_condition"] == "pec_tangential_zero"
 
 
+def test_mesh_graph_taps_solves_em_curl_curl_nedelec_order2() -> None:
+    geometry = GeometrySpec(id="geometry:mesh-em-p2-square", source=GeometrySource(kind="generated"), dimension=2)
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["electromagnetic"]),
+            mesh_policy=MeshPolicy(target_element_size=0.55, element_order=2),
+            target_backends=["taps"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    geometry.encodings.extend(encoding_output.encodings)
+    problem = PhysicsProblem(
+        id="problem:mesh-em-p2-curl-curl-2d",
+        user_intent={"raw_request": "solve a second-order 2D electromagnetic curl-curl problem on a square mesh"},
+        domain="electromagnetic",
+        geometry=geometry,
+        mesh=mesh,
+        fields=[FieldSpec(name="E", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:maxwell",
+                name="Maxwell curl-curl",
+                domain="electromagnetic",
+                equation_class="maxwell",
+                form="weak",
+                fields_out=["E"],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:air-p2",
+                name="air",
+                phase="gas",
+                properties=[
+                    MaterialProperty(name="relative_permittivity", value=1.0),
+                    MaterialProperty(name="relative_permeability", value=1.0),
+                    MaterialProperty(name="wave_number", value=0.4),
+                    MaterialProperty(name="current_source", value=0.25),
+                ],
+            )
+        ],
+        boundary_conditions=[{"id": "bc:e", "region_id": "boundary", "field": "E_t", "kind": "dirichlet", "value": 0.0}],
+        targets=[{"name": "field", "field": "E", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.residuals["fem_basis_order"] == 2.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["type"] == "triangle_nedelec_order2_em_curl_curl"
+    assert operator_payload["basis_order"] == 2
+    assert operator_payload["hcurl_scaffold"]["status"] == "nedelec_order2_hierarchical_scaffold"
+    assert operator_payload["hcurl_scaffold"]["high_order_boundary_dofs"] is True
+    assert operator_payload["dof_count"] > operator_payload["edge_dof_count"] > 0
+    assert operator_payload["cell_interior_dof_count"] > 0
+    assert operator_payload["boundary_dof_count"] >= 2 * operator_payload["boundary_edge_count"]
+    assert any(element["basis"] == "nedelec_first_kind_order2_hierarchical_scaffold_triangle" for element in operator_payload["elements"])
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    assert len(solution_payload["values"]) == operator_payload["dof_count"]
+
+
+def test_mesh_graph_taps_em_order2_boundary_policy_selects_high_order_dofs() -> None:
+    geometry = GeometrySpec(id="geometry:mesh-em-p2-port-xmin-square", source=GeometrySource(kind="generated"), dimension=2)
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["electromagnetic"]),
+            mesh_policy=MeshPolicy(target_element_size=0.6, element_order=2),
+            target_backends=["taps"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    graph_payload = json.loads(open(encoding_output.artifacts[0].uri, encoding="utf-8").read())
+    assert graph_payload["boundary_edge_sets"]["boundary:x_min"]
+    geometry.encodings.extend(encoding_output.encodings)
+    problem = PhysicsProblem(
+        id="problem:mesh-em-p2-port-xmin-curl-curl-2d",
+        user_intent={"raw_request": "solve a second-order curl-curl EM problem with a port only on x_min"},
+        domain="electromagnetic",
+        geometry=geometry,
+        mesh=mesh,
+        fields=[FieldSpec(name="E", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:maxwell",
+                name="Maxwell curl-curl",
+                domain="electromagnetic",
+                equation_class="maxwell",
+                form="weak",
+                fields_out=["E"],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:air-p2-port-xmin",
+                name="air",
+                phase="gas",
+                properties=[
+                    MaterialProperty(name="relative_permittivity", value=1.0),
+                    MaterialProperty(name="relative_permeability", value=1.0),
+                    MaterialProperty(name="wave_number", value=0.5),
+                    MaterialProperty(name="current_source", value=0.0),
+                ],
+            )
+        ],
+        boundary_conditions=[
+            {
+                "id": "bc:p2-port-xmin",
+                "region_id": "boundary:x_min",
+                "field": "E_t",
+                "kind": "custom",
+                "value": {"kind": "port", "impedance": 1.0, "amplitude": 1.0},
+            }
+        ],
+        targets=[{"name": "field", "field": "E", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["basis_order"] == 2
+    assert operator_payload["hcurl_scaffold"]["boundary_condition"] == "port"
+    assert operator_payload["active_boundary_edges"] == graph_payload["boundary_edge_sets"]["boundary:x_min"]
+    assert operator_payload["active_boundary_geometric_edge_count"] == 1
+    assert operator_payload["active_boundary_dof_count"] == 2 * operator_payload["active_boundary_geometric_edge_count"]
+    assert operator_payload["active_boundary_edge_count"] >= operator_payload["active_boundary_geometric_edge_count"]
+    active_dof_entities = [operator_payload["dofs"][index] for index in operator_payload["active_boundary_dofs"]]
+    assert all(entity["kind"] == "edge_moment" for entity in active_dof_entities)
+
+
 def test_mesh_graph_taps_em_curl_curl_supports_natural_boundary_policy() -> None:
     geometry = GeometrySpec(id="geometry:mesh-em-natural-square", source=GeometrySource(kind="generated"), dimension=2)
     mesh = generate_mesh(
