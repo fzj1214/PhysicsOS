@@ -170,9 +170,10 @@ def test_cli_without_args_starts_interactive_welcome(capsys) -> None:
     with patch("builtins.input", side_effect=["exit"]):
         assert cli_main([]) == 0
     output = capsys.readouterr().out
-    assert BANNER.count("____  _") == 2
+    assert BANNER == "PhysicsOS\nPhysicsOS"
+    assert output.count("PhysicsOS") >= 2
     assert "TAPS-first physics simulation agent" in output
-    assert "Commands:" in output
+    assert "Commands" in output
     assert "paths" in output
 
 
@@ -306,6 +307,20 @@ def test_deepagents_runtime_kwargs_can_be_built_without_optional_deps() -> None:
     )
     assert kwargs["name"] == "physicsos-main"
     assert "interrupt_on" in kwargs
+
+
+def test_deepagents_runtime_uses_backend_factory() -> None:
+    pytest.importorskip("deepagents")
+    kwargs = build_runtime_kwargs(
+        DeepAgentsRuntimeConfig(
+            enable_filesystem_backend=True,
+            enable_memory_store=False,
+            enable_checkpointer=False,
+        )
+    )
+    assert callable(kwargs["backend"])
+    backend = kwargs["backend"](object())
+    assert backend is not None
 
 
 def test_deepagents_graph_can_be_created_with_model_object() -> None:

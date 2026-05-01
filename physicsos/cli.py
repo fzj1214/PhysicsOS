@@ -13,25 +13,19 @@ from physicsos.agents.openai_compatible import create_openai_compatible_model
 from physicsos.config import runtime_paths
 
 
-BANNER = r"""
-  ____  _               _          ___  ____
- |  _ \| |__  _   _ ___(_) ___ ___/ _ \/ ___|
- | |_) | '_ \| | | / __| |/ __/ __| | | \___ \
- |  __/| | | | |_| \__ \ | (__\__ \ |_| |___) |
- |_|   |_| |_|\__, |___/_|\___|___/\___/|____/
-              |___/
-
-  ____  _               _          ___  ____
- |  _ \| |__  _   _ ___(_) ___ ___/ _ \/ ___|
- | |_) | '_ \| | | / __| |/ __/ __| | | \___ \
- |  __/| | | | |_| \__ \ | (__\__ \ |_| |___) |
- |_|   |_| |_|\__, |___/_|\___|___/\___/|____/
-              |___/
-"""
+BANNER = "PhysicsOS\nPhysicsOS"
 
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _rich_console():
+    try:
+        from rich.console import Console
+    except ImportError:
+        return None
+    return Console()
 
 
 def _append_jsonl(path: Path, payload: dict[str, object]) -> None:
@@ -70,6 +64,43 @@ def _paths_payload() -> dict[str, str]:
 
 def _print_welcome() -> None:
     paths = runtime_paths()
+    console = _rich_console()
+    if console is not None:
+        from rich import box
+        from rich.align import Align
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        title = Text()
+        title.append("PhysicsOS\n", style="bold cyan")
+        title.append("PhysicsOS", style="bold white")
+        console.print(
+            Panel(
+                Align.center(title),
+                subtitle="TAPS-first physics simulation agent",
+                border_style="cyan",
+                box=box.DOUBLE,
+            )
+        )
+        console.print(f"[dim]Home:[/]      {paths.home}")
+        console.print(f"[dim]Workspace:[/] {paths.workspace}")
+        table = Table(title="Commands", box=box.SIMPLE_HEAVY, show_lines=False)
+        table.add_column("Input", style="cyan", no_wrap=True)
+        table.add_column("Action")
+        table.add_row("<natural language>", "Chat with the PhysicsOS DeepAgents orchestrator")
+        table.add_row("/help", "Show commands")
+        table.add_row("/paths", "Show runtime storage paths")
+        table.add_row("/login", "Device-code login to PhysicsOS Cloud")
+        table.add_row("/account", "Show cloud account")
+        table.add_row("/submit <manifest.json>", "Submit runner manifest")
+        table.add_row("/status <job_id>", "Show cloud job status")
+        table.add_row("/logs <job_id>", "Show cloud job logs")
+        table.add_row("/artifacts <job_id>", "Show cloud job artifacts")
+        table.add_row("/exit", "Quit")
+        console.print(table)
+        return
+
     print(BANNER)
     print("TAPS-first physics simulation agent")
     print(f"Home:      {paths.home}")

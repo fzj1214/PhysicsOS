@@ -10,6 +10,7 @@ dependencies = [
   "deepagents",
   "langgraph",
   "langchain-openai",
+  "rich>=13.7",
 ]
 keywords = ["physics", "simulation", "pde", "fem", "agents", "neural-operator"]
 classifiers = [
