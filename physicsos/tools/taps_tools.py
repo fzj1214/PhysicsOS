@@ -14,6 +14,7 @@ from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_2
 from physicsos.backends.taps_generic import solve_scalar_elliptic_1d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_2d
 from physicsos.backends.taps_generic import supports_hcurl_curl_curl_weak_form
+from physicsos.backends.taps_generic import supports_nonlinear_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_scalar_elliptic_weak_form
 from physicsos.backends.taps_generic import supports_vector_elasticity_weak_form
 from physicsos.backends.taps_thermal import solve_transient_heat_1d
@@ -568,6 +569,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     field_count = len(input.taps_problem.weak_form.trial_fields) if input.taps_problem.weak_form is not None else 0
     has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in input.taps_problem.geometry_encodings)
     is_hcurl_curl_curl_ir = supports_hcurl_curl_curl_weak_form(input.taps_problem)
+    is_nonlinear_reaction_diffusion_ir = supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem)
     is_scalar_elliptic_ir = supports_scalar_elliptic_weak_form(input.taps_problem)
     is_vector_elasticity_ir = supports_vector_elasticity_weak_form(input.taps_problem)
     if (family in {"maxwell", "curl_curl", "electromagnetic"} or is_hcurl_curl_curl_ir) and has_mesh_graph:
@@ -679,7 +681,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
-    if family == "reaction_diffusion" and space_axis_count == 1:
+    if (family == "reaction_diffusion" or is_nonlinear_reaction_diffusion_ir) and space_axis_count == 1:
         artifacts, residual_report = solve_reaction_diffusion_nonlinear_1d(input.taps_problem)
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
@@ -690,11 +692,12 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         result = SolverResult(
             id=f"result:{input.taps_problem.id}",
             problem_id=input.problem.id,
-            backend="taps:nonlinear_reaction_diffusion_1d",
+            backend="taps:nonlinear_reaction_diffusion_1d" if family == "reaction_diffusion" else f"taps:weak_ir_nonlinear_reaction_diffusion_1d:{family}",
             status="success" if residual_report.converged else "needs_review",
             scalar_outputs={
                 "message": "Nonlinear TAPS 1D reaction-diffusion Picard kernel executed.",
                 "equation_family": family,
+                "weak_form_ir_blocks": is_nonlinear_reaction_diffusion_ir,
                 "tensor_rank": residual_report.rank,
                 **residual_report.residuals,
             },
@@ -704,7 +707,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
-    if family == "reaction_diffusion" and space_axis_count == 2:
+    if (family == "reaction_diffusion" or is_nonlinear_reaction_diffusion_ir) and space_axis_count == 2:
         artifacts, residual_report = solve_reaction_diffusion_nonlinear_2d(input.taps_problem)
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
@@ -715,11 +718,12 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         result = SolverResult(
             id=f"result:{input.taps_problem.id}",
             problem_id=input.problem.id,
-            backend="taps:nonlinear_reaction_diffusion_2d",
+            backend="taps:nonlinear_reaction_diffusion_2d" if family == "reaction_diffusion" else f"taps:weak_ir_nonlinear_reaction_diffusion_2d:{family}",
             status="success" if residual_report.converged else "needs_review",
             scalar_outputs={
                 "message": "Nonlinear TAPS 2D reaction-diffusion fixed-point kernel executed.",
                 "equation_family": family,
+                "weak_form_ir_blocks": is_nonlinear_reaction_diffusion_ir,
                 "tensor_rank": residual_report.rank,
                 **residual_report.residuals,
             },

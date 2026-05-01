@@ -601,6 +601,50 @@ def test_taps_nonlinear_reaction_diffusion_executes_1d() -> None:
     }
 
 
+def test_taps_executes_custom_nonlinear_reaction_diffusion_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-rd-line", source=GeometrySource(kind="generated"), dimension=1)
+    problem = PhysicsProblem(
+        id="problem:custom-nonlinear-rd-1d",
+        user_intent={"raw_request": "solve a custom scalar nonlinear reaction diffusion weak form"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-rd",
+                name="Custom nonlinear reaction diffusion",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["u"],
+                differential_terms=[
+                    {"expression": "int_Omega grad(v) dot D grad(u) dOmega", "order": 2, "fields": ["u"]},
+                    {"expression": "- int_Omega v R(u) dOmega with nonlinear cubic u^3 reaction", "order": 0, "fields": ["u"]},
+                ],
+                source_terms=[{"expression": "int_Omega v f dOmega"}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:custom-rd", name="custom rd", phase="solid", properties=[MaterialProperty(name="D", value=1.0)])],
+        boundary_conditions=[
+            {"id": "bc:left", "region_id": "x=0", "field": "u", "kind": "dirichlet", "value": 0.0},
+            {"id": "bc:right", "region_id": "x=1", "field": "u", "kind": "dirichlet", "value": 0.0},
+        ],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_nonlinear_reaction_diffusion_1d:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    assert "normalized_nonlinear_residual" in result.residuals
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_nonlinear_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["weak_form_blocks"]["operator_family"] == "nonlinear_reaction_diffusion"
+    assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"diffusion", "nonlinear_reaction", "source"}
+
+
 def test_taps_nonlinear_reaction_diffusion_executes_2d() -> None:
     geometry = GeometrySpec(id="geometry:square-rd", source=GeometrySource(kind="generated"), dimension=2)
     problem = PhysicsProblem(

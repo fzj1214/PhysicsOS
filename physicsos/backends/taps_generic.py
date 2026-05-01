@@ -570,6 +570,58 @@ def supports_hcurl_curl_curl_weak_form(problem: TAPSProblem) -> bool:
     return _weak_form_hcurl_curl_curl_blocks(problem) is not None
 
 
+def _weak_form_nonlinear_reaction_diffusion_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) != 1:
+        return None
+    blocks: list[dict[str, str]] = []
+    has_diffusion = False
+    has_nonlinear_reaction = False
+    has_source = False
+    allowed_roles = {"diffusion", "reaction", "source", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_diffusion = role == "diffusion" or any(token in expression for token in ("grad(", "nabla", "laplacian"))
+        is_nonlinear_reaction = role == "reaction" and any(
+            token in expression for token in ("u^2", "u^3", "u*u", "u**", "cubic", "nonlinear", "r(u", "reaction")
+        )
+        if role == "custom":
+            is_nonlinear_reaction = is_nonlinear_reaction or any(
+                token in expression for token in ("u^2", "u^3", "u*u", "u**", "cubic", "nonlinear", "r(u")
+            )
+        is_source = role == "source" or any(token in expression for token in ("source", " rhs", " f ", "v f", "v*f"))
+        if role == "custom" and not (is_diffusion or is_nonlinear_reaction or is_source):
+            return None
+        if is_diffusion:
+            has_diffusion = True
+            blocks.append({"role": "diffusion", "term_id": term.id, "expression": term.expression})
+        if is_nonlinear_reaction:
+            has_nonlinear_reaction = True
+            blocks.append({"role": "nonlinear_reaction", "term_id": term.id, "expression": term.expression})
+        if is_source:
+            has_source = True
+            blocks.append({"role": "source", "term_id": term.id, "expression": term.expression})
+    if not (has_diffusion and has_nonlinear_reaction):
+        return None
+    return {
+        "operator_family": "nonlinear_reaction_diffusion",
+        "source": "weak_form_ir",
+        "blocks": blocks,
+        "has_diffusion": has_diffusion,
+        "has_nonlinear_reaction": has_nonlinear_reaction,
+        "has_source": has_source,
+    }
+
+
+def supports_nonlinear_reaction_diffusion_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_nonlinear_reaction_diffusion_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):
@@ -2421,6 +2473,7 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
     Model:
         -D u'' + beta u + gamma u^3 = f
     """
+    weak_form_blocks = _weak_form_nonlinear_reaction_diffusion_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
     axes = _space_axes(taps_problem)
@@ -2467,6 +2520,7 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
     operator_payload = {
         "type": "nonlinear_reaction_diffusion_1d",
         "operator": "-D u'' + beta u + gamma u^3 = f",
+        "weak_form_blocks": weak_form_blocks,
         "axis": {"name": axes[0], "values": x},
         "coefficients": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
         "source_modes": [{"mode": mode, "coefficient": coefficient} for mode, coefficient in source_modes],
@@ -2480,6 +2534,7 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
     }
     residual_payload = {
         "family": "reaction_diffusion",
+        "weak_form_blocks": weak_form_blocks,
         "normalized_nonlinear_residual": final_residual,
         "relative_update": final_update,
         "iterations": len(history),
@@ -2679,6 +2734,7 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
 
 def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a scalar 2D nonlinear reaction-diffusion model with damped fixed-point sweeps."""
+    weak_form_blocks = _weak_form_nonlinear_reaction_diffusion_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
     axes = _space_axes(taps_problem)
@@ -2747,6 +2803,7 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
     operator_payload = {
         "type": "nonlinear_reaction_diffusion_2d",
         "operator": "-D (d2u/dx2 + d2u/dy2) + beta u + gamma u^3 = f",
+        "weak_form_blocks": weak_form_blocks,
         "axes": {axes[0]: x, axes[1]: y},
         "coefficients": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
         "source_modes": [{"x_mode": mx, "y_mode": my, "coefficient": coefficient} for mx, my, coefficient in modes],
@@ -2761,6 +2818,7 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
     }
     residual_payload = {
         "family": "reaction_diffusion",
+        "weak_form_blocks": weak_form_blocks,
         "normalized_nonlinear_residual": final_residual,
         "relative_update": final_update,
         "iterations": len(history),
