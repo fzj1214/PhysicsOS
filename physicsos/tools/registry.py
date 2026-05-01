@@ -39,7 +39,7 @@ from physicsos.tools.surrogate_tools import (
     route_surrogate_model,
     run_surrogate_inference,
 )
-from physicsos.tools.taps_tools import author_taps_runtime_extension, build_taps_problem, estimate_taps_residual, estimate_taps_support, export_taps_backend_bridge, formulate_taps_equation, plan_taps_adaptive_fallback, run_taps_backend, validate_taps_ir
+from physicsos.tools.taps_tools import author_taps_runtime_extension, build_taps_problem, estimate_taps_residual, estimate_taps_support, export_taps_backend_bridge, formulate_taps_equation, plan_taps_adaptive_fallback, prepare_taps_backend_case_bundle, run_taps_backend, validate_taps_ir
 from physicsos.tools.verification_tools import check_conservation_laws, compute_physics_residuals, detect_ood_case, estimate_uncertainty, validate_selected_slices
 
 
@@ -82,6 +82,7 @@ PHYSICSOS_TOOLS = [
     validate_taps_ir,
     export_taps_backend_bridge,
     plan_taps_adaptive_fallback,
+    prepare_taps_backend_case_bundle,
     author_taps_runtime_extension,
     run_taps_backend,
     estimate_taps_residual,

@@ -1373,6 +1373,7 @@ symbolic TAPS IR validation for field, coefficient, initial-condition, geometry-
 safe TAPS backend bridge manifest export for FEniCSx / MFEM / PETSc review without executing external solvers
 reviewable FEniCSx / PyMFEM / petsc4py draft artifacts generated from TAPS IR bridge manifests
 adaptive fallback decision artifacts for knowledge-agent, runtime-extension, backend-bridge, or full-solver preparation
+auditable backend case bundles with dependency checks, mesh-export requirements, coefficient binding, boundary binding, and approval gates
 strong-form diffusion/time/reaction/curl token patterns compiled into weak-form IR terms for reviewed execution
 Neumann / Robin / interface / custom boundary conditions compiled into first-class boundary weak-term IR metadata
 heat / diffusion
@@ -1821,9 +1822,10 @@ done: `validate_taps_ir` performs symbolic IR readiness checks and recommends kn
 done: `export_taps_backend_bridge` emits reviewed real-backend bridge manifests for FEniCSx/MFEM/PETSc without running external solvers.
 done: backend bridge export now also emits reviewable FEniCSx/PyMFEM/petsc4py draft artifacts.
 done: `plan_taps_adaptive_fallback` emits explicit safe fallback decision artifacts without executing external solvers.
+done: `prepare_taps_backend_case_bundle` emits auditable backend case bundles with dependency checks, mesh-export requirements, coefficient/boundary binding, and no-execute approval gates.
 done: strong-form diffusion/time/reaction/curl token patterns compile into reviewed weak-form IR terms.
 done: Neumann/Robin/interface/custom boundary conditions compile into first-class boundary weak-term IR metadata.
-next: turn reviewed backend drafts into auditable executable exports guarded by dependency checks, mesh export manifests, coefficient binding, boundary-tag binding, and explicit user approval.
+next: turn auditable backend case bundles into executable exports only after dependency checks, mesh export manifests, coefficient binding, boundary-tag binding, and explicit user approval are satisfied.
 ```
 
 PhysicsOS Cloud / foamvm scope:

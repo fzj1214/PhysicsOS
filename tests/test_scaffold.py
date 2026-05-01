@@ -30,6 +30,7 @@ from physicsos.tools.taps_tools import (
     ExportTAPSBackendBridgeInput,
     FormulateTAPSEquationInput,
     PlanTAPSAdaptiveFallbackInput,
+    PrepareTAPSBackendCaseBundleInput,
     RunTAPSBackendInput,
     ValidateTAPSIRInput,
     AuthorTAPSRuntimeExtensionInput,
@@ -39,6 +40,7 @@ from physicsos.tools.taps_tools import (
     export_taps_backend_bridge,
     formulate_taps_equation,
     plan_taps_adaptive_fallback,
+    prepare_taps_backend_case_bundle,
     run_taps_backend,
     validate_taps_ir,
 )
@@ -152,6 +154,7 @@ def test_tool_registry_has_core_tools() -> None:
     assert "validate_taps_ir" in TOOL_REGISTRY
     assert "export_taps_backend_bridge" in TOOL_REGISTRY
     assert "plan_taps_adaptive_fallback" in TOOL_REGISTRY
+    assert "prepare_taps_backend_case_bundle" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
     assert "recommend_runtime_stack" in TOOL_REGISTRY
@@ -472,6 +475,7 @@ def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
     result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
     bridge = export_taps_backend_bridge(ExportTAPSBackendBridgeInput(problem=problem, taps_problem=taps_problem, backend="fenicsx"))
     fallback = plan_taps_adaptive_fallback(PlanTAPSAdaptiveFallbackInput(problem=problem, taps_problem=taps_problem))
+    bundle = prepare_taps_backend_case_bundle(PrepareTAPSBackendCaseBundleInput(problem=problem, taps_problem=taps_problem, backend="fenicsx"))
     assert validation.valid
     assert any(check["name"] == "executable_block_mapping_connected" and check["passes"] for check in validation.checks)
     assert not validation.fallback_recommended
@@ -487,6 +491,11 @@ def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
     assert {"family": "transient_diffusion", "space": "H1", "time_integrator": "implicit_euler_or_crank_nicolson"} in bridge_payload["blocks"]
     assert bridge.draft_artifact is not None
     assert "Crank" in open(bridge.draft_artifact.uri, encoding="utf-8").read()
+    bundle_payload = json.loads(open(bundle.bundle.uri, encoding="utf-8").read())
+    assert bundle_payload["schema_version"] == "physicsos.taps_backend_case_bundle.v1"
+    assert bundle_payload["approval_gate"]["execute_external_solver"] is False
+    assert bundle_payload["approval_gate"]["requires_user_approval"] is True
+    assert any(check["name"] == "python_import_dolfinx" for check in bundle_payload["dependency_checks"])
 
 
 def test_taps_compiles_strong_form_and_boundary_weak_terms() -> None:

@@ -831,6 +831,22 @@ class PlanTAPSAdaptiveFallbackOutput(StrictBaseModel):
     artifact: ArtifactRef
 
 
+def _dependency_checks_for_backend(backend: str) -> list[dict[str, object]]:
+    if backend == "fenicsx":
+        return [
+            {"name": "python_import_dolfinx", "command": "python -c \"import dolfinx, ufl\"", "required": True},
+            {"name": "meshio_available", "command": "python -c \"import meshio\"", "required": True},
+        ]
+    if backend == "mfem":
+        return [
+            {"name": "python_import_mfem", "command": "python -c \"import mfem.ser\"", "required": True},
+            {"name": "meshio_available", "command": "python -c \"import meshio\"", "required": True},
+        ]
+    if backend == "petsc":
+        return [{"name": "python_import_petsc4py", "command": "python -c \"import petsc4py\"", "required": True}]
+    return [{"name": "python_available", "command": "python --version", "required": True}]
+
+
 def plan_taps_adaptive_fallback(input: PlanTAPSAdaptiveFallbackInput) -> PlanTAPSAdaptiveFallbackOutput:
     """Plan the next safe action when TAPS IR is incomplete, unsafe, or unsupported."""
     validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=input.taps_problem))
@@ -858,6 +874,73 @@ def plan_taps_adaptive_fallback(input: PlanTAPSAdaptiveFallbackInput) -> PlanTAP
     return PlanTAPSAdaptiveFallbackOutput(
         decision=decision,
         artifact=ArtifactRef(uri=str(path), kind="taps_adaptive_fallback_decision", format="json"),
+    )
+
+
+class PrepareTAPSBackendCaseBundleInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    backend: str = "fenicsx"
+    mesh_export_manifest: ArtifactRef | None = None
+
+
+class PrepareTAPSBackendCaseBundleOutput(StrictBaseModel):
+    bundle: ArtifactRef
+    bridge_manifest: ArtifactRef
+    draft_artifact: ArtifactRef | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+def prepare_taps_backend_case_bundle(input: PrepareTAPSBackendCaseBundleInput) -> PrepareTAPSBackendCaseBundleOutput:
+    """Prepare a reviewed backend execution bundle without running external solvers."""
+    bridge = export_taps_backend_bridge(
+        ExportTAPSBackendBridgeInput(problem=input.problem, taps_problem=input.taps_problem, backend=input.backend)
+    )
+    fallback = plan_taps_adaptive_fallback(
+        PlanTAPSAdaptiveFallbackInput(problem=input.problem, taps_problem=input.taps_problem, preferred_backend=input.backend)
+    )
+    backend = input.backend.lower()
+    warnings = list(bridge.warnings)
+    mesh_requirement = {
+        "required": backend in {"fenicsx", "mfem"},
+        "provided": input.mesh_export_manifest is not None,
+        "manifest_uri": input.mesh_export_manifest.uri if input.mesh_export_manifest is not None else None,
+        "expected_kind": "backend_mesh_export_manifest",
+    }
+    if mesh_requirement["required"] and not mesh_requirement["provided"]:
+        warnings.append("backend case bundle requires a backend mesh export manifest before execution")
+    bundle_payload = {
+        "schema_version": "physicsos.taps_backend_case_bundle.v1",
+        "problem_id": input.problem.id,
+        "taps_problem_id": input.taps_problem.id,
+        "backend": backend,
+        "bridge_manifest": bridge.manifest.uri,
+        "draft_artifact": bridge.draft_artifact.uri if bridge.draft_artifact is not None else None,
+        "fallback_decision": fallback.artifact.uri,
+        "dependency_checks": _dependency_checks_for_backend(backend),
+        "mesh_export": mesh_requirement,
+        "coefficient_binding": [{"name": coefficient.name, "role": coefficient.role, "region_ids": coefficient.region_ids} for coefficient in input.taps_problem.coefficients],
+        "boundary_binding": [
+            {"id": boundary.id, "field": boundary.field, "kind": boundary.kind, "region_id": boundary.region_id}
+            for boundary in input.taps_problem.boundary_conditions
+        ],
+        "approval_gate": {
+            "execute_external_solver": False,
+            "requires_user_approval": True,
+            "requires_dependency_checks": True,
+            "requires_mesh_export_manifest": bool(mesh_requirement["required"]),
+        },
+        "warnings": warnings,
+    }
+    output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_backend_bridge"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{backend}_case_bundle.json"
+    path.write_text(json.dumps(bundle_payload, indent=2), encoding="utf-8")
+    return PrepareTAPSBackendCaseBundleOutput(
+        bundle=ArtifactRef(uri=str(path), kind="taps_backend_case_bundle", format="json"),
+        bridge_manifest=bridge.manifest,
+        draft_artifact=bridge.draft_artifact,
+        warnings=warnings,
     )
 
 
@@ -1202,6 +1285,7 @@ for _tool, _input, _output in [
     (validate_taps_ir, ValidateTAPSIRInput, ValidateTAPSIROutput),
     (export_taps_backend_bridge, ExportTAPSBackendBridgeInput, ExportTAPSBackendBridgeOutput),
     (plan_taps_adaptive_fallback, PlanTAPSAdaptiveFallbackInput, PlanTAPSAdaptiveFallbackOutput),
+    (prepare_taps_backend_case_bundle, PrepareTAPSBackendCaseBundleInput, PrepareTAPSBackendCaseBundleOutput),
     (run_taps_backend, RunTAPSBackendInput, RunTAPSBackendOutput),
     (estimate_taps_residual, EstimateTAPSResidualInput, EstimateTAPSResidualOutput),
 ]:
