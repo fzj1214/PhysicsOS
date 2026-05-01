@@ -521,6 +521,153 @@ def generate_mesh(input: GenerateMeshInput) -> GenerateMeshOutput:
     return GenerateMeshOutput(mesh=mesh, artifacts=artifacts)
 
 
+class ExportBackendMeshInput(StrictBaseModel):
+    geometry: GeometrySpec
+    mesh: MeshSpec
+    backend: Literal["openfoam", "su2", "fenicsx", "mfem", "taps", "generic"]
+    geometry_encoding: GeometryEncoding | None = None
+    include_solver_native_hints: bool = True
+
+
+class ExportBackendMeshOutput(StrictBaseModel):
+    manifest: ArtifactRef
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    boundary_exports: list[dict[str, object]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _read_json_artifact(uri: str) -> dict[str, object] | None:
+    path = Path(uri)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _mesh_graph_payload(geometry: GeometrySpec, explicit_encoding: GeometryEncoding | None) -> dict[str, object] | None:
+    candidates = [explicit_encoding] if explicit_encoding is not None else []
+    candidates.extend(encoding for encoding in geometry.encodings if encoding.kind == "mesh_graph")
+    for encoding in candidates:
+        if encoding is None:
+            continue
+        payload = _read_json_artifact(encoding.uri)
+        if payload and payload.get("type") == "mesh_graph":
+            return payload
+    return None
+
+
+def _backend_boundary_name(group: dict[str, object], backend: str) -> str:
+    solver_native = group.get("solver_native")
+    if isinstance(solver_native, dict):
+        if backend == "openfoam" and isinstance(solver_native.get("openfoam_patch"), str):
+            return solver_native["openfoam_patch"]
+        if backend == "su2" and isinstance(solver_native.get("su2_marker"), str):
+            return solver_native["su2_marker"]
+        if backend in {"fenicsx", "mfem"} and solver_native.get("fenicsx_facet_tag") is not None:
+            return str(solver_native["fenicsx_facet_tag"])
+    name = group.get("name")
+    return str(name) if name is not None else "boundary"
+
+
+def _boundary_exports_from_graph(payload: dict[str, object], backend: str, include_hints: bool) -> list[dict[str, object]]:
+    raw_groups = payload.get("physical_boundary_groups")
+    if not isinstance(raw_groups, list):
+        return []
+    exports: list[dict[str, object]] = []
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
+            continue
+        name = str(raw_group.get("name") or "boundary")
+        edge_ids = raw_group.get("edge_ids") if isinstance(raw_group.get("edge_ids"), list) else []
+        node_ids = raw_group.get("node_ids") if isinstance(raw_group.get("node_ids"), list) else []
+        export: dict[str, object] = {
+            "source_name": name,
+            "backend_name": _backend_boundary_name(raw_group, backend),
+            "gmsh_physical_tag": raw_group.get("tag"),
+            "edge_ids": [int(edge_id) for edge_id in edge_ids if isinstance(edge_id, int)],
+            "node_ids": [int(node_id) for node_id in node_ids if isinstance(node_id, int)],
+        }
+        if include_hints and isinstance(raw_group.get("solver_native"), dict):
+            export["solver_native"] = raw_group["solver_native"]
+        exports.append(export)
+    return sorted(exports, key=lambda item: str(item["source_name"]))
+
+
+def _boundary_exports_from_geometry(geometry: GeometrySpec, backend: str) -> list[dict[str, object]]:
+    exports: list[dict[str, object]] = []
+    for boundary in geometry.boundaries:
+        name = boundary.label or boundary.id.removeprefix("boundary:")
+        if backend in {"fenicsx", "mfem"} and boundary.id.startswith("boundary:physical:"):
+            backend_name = boundary.id.removeprefix("boundary:physical:")
+        else:
+            backend_name = name
+        exports.append(
+            {
+                "source_name": name,
+                "backend_name": backend_name,
+                "boundary_id": boundary.id,
+                "entity_ids": boundary.entity_ids,
+                "confidence": boundary.confidence,
+            }
+        )
+    return exports
+
+
+def export_backend_mesh(input: ExportBackendMeshInput) -> ExportBackendMeshOutput:
+    """Export a solver-facing mesh manifest with physical boundary mappings."""
+    output_dir = project_root() / "scratch" / input.geometry.id.replace(":", "_") / "backend_mesh_exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_mesh = next((artifact for artifact in input.mesh.files if artifact.format == "msh"), None)
+    graph_payload = _mesh_graph_payload(input.geometry, input.geometry_encoding)
+    boundary_exports = (
+        _boundary_exports_from_graph(graph_payload, input.backend, input.include_solver_native_hints)
+        if graph_payload is not None
+        else _boundary_exports_from_geometry(input.geometry, input.backend)
+    )
+    warnings: list[str] = []
+    if source_mesh is None:
+        warnings.append("No Gmsh .msh artifact is attached to MeshSpec; backend runner must supply or regenerate mesh.")
+    if not boundary_exports:
+        warnings.append("No physical boundary groups are available; backend runner may need user/CAD boundary labels.")
+
+    mesh_formats = {
+        "openfoam": {"target": "constant/polyMesh", "conversion": "gmshToFoam or meshio-to-OpenFOAM runner step"},
+        "su2": {"target": ".su2", "conversion": "meshio or SU2-compatible mesh conversion runner step"},
+        "fenicsx": {"target": ".xdmf/.h5 with facet tags", "conversion": "meshio XDMF writer with gmsh:physical facet data"},
+        "mfem": {"target": ".mesh", "conversion": "meshio/MFEM conversion runner step"},
+        "taps": {"target": "mesh_graph.json", "conversion": "PhysicsOS mesh_graph encoding"},
+        "generic": {"target": ".msh + boundary manifest", "conversion": "no solver-specific conversion requested"},
+    }
+    manifest_payload = {
+        "schema_version": "physicsos.backend_mesh_export.v1",
+        "geometry_id": input.geometry.id,
+        "mesh_id": input.mesh.id,
+        "backend": input.backend,
+        "source_mesh": source_mesh.model_dump() if source_mesh is not None else None,
+        "source_mesh_graph": graph_payload.get("source_mesh") if graph_payload else None,
+        "target": mesh_formats[input.backend],
+        "execution_policy": {
+            "external_conversion_execution": "disabled_until_runner_approval",
+            "local_tool_invocation": False,
+        },
+        "boundary_exports": boundary_exports,
+        "regions": [region.model_dump() for region in input.mesh.regions],
+        "warnings": warnings,
+    }
+    manifest_path = output_dir / f"{input.backend}_mesh_export_manifest.json"
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+    manifest = ArtifactRef(
+        uri=str(manifest_path),
+        kind="backend_mesh_export_manifest",
+        format="json",
+        description=f"{input.backend} mesh export manifest with physical boundary mappings",
+    )
+    return ExportBackendMeshOutput(manifest=manifest, artifacts=[manifest], boundary_exports=boundary_exports, warnings=warnings)
+
+
 class AssessMeshQualityInput(StrictBaseModel):
     mesh: MeshSpec
     physics: PhysicsSpec
@@ -559,6 +706,7 @@ for _tool, _input, _output in [
     (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
     (generate_geometry_encoding, GenerateGeometryEncodingInput, GenerateGeometryEncodingOutput),
     (generate_mesh, GenerateMeshInput, GenerateMeshOutput),
+    (export_backend_mesh, ExportBackendMeshInput, ExportBackendMeshOutput),
     (assess_mesh_quality, AssessMeshQualityInput, AssessMeshQualityOutput),
 ]:
     _tool.input_model = _input

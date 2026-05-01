@@ -11,6 +11,7 @@ from physicsos.agents.prompts import (
 from physicsos.tools.geometry_tools import (
     apply_boundary_labels,
     assess_mesh_quality,
+    export_backend_mesh,
     generate_geometry_encoding,
     generate_mesh,
     import_geometry,
@@ -39,6 +40,7 @@ SUBAGENTS = [
             apply_boundary_labels,
             generate_geometry_encoding,
             generate_mesh,
+            export_backend_mesh,
             assess_mesh_quality,
         ],
     },

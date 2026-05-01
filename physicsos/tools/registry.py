@@ -16,6 +16,7 @@ from physicsos.tools.catalog_tools import (
 from physicsos.tools.geometry_tools import (
     apply_boundary_labels,
     assess_mesh_quality,
+    export_backend_mesh,
     generate_geometry_encoding,
     generate_mesh,
     import_geometry,
@@ -61,6 +62,7 @@ PHYSICSOS_TOOLS = [
     apply_boundary_labels,
     generate_geometry_encoding,
     generate_mesh,
+    export_backend_mesh,
     assess_mesh_quality,
     estimate_solver_support,
     route_solver_backend,

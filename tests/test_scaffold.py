@@ -64,12 +64,14 @@ from physicsos.tools.geometry_tools import (
     AssessMeshQualityInput,
     ApplyBoundaryLabelsInput,
     BoundaryLabelAssignment,
+    ExportBackendMeshInput,
     GenerateGeometryEncodingInput,
     GenerateMeshInput,
     ImportGeometryInput,
     LabelRegionsInput,
     apply_boundary_labels,
     assess_mesh_quality,
+    export_backend_mesh,
     generate_geometry_encoding,
     generate_mesh,
     import_geometry,
@@ -124,6 +126,7 @@ def test_tool_registry_has_core_tools() -> None:
     assert "prepare_full_solver_case" in TOOL_REGISTRY
     assert "submit_full_solver_job" in TOOL_REGISTRY
     assert "apply_boundary_labels" in TOOL_REGISTRY
+    assert "export_backend_mesh" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
     assert "recommend_runtime_stack" in TOOL_REGISTRY
@@ -1317,6 +1320,62 @@ def test_imported_geo_physical_curve_labels_drive_em_boundary_selection(tmp_path
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
     assert operator_payload["hcurl_scaffold"]["boundary_condition"] == "port"
     assert operator_payload["active_boundary_edges"] == graph_payload["boundary_edge_sets"]["boundary:port_left"]
+
+
+def test_backend_mesh_export_manifest_preserves_physical_boundary_groups(tmp_path) -> None:
+    geo_path = tmp_path / "export_square.geo"
+    geo_path.write_text(
+        "\n".join(
+            [
+                'SetFactory("Built-in");',
+                "lc = 0.3;",
+                "Point(1) = {0, 0, 0, lc};",
+                "Point(2) = {1, 0, 0, lc};",
+                "Point(3) = {1, 1, 0, lc};",
+                "Point(4) = {0, 1, 0, lc};",
+                "Line(1) = {1, 2};",
+                "Line(2) = {2, 3};",
+                "Line(3) = {3, 4};",
+                "Line(4) = {4, 1};",
+                "Curve Loop(1) = {1, 2, 3, 4};",
+                "Plane Surface(1) = {1};",
+                'Physical Surface("domain") = {1};',
+                'Physical Curve("inlet") = {4};',
+                'Physical Curve("wall") = {1, 2, 3};',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = import_geometry(ImportGeometryInput(source=GeometrySource(kind="mesh_file", uri=str(geo_path)))).geometry
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["fluid"]),
+            mesh_policy=MeshPolicy(target_element_size=0.3),
+            target_backends=["openfoam"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    geometry.encodings.extend(encoding_output.encodings)
+    exported = export_backend_mesh(
+        ExportBackendMeshInput(
+            geometry=geometry,
+            mesh=mesh,
+            backend="openfoam",
+            geometry_encoding=encoding_output.encodings[0],
+        )
+    )
+    manifest = json.loads(open(exported.manifest.uri, encoding="utf-8").read())
+    assert manifest["schema_version"] == "physicsos.backend_mesh_export.v1"
+    assert manifest["execution_policy"]["local_tool_invocation"] is False
+    assert manifest["target"]["target"] == "constant/polyMesh"
+    patches = {item["backend_name"]: item for item in manifest["boundary_exports"]}
+    assert {"inlet", "wall"} <= set(patches)
+    assert patches["inlet"]["solver_native"]["openfoam_patch"] == "inlet"
+    assert patches["wall"]["edge_ids"]
+    assert exported.warnings == []
 
 
 def test_triangle_p1_assembler_uses_cell_gradients() -> None:
