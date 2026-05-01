@@ -1,0 +1,42 @@
+[project]
+name = "physicsos"
+version = "0.1.0"
+description = "AI-native physics simulation OS scaffold."
+readme = "ARCHITECTURE.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.7",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+physicsos = "physicsos.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+agents = [
+  "deepagents",
+  "langgraph",
+  "langchain-openai",
+]
+geometry = [
+  "gmsh>=4.13",
+  "meshio>=5.3",
+]
+all = [
+  "deepagents",
+  "langgraph",
+  "langchain-openai",
+  "gmsh>=4.13",
+  "meshio>=5.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["physicsos*"]
+exclude = ["runners*", "data*", "models*", "configs*", "scratch*", "docs*", "scripts*", "tests*", "examples*"]

@@ -1,0 +1,61 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Node / Next.js runner caches
+node_modules/
+.next/
+out/
+.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated runtime artifacts
+scratch/
+*.msh
+*.vtu
+*.vtk
+*.xdmf
+*.h5
+*.jsonl
+
+# Downloaded model weights and heavyweight corpora
+models/huggingface/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+*.pdf
+data/knowledge/*.sqlite
+data/knowledge/papers/
+
+# Local-only config and generated knowledge/memory stores
+configs/*.local.json
+data/case_memory.jsonl
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

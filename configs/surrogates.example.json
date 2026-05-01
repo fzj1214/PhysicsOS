@@ -1,0 +1,43 @@
+{
+  "models": [
+    {
+      "id": "grid_fno_local",
+      "name": "Local TorchScript FNO",
+      "family": "grid_neural_operator",
+      "domains": ["fluid", "thermal"],
+      "operator_families": ["navier_stokes", "heat"],
+      "geometry_encodings": ["multi_resolution_grid", "occupancy_mask"],
+      "mesh_kinds": ["structured"],
+      "supports_transient": true,
+      "checkpoint": {
+        "uri": "models/grid_fno_local/model.ts",
+        "kind": "model_checkpoint",
+        "format": "torchscript",
+        "description": "Place a real TorchScript checkpoint here."
+      },
+      "expected_fields": ["input_tensor"],
+      "output_fields": ["field"],
+      "notes": ["Example only. Copy to configs/surrogates.local.json and edit."]
+    },
+    {
+      "id": "mesh_graph_operator_local",
+      "name": "Local mesh graph operator",
+      "family": "mesh_graph_operator",
+      "domains": ["fluid", "thermal", "solid"],
+      "operator_families": ["navier_stokes", "heat", "elasticity"],
+      "geometry_encodings": ["mesh_graph", "boundary_graph"],
+      "mesh_kinds": ["unstructured", "hybrid", "surface", "volume"],
+      "supports_transient": true,
+      "checkpoint": {
+        "uri": "models/mesh_graph_operator_local/model.ts",
+        "kind": "model_checkpoint",
+        "format": "torchscript",
+        "description": "Place a real TorchScript checkpoint here."
+      },
+      "expected_fields": ["graph_features"],
+      "output_fields": ["field"],
+      "notes": ["Example only. Graph feature packing must match the trained model."]
+    }
+  ]
+}
+

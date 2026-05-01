@@ -1,0 +1,566 @@
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+
+from physicsos.backends.geometry_mesh import generate_mesh_backend, import_geometry_backend
+from physicsos.config import project_root
+from physicsos.schemas.common import ArtifactRef, StrictBaseModel
+from physicsos.schemas.geometry import BoundaryRegionSpec, GeometryEncoding, GeometryEntity, GeometryQualityReport, GeometrySource, GeometrySpec, GeometryTransform, RegionSpec
+from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
+from physicsos.schemas.operators import PhysicsDomain, PhysicsSpec
+
+
+class ImportGeometryInput(StrictBaseModel):
+    source: GeometrySource
+    target_units: str = "SI"
+
+
+class ImportGeometryOutput(StrictBaseModel):
+    geometry: GeometrySpec
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+
+
+def import_geometry(input: ImportGeometryInput) -> ImportGeometryOutput:
+    """Import CAD/mesh/material geometry into GeometrySpec."""
+    geometry, artifacts = import_geometry_backend(input.source, target_units=input.target_units)
+    return ImportGeometryOutput(geometry=geometry, artifacts=artifacts)
+
+
+class RepairGeometryInput(StrictBaseModel):
+    geometry: GeometrySpec
+    repair_policy: str = "conservative"
+
+
+class RepairGeometryOutput(StrictBaseModel):
+    geometry: GeometrySpec
+    changes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def repair_geometry(input: RepairGeometryInput) -> RepairGeometryOutput:
+    """Repair invalid, non-manifold, open, or self-intersecting geometry."""
+    geometry = input.geometry.model_copy(update={"quality": GeometryQualityReport(passes=True)})
+    return RepairGeometryOutput(geometry=geometry, changes=["No-op scaffold repair."])
+
+
+class LabelRegionsInput(StrictBaseModel):
+    geometry: GeometrySpec
+    physics_domain: PhysicsDomain
+    hints: list[str] = Field(default_factory=list)
+
+
+class LabelRegionsOutput(StrictBaseModel):
+    geometry: GeometrySpec
+    confidence_by_region: dict[str, float] = Field(default_factory=dict)
+    unresolved_regions: list[str] = Field(default_factory=list)
+
+
+def _default_boundary_kind(label: str, physics_domain: PhysicsDomain) -> str:
+    if physics_domain == "fluid":
+        if label in {"x_min", "left"}:
+            return "inlet"
+        if label in {"x_max", "right"}:
+            return "outlet"
+        return "wall"
+    if physics_domain == "electromagnetic":
+        return "farfield"
+    return "surface"
+
+
+def _generated_boundary_labels(dimension: int) -> list[tuple[str, str]]:
+    if dimension == 1:
+        return [("x_min", "point"), ("x_max", "point")]
+    if dimension == 2:
+        return [("x_min", "curve"), ("x_max", "curve"), ("y_min", "curve"), ("y_max", "curve")]
+    if dimension == 3:
+        return [
+            ("x_min", "surface"),
+            ("x_max", "surface"),
+            ("y_min", "surface"),
+            ("y_max", "surface"),
+            ("z_min", "surface"),
+            ("z_max", "surface"),
+        ]
+    return []
+
+
+def label_regions(input: LabelRegionsInput) -> LabelRegionsOutput:
+    """Infer physical regions and boundary labels."""
+    geometry = input.geometry.model_copy(deep=True)
+    confidence_by_region: dict[str, float] = {}
+    unresolved_regions: list[str] = []
+
+    if not geometry.regions and geometry.dimension > 0:
+        region_kind = "fluid" if input.physics_domain == "fluid" else "solid" if input.physics_domain in {"solid", "thermal"} else "custom"
+        geometry.regions.append(RegionSpec(id="region:domain", label="domain", kind=region_kind))
+        confidence_by_region["region:domain"] = 0.75 if geometry.source.kind == "generated" else 0.45
+    for region in geometry.regions:
+        confidence_by_region.setdefault(region.id, 1.0 if region.entity_ids else 0.75)
+
+    if not geometry.boundaries and geometry.source.kind == "generated":
+        for label, entity_kind in _generated_boundary_labels(geometry.dimension):
+            entity_id = f"entity:boundary:{label}"
+            if all(entity.id != entity_id for entity in geometry.entities):
+                geometry.entities.append(GeometryEntity(id=entity_id, kind=entity_kind, label=label))  # type: ignore[arg-type]
+            boundary_kind = _default_boundary_kind(label, input.physics_domain)
+            geometry.boundaries.append(
+                BoundaryRegionSpec(
+                    id=f"boundary:{label}",
+                    label=label,
+                    kind=boundary_kind,  # type: ignore[arg-type]
+                    entity_ids=[entity_id],
+                    confidence=0.70,
+                )
+            )
+            confidence_by_region[f"boundary:{label}"] = 0.70
+    elif not geometry.boundaries:
+        unresolved_regions.append("boundary_labels")
+        quality = geometry.quality or GeometryQualityReport()
+        geometry.quality = quality.model_copy(
+            update={
+                "passes": False,
+                "unresolved_regions": sorted(set([*quality.unresolved_regions, "boundary_labels"])),
+                "issues": sorted(set([*quality.issues, "Boundary labels are unresolved; user/CAD physical groups are required."])),
+            }
+        )
+    else:
+        for boundary in geometry.boundaries:
+            confidence_by_region.setdefault(boundary.id, boundary.confidence)
+
+    return LabelRegionsOutput(geometry=geometry, confidence_by_region=confidence_by_region, unresolved_regions=unresolved_regions)
+
+
+class BoundaryLabelAssignment(StrictBaseModel):
+    entity_ids: list[str] = Field(default_factory=list)
+    boundary_id: str
+    label: str
+    kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    confidence: float = 1.0
+
+
+class ApplyBoundaryLabelsInput(StrictBaseModel):
+    geometry: GeometrySpec
+    assignments: list[BoundaryLabelAssignment]
+    replace_existing: bool = False
+    source: Literal["user", "cad_physical_group", "knowledge_agent", "script"] = "user"
+
+
+class ApplyBoundaryLabelsOutput(StrictBaseModel):
+    geometry: GeometrySpec
+    applied: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def apply_boundary_labels(input: ApplyBoundaryLabelsInput) -> ApplyBoundaryLabelsOutput:
+    """Apply explicit user/CAD/knowledge-agent boundary labels to GeometrySpec."""
+    geometry = input.geometry.model_copy(deep=True)
+    warnings: list[str] = []
+    applied: list[str] = []
+    existing_entity_ids = {entity.id for entity in geometry.entities}
+    if input.replace_existing:
+        geometry.boundaries = []
+    by_id = {boundary.id: boundary for boundary in geometry.boundaries}
+    for assignment in input.assignments:
+        missing = [entity_id for entity_id in assignment.entity_ids if entity_id not in existing_entity_ids]
+        if missing:
+            warnings.append(f"Assignment {assignment.boundary_id} references unknown entities: {', '.join(missing)}")
+        confidence = max(0.0, min(1.0, assignment.confidence))
+        boundary = BoundaryRegionSpec(
+            id=assignment.boundary_id,
+            label=assignment.label,
+            kind=assignment.kind,
+            entity_ids=[entity_id for entity_id in assignment.entity_ids if entity_id in existing_entity_ids],
+            confidence=confidence,
+        )
+        if boundary.id in by_id:
+            geometry.boundaries = [boundary if item.id == boundary.id else item for item in geometry.boundaries]
+        else:
+            geometry.boundaries.append(boundary)
+        by_id[boundary.id] = boundary
+        applied.append(boundary.id)
+    unresolved = [item for item in (geometry.quality.unresolved_regions if geometry.quality else []) if item != "boundary_labels"]
+    quality = geometry.quality or GeometryQualityReport()
+    issues = [issue for issue in quality.issues if "Boundary labels are unresolved" not in issue]
+    geometry.quality = quality.model_copy(update={"unresolved_regions": unresolved, "issues": issues, "passes": not unresolved and not issues})
+    geometry.transforms.append(
+        GeometryTransform(kind="custom", description=f"Applied {len(applied)} explicit boundary label assignments from {input.source}.")
+    )
+    return ApplyBoundaryLabelsOutput(geometry=geometry, applied=applied, warnings=warnings)
+
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * fraction))))
+    return ordered[index]
+
+
+def _triangle_quality(points: list[list[float]], cell: list[int]) -> tuple[float, float, float] | None:
+    if len(cell) < 3:
+        return None
+    p0, p1, p2 = (points[int(cell[0])], points[int(cell[1])], points[int(cell[2])])
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    jacobian = abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))
+    area = jacobian / 2.0
+    if area <= 0.0:
+        return None
+    lengths = [
+        math.dist(p0[:3], p1[:3]),
+        math.dist(p1[:3], p2[:3]),
+        math.dist(p2[:3], p0[:3]),
+    ]
+    shortest = min(lengths)
+    if shortest <= 0.0:
+        return None
+    aspect_ratio = max(lengths) / shortest
+    shape_quality = 4.0 * math.sqrt(3.0) * area / (sum(length * length for length in lengths) + 1e-30)
+    skewness_proxy = 1.0 - max(0.0, min(1.0, shape_quality))
+    return jacobian, aspect_ratio, skewness_proxy
+
+
+def _mesh_quality_from_msh(mesh: MeshSpec) -> MeshQualityReport | None:
+    msh_artifact = next((artifact for artifact in mesh.files if artifact.format == "msh"), None)
+    if msh_artifact is None:
+        return None
+    try:
+        import meshio
+    except ImportError:
+        return MeshQualityReport(passes=False, issues=["meshio is not installed; mesh quality could not be recomputed from .msh."])
+
+    raw_mesh = meshio.read(msh_artifact.uri)
+    points = [[float(coord) for coord in point[:3]] for point in raw_mesh.points]
+    jacobians: list[float] = []
+    aspect_ratios: list[float] = []
+    skewness: list[float] = []
+    unsupported_cell_types: set[str] = set()
+    for block in raw_mesh.cells:
+        if "triangle" not in block.type.lower():
+            unsupported_cell_types.add(block.type)
+            continue
+        for raw_cell in block.data.tolist():
+            quality = _triangle_quality(points, [int(node) for node in raw_cell])
+            if quality is None:
+                jacobians.append(0.0)
+                continue
+            jacobian, aspect_ratio, skewness_proxy = quality
+            jacobians.append(jacobian)
+            aspect_ratios.append(aspect_ratio)
+            skewness.append(skewness_proxy)
+
+    issues: list[str] = []
+    min_jacobian = min(jacobians) if jacobians else None
+    max_skewness = max(skewness) if skewness else None
+    aspect_ratio_p95 = _percentile(aspect_ratios, 0.95)
+    if min_jacobian is None:
+        issues.append("No triangle cells found for current local mesh quality evaluator.")
+    elif min_jacobian <= 1e-14:
+        issues.append("Degenerate triangle cell detected.")
+    if aspect_ratio_p95 is not None and aspect_ratio_p95 > 25.0:
+        issues.append(f"High triangle aspect ratio p95={aspect_ratio_p95:.3g}.")
+    if max_skewness is not None and max_skewness > 0.95:
+        issues.append(f"High triangle skewness proxy max={max_skewness:.3g}.")
+    if unsupported_cell_types and not jacobians:
+        issues.append(f"Unsupported cell types for local evaluator: {', '.join(sorted(unsupported_cell_types))}.")
+    passes = not issues
+    return MeshQualityReport(
+        min_jacobian=min_jacobian,
+        max_skewness=max_skewness,
+        aspect_ratio_p95=aspect_ratio_p95,
+        passes=passes,
+        issues=issues,
+    )
+
+
+class GenerateGeometryEncodingInput(StrictBaseModel):
+    geometry: GeometrySpec
+    mesh: MeshSpec | None = None
+    encodings: list[str]
+    resolutions: list[list[int]] = Field(default_factory=list)
+
+
+class GenerateGeometryEncodingOutput(StrictBaseModel):
+    encodings: list[GeometryEncoding]
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+
+
+def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> GenerateGeometryEncodingOutput:
+    """Generate SDF, masks, graph, point cloud, or multiresolution grid encodings."""
+    output_dir = project_root() / "scratch" / input.geometry.id.replace(":", "_") / "geometry_encodings"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    encodings: list[GeometryEncoding] = []
+    artifacts: list[ArtifactRef] = []
+    for index, kind in enumerate(input.encodings):
+        resolution = input.resolutions[index] if index < len(input.resolutions) else [32, 32]
+        path = output_dir / f"{kind}.json"
+        if kind == "occupancy_mask":
+            nx = resolution[0] if resolution else 32
+            ny = resolution[1] if len(resolution) > 1 else nx
+            has_hole = any("hole" in entity.label.lower() for entity in input.geometry.entities if entity.label) or any(
+                "hole" in region.label.lower() for region in input.geometry.regions
+            )
+            hole_center = [0.5, 0.5]
+            hole_radius = 0.2
+            mask: list[list[int]] = []
+            for i in range(nx):
+                x = i / (nx - 1) if nx > 1 else 0.0
+                row: list[int] = []
+                for j in range(ny):
+                    y = j / (ny - 1) if ny > 1 else 0.0
+                    in_hole = has_hole and ((x - hole_center[0]) ** 2 + (y - hole_center[1]) ** 2 <= hole_radius * hole_radius)
+                    row.append(0 if in_hole else 1)
+                mask.append(row)
+            payload = {
+                "type": "occupancy_mask",
+                "geometry_id": input.geometry.id,
+                "resolution": [nx, ny],
+                "axes": {
+                    "x": [i / (nx - 1) if nx > 1 else 0.0 for i in range(nx)],
+                    "y": [j / (ny - 1) if ny > 1 else 0.0 for j in range(ny)],
+                },
+                "mask": mask,
+                "active_value": 1,
+                "boundary_policy": "dirichlet_zero",
+                "holes": [{"shape": "circle", "center": hole_center, "radius": hole_radius}] if has_hole else [],
+                "description": "Generated active-domain mask for geometry-encoded TAPS.",
+            }
+        elif kind == "sdf":
+            nx = resolution[0] if resolution else 32
+            ny = resolution[1] if len(resolution) > 1 else nx
+            values = []
+            for i in range(nx):
+                x = i / (nx - 1) if nx > 1 else 0.0
+                row = []
+                for j in range(ny):
+                    y = j / (ny - 1) if ny > 1 else 0.0
+                    row.append(min(x, y, 1.0 - x, 1.0 - y))
+                values.append(row)
+            payload = {
+                "type": "sdf",
+                "geometry_id": input.geometry.id,
+                "resolution": [nx, ny],
+                "values": values,
+                "description": "Signed-distance-like box interior distance for unit-square TAPS geometry encoding.",
+            }
+        elif kind == "mesh_graph":
+            msh_artifact = None
+            if input.mesh is not None:
+                msh_artifact = next((artifact for artifact in input.mesh.files if artifact.format == "msh"), None)
+            if msh_artifact is None:
+                payload = {
+                    "type": "mesh_graph",
+                    "geometry_id": input.geometry.id,
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "description": "No .msh artifact was provided; mesh_graph could not be generated.",
+                }
+            else:
+                try:
+                    import meshio
+                except ImportError:
+                    payload = {
+                        "type": "mesh_graph",
+                        "geometry_id": input.geometry.id,
+                        "source_mesh": msh_artifact.uri,
+                        "node_count": 0,
+                        "edge_count": 0,
+                        "description": "meshio is not installed; mesh_graph could not be generated.",
+                    }
+                else:
+                    mesh = meshio.read(msh_artifact.uri)
+                    points = [[float(coord) for coord in point[:3]] for point in mesh.points]
+                    edges: set[tuple[int, int]] = set()
+                    cell_blocks = []
+                    for block in mesh.cells:
+                        cells = [[int(node) for node in cell] for cell in block.data.tolist()]
+                        cell_blocks.append({"type": block.type, "cells": cells})
+                        for cell in cells:
+                            for a_index, a in enumerate(cell):
+                                for b in cell[a_index + 1 :]:
+                                    edge = (a, b) if a < b else (b, a)
+                                    edges.add(edge)
+                    mins = [min(point[axis] for point in points) for axis in range(3)] if points else [0.0, 0.0, 0.0]
+                    maxs = [max(point[axis] for point in points) for axis in range(3)] if points else [0.0, 0.0, 0.0]
+                    tolerance = 1e-10
+                    boundary_node_sets = {
+                        "x_min": [index for index, point in enumerate(points) if abs(point[0] - mins[0]) <= tolerance],
+                        "x_max": [index for index, point in enumerate(points) if abs(point[0] - maxs[0]) <= tolerance],
+                        "y_min": [index for index, point in enumerate(points) if abs(point[1] - mins[1]) <= tolerance],
+                        "y_max": [index for index, point in enumerate(points) if abs(point[1] - maxs[1]) <= tolerance],
+                    }
+                    if input.geometry.dimension == 3:
+                        boundary_node_sets["z_min"] = [index for index, point in enumerate(points) if abs(point[2] - mins[2]) <= tolerance]
+                        boundary_node_sets["z_max"] = [index for index, point in enumerate(points) if abs(point[2] - maxs[2]) <= tolerance]
+                    boundary_nodes = sorted({node for nodes in boundary_node_sets.values() for node in nodes})
+                    boundary_edge_sets: dict[str, list[int]] = {}
+                    sorted_edges = sorted(edges)
+                    edge_index = {edge: index for index, edge in enumerate(sorted_edges)}
+                    for name, nodes in boundary_node_sets.items():
+                        node_set = set(nodes)
+                        boundary_edge_sets[name] = [
+                            index for index, (a, b) in enumerate(sorted_edges) if a in node_set and b in node_set
+                        ]
+                    boundary_edge_sets["boundary"] = sorted(
+                        {edge for edge_ids in boundary_edge_sets.values() for edge in edge_ids}
+                    )
+                    field_names_by_tag = {
+                        int(values[0]): name
+                        for name, values in getattr(mesh, "field_data", {}).items()
+                        if len(values) >= 2 and int(values[1]) == 1
+                    }
+                    physical_boundary_groups: dict[int, dict[str, object]] = {}
+                    physical_cell_data = getattr(mesh, "cell_data_dict", {}).get("gmsh:physical", {})
+                    physical_offsets: dict[str, int] = {}
+                    for block in mesh.cells:
+                        if not block.type.startswith("line"):
+                            continue
+                        physical_tags = physical_cell_data.get(block.type)
+                        if physical_tags is None:
+                            continue
+                        offset = physical_offsets.get(block.type, 0)
+                        block_tags = physical_tags.tolist()[offset : offset + len(block.data)]
+                        physical_offsets[block.type] = offset + len(block.data)
+                        for cell, tag in zip(block.data.tolist(), block_tags):
+                            if len(cell) < 2:
+                                continue
+                            a = int(cell[0])
+                            b = int(cell[-1])
+                            edge = (a, b) if a < b else (b, a)
+                            if edge not in edge_index:
+                                continue
+                            physical_tag = int(tag)
+                            physical_name = field_names_by_tag.get(physical_tag) or f"physical_{physical_tag}"
+                            group = physical_boundary_groups.setdefault(
+                                physical_tag,
+                                {
+                                    "tag": physical_tag,
+                                    "name": physical_name,
+                                    "aliases": [f"physical:{physical_tag}", f"boundary:physical:{physical_tag}", physical_name, f"boundary:{physical_name}"],
+                                    "edge_ids": [],
+                                    "node_ids": [],
+                                    "solver_native": {
+                                        "gmsh_physical_tag": physical_tag,
+                                        "gmsh_physical_name": physical_name,
+                                        "openfoam_patch": physical_name,
+                                        "su2_marker": physical_name,
+                                        "fenicsx_facet_tag": physical_tag,
+                                    },
+                                },
+                            )
+                            names = {
+                                f"physical:{physical_tag}",
+                                f"boundary:physical:{physical_tag}",
+                            }
+                            if physical_name:
+                                names.add(physical_name)
+                                names.add(f"boundary:{physical_name}")
+                            for name in names:
+                                boundary_edge_sets.setdefault(name, []).append(edge_index[edge])
+                                boundary_node_sets.setdefault(name, [])
+                                boundary_node_sets[name] = sorted(set([*boundary_node_sets[name], a, b]))
+                            group["edge_ids"] = sorted(set([*group["edge_ids"], edge_index[edge]]))  # type: ignore[index]
+                            group["node_ids"] = sorted(set([*group["node_ids"], a, b]))  # type: ignore[index]
+                    boundary_edge_sets = {name: sorted(set(edge_ids)) for name, edge_ids in boundary_edge_sets.items()}
+                    payload = {
+                        "type": "mesh_graph",
+                        "geometry_id": input.geometry.id,
+                        "source_mesh": msh_artifact.uri,
+                        "points": points,
+                        "edges": [[a, b] for a, b in sorted_edges],
+                        "boundary_nodes": boundary_nodes,
+                        "boundary_node_sets": boundary_node_sets,
+                        "boundary_edge_sets": boundary_edge_sets,
+                        "physical_boundary_groups": sorted(physical_boundary_groups.values(), key=lambda group: str(group["name"])),
+                        "bbox": {"min": mins, "max": maxs},
+                        "cell_blocks": cell_blocks,
+                        "node_count": len(points),
+                        "edge_count": len(edges),
+                        "description": "Graph encoding derived from Gmsh mesh connectivity with bbox boundary node labels.",
+                    }
+        else:
+            payload = {
+                "type": kind,
+                "geometry_id": input.geometry.id,
+                "resolution": resolution,
+                "description": "Placeholder encoding metadata; concrete encoder not connected yet.",
+            }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        encoding = GeometryEncoding(kind=kind, uri=str(Path(path)), resolution=resolution, target_backend="taps")  # type: ignore[arg-type]
+        encodings.append(encoding)
+        artifacts.append(ArtifactRef(uri=str(path), kind=f"geometry_encoding:{kind}", format="json"))
+    return GenerateGeometryEncodingOutput(encodings=encodings, artifacts=artifacts)
+
+
+class GenerateMeshInput(StrictBaseModel):
+    geometry: GeometrySpec
+    physics: PhysicsSpec
+    mesh_policy: MeshPolicy = Field(default_factory=MeshPolicy)
+    target_backends: list[str] = Field(default_factory=list)
+
+
+class GenerateMeshOutput(StrictBaseModel):
+    mesh: MeshSpec
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+
+
+def generate_mesh(input: GenerateMeshInput) -> GenerateMeshOutput:
+    """Generate solver-compatible mesh from GeometrySpec."""
+    mesh, artifacts = generate_mesh_backend(
+        input.geometry,
+        target_backends=input.target_backends,
+        target_element_size=input.mesh_policy.target_element_size,
+        element_order=input.mesh_policy.element_order,
+    )
+    return GenerateMeshOutput(mesh=mesh, artifacts=artifacts)
+
+
+class AssessMeshQualityInput(StrictBaseModel):
+    mesh: MeshSpec
+    physics: PhysicsSpec
+    backend: str | None = None
+
+
+class AssessMeshQualityOutput(StrictBaseModel):
+    report: MeshQualityReport
+    recommended_action: str
+
+
+def assess_mesh_quality(input: AssessMeshQualityInput) -> AssessMeshQualityOutput:
+    """Evaluate mesh quality for selected physics and backend."""
+    computed = _mesh_quality_from_msh(input.mesh)
+    report = computed or input.mesh.quality
+    issues = list(report.issues)
+    if input.backend in {"taps", "taps:mesh_fem_poisson"} and not any("triangle" in cell_type.lower() for cell_type in input.mesh.topology.cell_types):
+        issues.append("TAPS mesh FEM path expects triangle cells in the current local assembler.")
+    passes = report.passes and not issues
+    report = report.model_copy(update={"passes": passes, "issues": sorted(set(issues))})
+    if passes:
+        action = "accept"
+    elif report.min_jacobian is not None and report.min_jacobian <= 1e-14:
+        action = "remesh"
+    elif report.aspect_ratio_p95 is not None or report.max_skewness is not None:
+        action = "refine_or_remesh"
+    else:
+        action = "inspect_mesh"
+    return AssessMeshQualityOutput(report=report, recommended_action=action)
+
+
+for _tool, _input, _output in [
+    (import_geometry, ImportGeometryInput, ImportGeometryOutput),
+    (repair_geometry, RepairGeometryInput, RepairGeometryOutput),
+    (label_regions, LabelRegionsInput, LabelRegionsOutput),
+    (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
+    (generate_geometry_encoding, GenerateGeometryEncodingInput, GenerateGeometryEncodingOutput),
+    (generate_mesh, GenerateMeshInput, GenerateMeshOutput),
+    (assess_mesh_quality, AssessMeshQualityInput, AssessMeshQualityOutput),
+]:
+    _tool.input_model = _input
+    _tool.output_model = _output
+    _tool.side_effects = "workspace artifacts only"
