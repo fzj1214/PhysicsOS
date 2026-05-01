@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from pydantic import Field
 
 from physicsos.config import project_root
@@ -17,6 +19,7 @@ from physicsos.backends.taps_generic import supports_coupled_reaction_diffusion_
 from physicsos.backends.taps_generic import supports_hcurl_curl_curl_weak_form
 from physicsos.backends.taps_generic import supports_nonlinear_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_scalar_elliptic_weak_form
+from physicsos.backends.taps_generic import supports_transient_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_vector_elasticity_weak_form
 from physicsos.backends.taps_thermal import solve_transient_heat_1d
 from physicsos.schemas.common import ArtifactRef, Provenance, StrictBaseModel
@@ -117,12 +120,62 @@ def _default_axes(problem: PhysicsProblem) -> list[TAPSAxisSpec]:
     return axes
 
 
+def _compile_strong_form_term(expression: str, fields: list[str]) -> tuple[str, str, list[str]]:
+    lowered = expression.lower()
+    field = fields[0] if fields else "u"
+    test = f"v_{field}"
+    if any(token in lowered for token in ("d/dt", "dt", "partial_t", "time_derivative")):
+        return "time_derivative", f"int_Omega {test} d({field})/dt dOmega", []
+    if any(token in lowered for token in ("laplacian", "div(", "grad(", "d2", "diffusion")):
+        return "diffusion", f"int_Omega grad({test}) dot k grad({field}) dOmega", ["k"]
+    if any(token in lowered for token in ("u^3", "cubic", "nonlinear", "r(")):
+        return "reaction", f"- int_Omega {test} R({field}) dOmega", ["reaction_parameters"]
+    if "curl" in lowered:
+        return "diffusion", f"int_Omega curl({test}) dot curl({field}) dOmega", []
+    return "custom", expression, []
+
+
+def _boundary_weak_terms(problem: PhysicsProblem) -> list[TAPSEquationTerm]:
+    terms: list[TAPSEquationTerm] = []
+    for boundary in problem.boundary_conditions:
+        kind = boundary.kind.lower()
+        field = boundary.field
+        if kind == "dirichlet":
+            continue
+        role = "boundary"
+        if kind == "neumann":
+            expression = f"int_Gamma v_{field} g dGamma on {boundary.region_id}"
+            coefficients = ["neumann_flux"]
+        elif kind == "robin":
+            expression = f"int_Gamma h v_{field} {field} dGamma - int_Gamma v_{field} r dGamma on {boundary.region_id}"
+            coefficients = ["robin_h", "robin_r"]
+        elif kind in {"interface", "periodic"}:
+            expression = f"interface constraint for {field} on {boundary.region_id}"
+            coefficients = []
+        else:
+            expression = f"boundary weak term for {kind} {field} on {boundary.region_id}"
+            coefficients = []
+        terms.append(
+            TAPSEquationTerm(
+                id=f"{boundary.id}:weak_boundary",
+                role=role,
+                expression=expression,
+                fields=[field],
+                coefficients=coefficients,
+                integration_domain=boundary.region_id,
+                assumptions=["Boundary term compiled as IR metadata; executable kernels may still use backend-specific boundary handling."],
+            )
+        )
+    return terms
+
+
 def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: KnowledgeContext | None) -> TAPSWeakFormSpec | None:
     if not problem.operators or not problem.fields:
         return None
     family = problem.operators[0].equation_class.lower()
     fields = [field.name for field in problem.fields]
     terms: list[TAPSEquationTerm] = []
+    boundary_terms: list[TAPSEquationTerm] = _boundary_weak_terms(problem)
     source = "physics_problem"
     if knowledge_context is not None and (knowledge_context.chunks or knowledge_context.deepsearch):
         source = "hybrid"
@@ -272,12 +325,20 @@ def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: Knowledg
             for index, term in enumerate(operator.differential_terms):
                 expression = term.expression if hasattr(term, "expression") else term.get("expression", "")
                 term_fields = term.fields if hasattr(term, "fields") else term.get("fields", [])
+                role = "custom"
+                coefficients: list[str] = []
+                if operator.form == "strong":
+                    role, expression, coefficients = _compile_strong_form_term(expression, term_fields or operator.fields_out or fields)
                 terms.append(
                     TAPSEquationTerm(
                         id=f"{operator.id}:term:{index}",
-                        role="custom",
+                        role=role,  # type: ignore[arg-type]
                         expression=expression,
                         fields=term_fields or operator.fields_out or fields,
+                        coefficients=coefficients,
+                        assumptions=["Compiled from strong-form token pattern; knowledge-agent review is recommended for high-trust use."]
+                        if operator.form == "strong"
+                        else [],
                     )
                 )
             for index, term in enumerate(operator.source_terms):
@@ -293,13 +354,14 @@ def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: Knowledg
 
     if not terms:
         return None
-    residual = " + ".join(term.expression for term in terms)
+    residual = " + ".join(term.expression for term in [*terms, *boundary_terms])
     return TAPSWeakFormSpec(
         family=family,
         strong_form="; ".join(f"{operator.name}:{operator.equation_class}" for operator in problem.operators),
         trial_fields=fields,
         test_functions=[f"v_{field}" for field in fields],
         terms=terms,
+        boundary_terms=boundary_terms,
         constraints=[constraint.expression for constraint in problem.constraints],
         residual_expression=f"Find fields such that {residual} = 0 for all test functions.",
         source=source,  # type: ignore[arg-type]
@@ -537,11 +599,274 @@ def author_taps_runtime_extension(input: AuthorTAPSRuntimeExtensionInput) -> Aut
     return AuthorTAPSRuntimeExtensionOutput(extension=extension)
 
 
+class ValidateTAPSIRInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+
+
+class ValidateTAPSIROutput(StrictBaseModel):
+    valid: bool
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    checks: list[dict[str, object]] = Field(default_factory=list)
+    fallback_recommended: bool = False
+    recommended_action: str = "run_taps_backend"
+    artifact: ArtifactRef
+
+
+def validate_taps_ir(input: ValidateTAPSIRInput) -> ValidateTAPSIROutput:
+    """Validate TAPS weak-form IR before execution or backend export."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks: list[dict[str, object]] = []
+    weak_form = input.taps_problem.weak_form
+    if weak_form is None:
+        errors.append("missing weak_form IR")
+        checks.append({"name": "weak_form_present", "passes": False})
+    else:
+        checks.append({"name": "weak_form_present", "passes": True, "family": weak_form.family})
+        if not weak_form.trial_fields:
+            errors.append("weak_form has no trial_fields")
+        checks.append({"name": "trial_fields_declared", "passes": bool(weak_form.trial_fields), "trial_fields": weak_form.trial_fields})
+        field_names = {field.name for field in input.problem.fields}
+        missing_fields = [field for field in weak_form.trial_fields if field not in field_names]
+        if missing_fields:
+            errors.append(f"weak_form trial_fields not declared in PhysicsProblem.fields: {missing_fields}")
+        checks.append({"name": "trial_fields_match_problem_fields", "passes": not missing_fields, "missing_fields": missing_fields})
+        if not weak_form.terms:
+            errors.append("weak_form has no equation terms")
+        checks.append({"name": "equation_terms_present", "passes": bool(weak_form.terms), "term_count": len(weak_form.terms)})
+        if any(term.role == "time_derivative" for term in weak_form.terms) and not input.problem.initial_conditions:
+            errors.append("time_derivative term requires at least one InitialConditionSpec")
+        checks.append(
+            {
+                "name": "time_derivative_has_initial_condition",
+                "passes": not any(term.role == "time_derivative" for term in weak_form.terms) or bool(input.problem.initial_conditions),
+            }
+        )
+    coefficient_names = {coefficient.name.lower() for coefficient in input.taps_problem.coefficients}
+    required_coefficients = {
+        coefficient.lower()
+        for term in (weak_form.terms if weak_form is not None else [])
+        for coefficient in term.coefficients
+    }
+    missing_coefficients = sorted(required_coefficients - coefficient_names)
+    if missing_coefficients:
+        warnings.append(f"coefficients referenced by weak_form but not provided explicitly: {missing_coefficients}")
+    checks.append({"name": "referenced_coefficients_available", "passes": not missing_coefficients, "missing_coefficients": missing_coefficients})
+    has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in input.taps_problem.geometry_encodings)
+    if supports_vector_elasticity_weak_form(input.taps_problem) and not has_mesh_graph:
+        errors.append("vector elasticity IR requires mesh_graph geometry encoding")
+    if supports_hcurl_curl_curl_weak_form(input.taps_problem) and not has_mesh_graph:
+        errors.append("H(curl) curl-curl IR requires mesh_graph geometry encoding")
+    supported = any(
+        [
+            supports_transient_diffusion_weak_form(input.taps_problem),
+            supports_coupled_reaction_diffusion_weak_form(input.taps_problem),
+            supports_hcurl_curl_curl_weak_form(input.taps_problem),
+            supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem),
+            supports_scalar_elliptic_weak_form(input.taps_problem),
+            supports_vector_elasticity_weak_form(input.taps_problem),
+            (weak_form.family.lower() if weak_form is not None else "") in GENERIC_TAPS_FAMILIES,
+        ]
+    )
+    if not supported:
+        warnings.append("no executable TAPS IR block mapping is currently connected for this weak_form")
+    checks.append({"name": "executable_block_mapping_connected", "passes": supported})
+    fallback_recommended = bool(errors) or not supported
+    recommended_action = "run_taps_backend"
+    if errors:
+        recommended_action = "ask_user_or_knowledge_agent"
+    elif not supported:
+        recommended_action = "author_runtime_extension_or_export_full_solver"
+    output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_validation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "taps_ir_validation.json"
+    path.write_text(
+        json.dumps(
+            {
+                "valid": not errors,
+                "errors": errors,
+                "warnings": warnings,
+                "checks": checks,
+                "fallback_recommended": fallback_recommended,
+                "recommended_action": recommended_action,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return ValidateTAPSIROutput(
+        valid=not errors,
+        errors=errors,
+        warnings=warnings,
+        checks=checks,
+        fallback_recommended=fallback_recommended,
+        recommended_action=recommended_action,
+        artifact=ArtifactRef(uri=str(path), kind="taps_ir_validation", format="json"),
+    )
+
+
+class ExportTAPSBackendBridgeInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    backend: str = "fenicsx"
+
+
+class ExportTAPSBackendBridgeOutput(StrictBaseModel):
+    manifest: ArtifactRef
+    draft_artifact: ArtifactRef | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _backend_bridge_draft(backend: str, blocks: list[dict[str, object]], weak_form: TAPSWeakFormSpec | None) -> tuple[str, str]:
+    families = {str(block.get("family")) for block in blocks}
+    if backend == "fenicsx":
+        lines = [
+            "# Draft FEniCSx bridge generated from TAPS IR. Review before execution.",
+            "from dolfinx import fem",
+            "import ufl",
+            "",
+            "# TODO: load mesh/facet tags from PhysicsOS backend mesh export manifest.",
+            "# TODO: bind coefficients and boundary terms from TAPSProblem.",
+        ]
+        if "hcurl_curl_curl" in families:
+            lines.append("# Use Nedelec element: element = ufl.FiniteElement('N1curl', cell, degree)")
+        elif "vector_elasticity" in families:
+            lines.append("# Use vector H1 space and form: inner(eps(v), C*eps(u))*dx")
+        elif "coupled_reaction_diffusion" in families:
+            lines.append("# Use mixed H1 space and block/mixed nonlinear form.")
+        elif "transient_diffusion" in families:
+            lines.append("# Use H1 space with implicit Euler or Crank-Nicolson time stepping.")
+            lines.append("# Example residual: (u-u_n)/dt*v*dx + k*dot(grad(u), grad(v))*dx")
+        else:
+            lines.append("# Use H1 space and scalar elliptic form: k*dot(grad(u), grad(v))*dx")
+        return "py", "\n".join(lines) + "\n"
+    if backend == "mfem":
+        return "py", "\n".join(
+            [
+                "# Draft PyMFEM bridge generated from TAPS IR. Review before execution.",
+                "# TODO: load MFEM mesh converted from PhysicsOS mesh export manifest.",
+                "# TODO: choose H1, ND, or mixed finite element collection from blocks.",
+                f"# Blocks: {[block.get('family') for block in blocks]}",
+            ]
+        ) + "\n"
+    if backend == "petsc":
+        return "py", "\n".join(
+            [
+                "# Draft petsc4py bridge generated from TAPS IR. Review before execution.",
+                "# TODO: assemble Mat/Vec from exported TAPS block operators or backend FEM code.",
+                f"# Trial fields: {weak_form.trial_fields if weak_form is not None else []}",
+            ]
+        ) + "\n"
+    return "md", "# Generic TAPS backend bridge draft\n\nReview IR blocks and map them to a trusted backend manually.\n"
+
+
+def export_taps_backend_bridge(input: ExportTAPSBackendBridgeInput) -> ExportTAPSBackendBridgeOutput:
+    """Export a safe manifest describing how TAPS IR maps to a real PDE backend.
+
+    This does not execute external solvers or generate trusted production code.
+    It records weak-form blocks, required function-space hints, and fallback
+    targets for a reviewed FEniCSx/MFEM/PETSc implementation.
+    """
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=input.taps_problem))
+    backend = input.backend.lower()
+    weak_form = input.taps_problem.weak_form
+    blocks: list[dict[str, object]] = []
+    if supports_transient_diffusion_weak_form(input.taps_problem):
+        blocks.append({"family": "transient_diffusion", "space": "H1", "time_integrator": "implicit_euler_or_crank_nicolson"})
+    if supports_scalar_elliptic_weak_form(input.taps_problem):
+        blocks.append({"family": "scalar_elliptic", "space": "H1"})
+    if supports_vector_elasticity_weak_form(input.taps_problem):
+        blocks.append({"family": "vector_elasticity", "space": "vector_H1"})
+    if supports_hcurl_curl_curl_weak_form(input.taps_problem):
+        blocks.append({"family": "hcurl_curl_curl", "space": "Nedelec_Hcurl"})
+    if supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem):
+        blocks.append({"family": "nonlinear_reaction_diffusion", "space": "H1", "nonlinear_solver": "Picard_or_Newton"})
+    if supports_coupled_reaction_diffusion_weak_form(input.taps_problem):
+        blocks.append({"family": "coupled_reaction_diffusion", "space": "mixed_H1", "block_solver": "monolithic_or_block_gauss_seidel"})
+    warnings = list(validation.warnings)
+    if validation.errors:
+        warnings.extend(validation.errors)
+    if backend not in {"fenicsx", "mfem", "petsc", "generic"}:
+        warnings.append(f"backend={input.backend!r} is not a known bridge target; manifest emitted as generic guidance")
+    output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_backend_bridge"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{backend}_bridge_manifest.json"
+    draft_format, draft_text = _backend_bridge_draft(backend, blocks, weak_form)
+    draft_path = output_dir / f"{backend}_bridge_draft.{draft_format}"
+    payload = {
+        "schema_version": "physicsos.taps_backend_bridge.v1",
+        "problem_id": input.problem.id,
+        "taps_problem_id": input.taps_problem.id,
+        "target_backend": backend,
+        "weak_form_family": weak_form.family if weak_form is not None else None,
+        "trial_fields": weak_form.trial_fields if weak_form is not None else [],
+        "blocks": blocks,
+        "validation_artifact": validation.artifact.uri,
+        "fallback_policy": {
+            "execute_external_solver": False,
+            "requires_review": True,
+            "recommended_action": validation.recommended_action,
+        },
+        "warnings": warnings,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    draft_path.write_text(draft_text, encoding="utf-8")
+    return ExportTAPSBackendBridgeOutput(
+        manifest=ArtifactRef(uri=str(path), kind="taps_backend_bridge_manifest", format="json"),
+        draft_artifact=ArtifactRef(uri=str(draft_path), kind="taps_backend_bridge_draft", format=draft_format),
+        warnings=warnings,
+    )
+
+
+class PlanTAPSAdaptiveFallbackInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    preferred_backend: str = "fenicsx"
+
+
+class PlanTAPSAdaptiveFallbackOutput(StrictBaseModel):
+    decision: dict[str, object]
+    artifact: ArtifactRef
+
+
+def plan_taps_adaptive_fallback(input: PlanTAPSAdaptiveFallbackInput) -> PlanTAPSAdaptiveFallbackOutput:
+    """Plan the next safe action when TAPS IR is incomplete, unsafe, or unsupported."""
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=input.taps_problem))
+    if not validation.fallback_recommended:
+        mode = "run_taps_backend"
+        reason = "TAPS IR passed readiness checks and has an executable block mapping."
+    elif validation.errors:
+        mode = "ask_knowledge_agent"
+        reason = "TAPS IR has blocking validation errors that should be resolved before execution."
+    else:
+        mode = "export_backend_bridge"
+        reason = "TAPS IR compiled but lacks a connected local executable mapping; export reviewed backend bridge."
+    decision: dict[str, object] = {
+        "mode": mode,
+        "reason": reason,
+        "validation_artifact": validation.artifact.uri,
+        "preferred_backend": input.preferred_backend,
+        "allowed_actions": ["ask_knowledge_agent", "author_runtime_extension", "export_backend_bridge", "prepare_full_solver_case"],
+        "execute_external_solver": False,
+    }
+    output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_fallback"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "adaptive_fallback_decision.json"
+    path.write_text(json.dumps(decision, indent=2), encoding="utf-8")
+    return PlanTAPSAdaptiveFallbackOutput(
+        decision=decision,
+        artifact=ArtifactRef(uri=str(path), kind="taps_adaptive_fallback_decision", format="json"),
+    )
+
+
 def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     """Run the TAPS backend."""
     operator_classes = {operator.equation_class.lower() for operator in input.problem.operators}
     is_heat = bool(operator_classes.intersection({"heat", "diffusion", "thermal_diffusion"}))
-    if is_heat and input.problem.initial_conditions:
+    is_transient_diffusion_ir = supports_transient_diffusion_weak_form(input.taps_problem)
+    if (is_heat or is_transient_diffusion_ir) and input.problem.initial_conditions:
         artifacts, residual_report = solve_transient_heat_1d(input.taps_problem)
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
@@ -552,10 +877,11 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         result = SolverResult(
             id=f"result:{input.taps_problem.id}",
             problem_id=input.problem.id,
-            backend="taps:thermal_1d",
+            backend="taps:thermal_1d" if is_heat else "taps:weak_ir_transient_diffusion_1d:custom",
             status="success" if residual_report.converged else "needs_review",
             scalar_outputs={
                 "message": "TAPS thermal MVP backend executed.",
+                "weak_form_ir_blocks": is_transient_diffusion_ir,
                 "tensor_rank": input.taps_problem.basis.tensor_rank,
                 **residual_report.residuals,
             },
@@ -873,6 +1199,9 @@ for _tool, _input, _output in [
     (formulate_taps_equation, FormulateTAPSEquationInput, FormulateTAPSEquationOutput),
     (build_taps_problem, BuildTAPSProblemInput, BuildTAPSProblemOutput),
     (author_taps_runtime_extension, AuthorTAPSRuntimeExtensionInput, AuthorTAPSRuntimeExtensionOutput),
+    (validate_taps_ir, ValidateTAPSIRInput, ValidateTAPSIROutput),
+    (export_taps_backend_bridge, ExportTAPSBackendBridgeInput, ExportTAPSBackendBridgeOutput),
+    (plan_taps_adaptive_fallback, PlanTAPSAdaptiveFallbackInput, PlanTAPSAdaptiveFallbackOutput),
     (run_taps_backend, RunTAPSBackendInput, RunTAPSBackendOutput),
     (estimate_taps_residual, EstimateTAPSResidualInput, EstimateTAPSResidualOutput),
 ]:

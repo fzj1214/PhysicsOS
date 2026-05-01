@@ -682,6 +682,60 @@ def supports_coupled_reaction_diffusion_weak_form(problem: TAPSProblem) -> bool:
     return _weak_form_coupled_reaction_diffusion_blocks(problem) is not None
 
 
+def weak_form_transient_diffusion_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) != 1:
+        return None
+    blocks: list[dict[str, str]] = []
+    has_time_derivative = False
+    has_diffusion = False
+    has_mass = False
+    has_source = False
+    allowed_roles = {"time_derivative", "mass", "diffusion", "source", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_time = role == "time_derivative" or any(token in expression for token in ("d/dt", "dt", "partial_t", "∂", "time_derivative"))
+        is_mass = role == "mass" or any(token in expression for token in ("mass", " v u", "v*u"))
+        is_diffusion = role == "diffusion" or any(token in expression for token in ("grad(", "laplacian", "nabla", "d2"))
+        is_source = role == "source" or any(token in expression for token in ("source", " rhs", " f ", "v f", "v*f"))
+        if role == "custom" and not (is_time or is_mass or is_diffusion or is_source):
+            return None
+        if is_time:
+            has_time_derivative = True
+            blocks.append({"role": "time_derivative", "term_id": term.id, "expression": term.expression})
+        if is_mass:
+            has_mass = True
+            blocks.append({"role": "mass", "term_id": term.id, "expression": term.expression})
+        if is_diffusion:
+            has_diffusion = True
+            blocks.append({"role": "diffusion", "term_id": term.id, "expression": term.expression})
+        if is_source:
+            has_source = True
+            blocks.append({"role": "source", "term_id": term.id, "expression": term.expression})
+    if not (has_time_derivative and has_diffusion):
+        return None
+    return {
+        "operator_family": "transient_diffusion",
+        "source": "weak_form_ir",
+        "fields": weak_form.trial_fields,
+        "blocks": blocks,
+        "has_time_derivative": has_time_derivative,
+        "has_mass": has_mass,
+        "has_diffusion": has_diffusion,
+        "has_source": has_source,
+        "time_integrator": "low_rank_spt_surrogate",
+    }
+
+
+def supports_transient_diffusion_weak_form(problem: TAPSProblem) -> bool:
+    return weak_form_transient_diffusion_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):

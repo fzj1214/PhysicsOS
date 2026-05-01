@@ -1368,6 +1368,13 @@ custom vector elasticity weak-form IR terms mapped to reusable strain-energy / b
 custom H(curl) curl-curl weak-form IR terms mapped to reusable curl-curl / mass / source assembler blocks
 custom nonlinear reaction-diffusion weak-form IR terms mapped to reusable diffusion / nonlinear-reaction / source Picard blocks
 custom coupled-field weak-form IR terms mapped to reusable field-diffusion / coupling-operator / reaction / source subspace-solver blocks
+custom transient diffusion weak-form IR terms mapped to reusable time-derivative / mass / diffusion / source time-integration blocks
+symbolic TAPS IR validation for field, coefficient, initial-condition, geometry-encoding, and function-space compatibility
+safe TAPS backend bridge manifest export for FEniCSx / MFEM / PETSc review without executing external solvers
+reviewable FEniCSx / PyMFEM / petsc4py draft artifacts generated from TAPS IR bridge manifests
+adaptive fallback decision artifacts for knowledge-agent, runtime-extension, backend-bridge, or full-solver preparation
+strong-form diffusion/time/reaction/curl token patterns compiled into weak-form IR terms for reviewed execution
+Neumann / Robin / interface / custom boundary conditions compiled into first-class boundary weak-term IR metadata
 heat / diffusion
 Poisson
 reaction-diffusion
@@ -1378,8 +1385,8 @@ knowledge-assisted unspecified physics
 Next implementation requirement:
 
 ```text
-extend weak-form IR block mapping beyond scalar/vector/H(curl)/nonlinear/coupled
-operators into transient mass/time-derivative time integrators and solver-export bridges.
+harden reviewed backend drafts into auditable executable exports with dependency,
+mesh, coefficient, boundary, and safety gates.
 
 near-term executable IR extensions:
 1. transient mass/time-derivative blocks:
@@ -1809,7 +1816,14 @@ done: custom vector elasticity weak-form IR can execute through reusable strain-
 done: custom H(curl) curl-curl weak-form IR can execute through reusable curl-curl/mass/source blocks on the Nedelec mesh_graph EM path.
 done: custom nonlinear reaction-diffusion weak-form IR can execute through reusable diffusion/nonlinear-reaction/source Picard blocks.
 done: custom coupled-field weak-form IR can execute through reusable field-diffusion/coupling/reaction/source blocks on the 2-field subspace solver path.
-next: extend reusable weak-form IR block mapping to transient mass/time-derivative time integrators, boundary weak terms, strong-form compilation, symbolic validation, adaptive fallback, and real backend export.
+done: custom transient diffusion weak-form IR can execute through reusable time-derivative/mass/diffusion/source blocks on the low-rank S-P-T time path.
+done: `validate_taps_ir` performs symbolic IR readiness checks and recommends knowledge/runtime-extension/full-solver fallback when mappings are unsafe.
+done: `export_taps_backend_bridge` emits reviewed real-backend bridge manifests for FEniCSx/MFEM/PETSc without running external solvers.
+done: backend bridge export now also emits reviewable FEniCSx/PyMFEM/petsc4py draft artifacts.
+done: `plan_taps_adaptive_fallback` emits explicit safe fallback decision artifacts without executing external solvers.
+done: strong-form diffusion/time/reaction/curl token patterns compile into reviewed weak-form IR terms.
+done: Neumann/Robin/interface/custom boundary conditions compile into first-class boundary weak-term IR metadata.
+next: turn reviewed backend drafts into auditable executable exports guarded by dependency checks, mesh export manifests, coefficient binding, boundary-tag binding, and explicit user approval.
 ```
 
 PhysicsOS Cloud / foamvm scope:

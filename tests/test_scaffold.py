@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from physicsos.schemas.boundary import InitialConditionSpec
 from physicsos.schemas.common import ComputeBudget, Provenance
 from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
 from physicsos.schemas.geometry import GeometryEncoding
@@ -26,14 +27,20 @@ from physicsos.tools.surrogate_tools import RouteSurrogateModelInput, RunSurroga
 from physicsos.tools.taps_tools import (
     BuildTAPSProblemInput,
     EstimateTAPSResidualInput,
+    ExportTAPSBackendBridgeInput,
     FormulateTAPSEquationInput,
+    PlanTAPSAdaptiveFallbackInput,
     RunTAPSBackendInput,
+    ValidateTAPSIRInput,
     AuthorTAPSRuntimeExtensionInput,
     author_taps_runtime_extension,
     build_taps_problem,
     estimate_taps_residual,
+    export_taps_backend_bridge,
     formulate_taps_equation,
+    plan_taps_adaptive_fallback,
     run_taps_backend,
+    validate_taps_ir,
 )
 from physicsos.tools.verification_tools import (
     CheckConservationLawsInput,
@@ -142,6 +149,9 @@ def test_tool_registry_has_core_tools() -> None:
     assert "export_backend_mesh" in TOOL_REGISTRY
     assert "prepare_mesh_conversion_job" in TOOL_REGISTRY
     assert "submit_mesh_conversion_job" in TOOL_REGISTRY
+    assert "validate_taps_ir" in TOOL_REGISTRY
+    assert "export_taps_backend_bridge" in TOOL_REGISTRY
+    assert "plan_taps_adaptive_fallback" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
     assert "recommend_runtime_stack" in TOOL_REGISTRY
@@ -421,6 +431,104 @@ def test_taps_executes_custom_scalar_elliptic_weak_form_ir() -> None:
     assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"diffusion", "source"}
 
 
+def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-transient-line", source=GeometrySource(kind="generated"), dimension=1)
+    problem = PhysicsProblem(
+        id="problem:custom-transient-diffusion-1d",
+        user_intent={"raw_request": "solve a custom transient diffusion weak form"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="T", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-transient",
+                name="Custom transient diffusion",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["T"],
+                differential_terms=[
+                    {"expression": "int_Omega v dT/dt dOmega", "order": 1, "fields": ["T"]},
+                    {"expression": "int_Omega grad(v) dot alpha grad(T) dOmega", "order": 2, "fields": ["T"]},
+                ],
+                source_terms=[{"expression": "0"}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:thermal-custom", name="thermal custom", phase="solid", properties=[MaterialProperty(name="alpha", value=0.05)])],
+        boundary_conditions=[
+            {"id": "bc:left", "region_id": "x=0", "field": "T", "kind": "dirichlet", "value": 0.0},
+            {"id": "bc:right", "region_id": "x=1", "field": "T", "kind": "dirichlet", "value": 0.0},
+        ],
+        initial_conditions=[InitialConditionSpec(id="ic:T", field="T", value={"expression": "sin(pi*x)", "language": "text"})],
+        targets=[{"name": "field", "field": "T", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    for axis in plan.axes:
+        if axis.kind in {"space", "time"}:
+            axis.points = 16
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    bridge = export_taps_backend_bridge(ExportTAPSBackendBridgeInput(problem=problem, taps_problem=taps_problem, backend="fenicsx"))
+    fallback = plan_taps_adaptive_fallback(PlanTAPSAdaptiveFallbackInput(problem=problem, taps_problem=taps_problem))
+    assert validation.valid
+    assert any(check["name"] == "executable_block_mapping_connected" and check["passes"] for check in validation.checks)
+    assert not validation.fallback_recommended
+    assert fallback.decision["mode"] == "run_taps_backend"
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_transient_diffusion_1d:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    metadata_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_reconstruction_metadata")
+    metadata_payload = json.loads(open(metadata_artifact.uri, encoding="utf-8").read())
+    assert metadata_payload["weak_form_blocks"]["operator_family"] == "transient_diffusion"
+    bridge_payload = json.loads(open(bridge.manifest.uri, encoding="utf-8").read())
+    assert bridge_payload["schema_version"] == "physicsos.taps_backend_bridge.v1"
+    assert {"family": "transient_diffusion", "space": "H1", "time_integrator": "implicit_euler_or_crank_nicolson"} in bridge_payload["blocks"]
+    assert bridge.draft_artifact is not None
+    assert "Crank" in open(bridge.draft_artifact.uri, encoding="utf-8").read()
+
+
+def test_taps_compiles_strong_form_and_boundary_weak_terms() -> None:
+    geometry = GeometrySpec(id="geometry:strong-line", source=GeometrySource(kind="generated"), dimension=1)
+    problem = PhysicsProblem(
+        id="problem:strong-form-diffusion-1d",
+        user_intent={"raw_request": "compile a strong-form diffusion equation with a Neumann weak boundary term"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:strong-diffusion",
+                name="Strong diffusion",
+                domain="custom",
+                equation_class="custom",
+                form="strong",
+                fields_out=["u"],
+                differential_terms=[{"expression": "-div(k grad(u)) = f", "order": 2, "fields": ["u"]}],
+                source_terms=[{"expression": "int_Omega v_u f dOmega"}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:strong", name="strong", phase="solid", properties=[MaterialProperty(name="k", value=1.0)])],
+        boundary_conditions=[
+            {"id": "bc:left", "region_id": "x=0", "field": "u", "kind": "dirichlet", "value": 0.0},
+            {"id": "bc:right_flux", "region_id": "x=1", "field": "u", "kind": "neumann", "value": 0.0},
+        ],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    assert taps_problem.weak_form is not None
+    assert taps_problem.weak_form.terms[0].role == "diffusion"
+    assert "grad(v_u)" in taps_problem.weak_form.terms[0].expression
+    assert taps_problem.weak_form.boundary_terms
+    assert taps_problem.weak_form.boundary_terms[0].integration_domain == "x=1"
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_scalar_elliptic_1d:custom"
+
+
 def test_taps_agent_requests_knowledge_for_under_specified_problem() -> None:
     geometry = GeometrySpec(id="geometry:unknown", source=GeometrySource(kind="text"), dimension=3)
     problem = PhysicsProblem(
@@ -447,6 +555,44 @@ def test_taps_agent_requests_knowledge_for_under_specified_problem() -> None:
     plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
     assert plan.status == "needs_knowledge"
     assert plan.required_knowledge_queries
+
+
+def test_taps_adaptive_fallback_exports_bridge_for_unsupported_ir() -> None:
+    geometry = GeometrySpec(id="geometry:unsupported-custom", source=GeometrySource(kind="generated"), dimension=1)
+    problem = PhysicsProblem(
+        id="problem:unsupported-custom-ir",
+        user_intent={"raw_request": "compile an unsupported algebraic custom weak form"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="q", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:unsupported",
+                name="Unsupported custom weak form",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["q"],
+                differential_terms=[{"expression": "int_Omega v_q custom_memory_kernel(q) dOmega", "fields": ["q"]}],
+            )
+        ],
+        materials=[],
+        boundary_conditions=[],
+        targets=[{"name": "field", "field": "q", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    fallback = plan_taps_adaptive_fallback(PlanTAPSAdaptiveFallbackInput(problem=problem, taps_problem=taps_problem, preferred_backend="mfem"))
+    bridge = export_taps_backend_bridge(ExportTAPSBackendBridgeInput(problem=problem, taps_problem=taps_problem, backend="mfem"))
+    assert validation.valid
+    assert validation.fallback_recommended
+    assert validation.recommended_action == "author_runtime_extension_or_export_full_solver"
+    assert fallback.decision["mode"] == "export_backend_bridge"
+    assert fallback.decision["execute_external_solver"] is False
+    assert bridge.draft_artifact is not None
+    assert "PyMFEM" in open(bridge.draft_artifact.uri, encoding="utf-8").read()
 
 
 def test_taps_problem_carries_general_weak_form_ir() -> None:

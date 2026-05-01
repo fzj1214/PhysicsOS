@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from physicsos.config import project_root
+from physicsos.backends.taps_generic import weak_form_transient_diffusion_blocks
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.taps import TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
 
@@ -64,6 +65,7 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
     """
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_thermal"
     output_dir.mkdir(parents=True, exist_ok=True)
+    weak_form_blocks = weak_form_transient_diffusion_blocks(taps_problem)
 
     x = _axis(taps_problem, "x", 0.0, 1.0, 128)
     alpha = _axis(taps_problem, "alpha", 0.01, 0.1, 48)
@@ -98,6 +100,7 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
 
     factor_payload = {
         "type": "low_rank_heat_1d_spt",
+        "weak_form_blocks": weak_form_blocks,
         "rank": rank,
         "axes": {
             "x": x,
@@ -113,9 +116,11 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
     }
     metadata_payload = {
         "equation": "dT/dt = alpha d2T/dx2",
+        "weak_form_blocks": weak_form_blocks,
         "initial_condition": "sin(pi x / L)",
         "boundary_condition": "T(0,t)=T(L,t)=0",
         "rank": rank,
+        "weak_form_blocks": weak_form_blocks,
         "relative_l2_reconstruction_error": relative_l2,
         "normalized_pde_residual": normalized_residual,
     }
