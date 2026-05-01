@@ -429,6 +429,211 @@ def apply_boundary_labeling_artifact(input: ApplyBoundaryLabelingArtifactInput) 
     )
 
 
+class CreateGeometryLabelerViewerInput(StrictBaseModel):
+    labeling_artifact: ArtifactRef
+    title: str = "PhysicsOS Geometry Labeler"
+
+
+class CreateGeometryLabelerViewerOutput(StrictBaseModel):
+    viewer: ArtifactRef
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _geometry_labeler_html(title: str, artifact_json: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: radial-gradient(circle at 20% 0%, rgba(34,211,238,.18), transparent 32%), #020617; color: #e2e8f0; }}
+    main {{ max-width: 1280px; margin: 0 auto; padding: 28px; }}
+    header, section {{ border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.04); border-radius: 28px; padding: 22px; }}
+    h1 {{ margin: 8px 0 0; font-size: clamp(30px, 5vw, 54px); line-height: 1; }}
+    .eyebrow {{ color: #67e8f9; font-size: 12px; letter-spacing: .28em; text-transform: uppercase; }}
+    .grid {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .72fr); gap: 18px; margin-top: 18px; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    svg {{ width: 100%; height: auto; border-radius: 24px; background: radial-gradient(circle at top, rgba(34,211,238,.16), transparent 45%), #020617; }}
+    button, select, input {{ border-radius: 999px; border: 1px solid rgba(255,255,255,.12); background: rgba(15,23,42,.9); color: #e2e8f0; padding: 10px 12px; }}
+    button {{ cursor: pointer; }}
+    button.primary {{ background: #67e8f9; color: #020617; border: 0; font-weight: 700; }}
+    .groups {{ display: grid; gap: 8px; max-height: 300px; overflow: auto; }}
+    .group {{ width: 100%; text-align: left; border-radius: 16px; }}
+    .group.active {{ border-color: #67e8f9; background: rgba(34,211,238,.14); }}
+    label {{ display: grid; gap: 6px; color: #94a3b8; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; }}
+    pre, textarea {{ box-sizing: border-box; width: 100%; min-height: 260px; overflow: auto; border: 1px solid rgba(255,255,255,.1); border-radius: 20px; background: rgba(2,6,23,.78); color: #cbd5e1; padding: 14px; font-size: 12px; line-height: 1.55; }}
+    .controls {{ display: grid; gap: 12px; margin-top: 12px; }}
+    .two {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">PhysicsOS standalone tool</div>
+      <h1>{title}</h1>
+      <p>Rotate the mesh/facet artifact, select a face/edge group, confirm its physical label, then use the output JSON with <code>apply_boundary_labeling_artifact</code>.</p>
+    </header>
+    <div class="grid">
+      <section>
+        <svg id="viewer" viewBox="0 0 560 560"></svg>
+        <div class="two">
+          <label>Yaw <input id="yaw" type="range" min="-3.14" max="3.14" step="0.01" value="-0.65" /></label>
+          <label>Pitch <input id="pitch" type="range" min="-1.4" max="1.4" step="0.01" value="0.45" /></label>
+        </div>
+      </section>
+      <section>
+        <h2>Selectable groups</h2>
+        <div class="groups" id="groups"></div>
+        <div class="controls">
+          <label>Label <input id="label" value="boundary" /></label>
+          <label>Kind
+            <select id="kind">
+              <option>inlet</option><option>outlet</option><option>wall</option><option>symmetry</option><option>periodic</option><option>interface</option><option>farfield</option><option selected>surface</option><option>custom</option>
+            </select>
+          </label>
+          <button class="primary" id="confirm">Confirm selected group</button>
+        </div>
+      </section>
+    </div>
+    <section style="margin-top:18px">
+      <h2>Confirmed artifact output</h2>
+      <pre id="output"></pre>
+    </section>
+    <section style="margin-top:18px">
+      <h2>Embedded input artifact</h2>
+      <textarea id="input"></textarea>
+    </section>
+  </main>
+  <script id="artifact" type="application/json">{artifact_json}</script>
+  <script>
+    const artifact = JSON.parse(document.getElementById('artifact').textContent);
+    document.getElementById('input').value = JSON.stringify(artifact, null, 2);
+    let selectedId = artifact.selectable_groups?.[0]?.id || null;
+    let confirmed = artifact.confirmed_boundary_labels || [];
+    const svg = document.getElementById('viewer');
+    const yaw = document.getElementById('yaw');
+    const pitch = document.getElementById('pitch');
+    const label = document.getElementById('label');
+    const kind = document.getElementById('kind');
+
+    function inferKind(name) {{
+      const s = String(name || '').toLowerCase();
+      if (s.includes('inlet')) return 'inlet';
+      if (s.includes('outlet')) return 'outlet';
+      if (s.includes('wall')) return 'wall';
+      if (s.includes('symmetry')) return 'symmetry';
+      if (s.includes('periodic')) return 'periodic';
+      if (s.includes('farfield')) return 'farfield';
+      return 'surface';
+    }}
+    function points2d(points, yawValue, pitchValue) {{
+      if (!points.length) return [];
+      const min = [0,1,2].map(a => Math.min(...points.map(p => p[a] || 0)));
+      const max = [0,1,2].map(a => Math.max(...points.map(p => p[a] || 0)));
+      const center = min.map((v,a) => (v + max[a]) / 2);
+      const span = Math.max(...max.map((v,a) => v - min[a]), 1e-6);
+      const cy = Math.cos(yawValue), sy = Math.sin(yawValue), cp = Math.cos(pitchValue), sp = Math.sin(pitchValue);
+      return points.map(p => {{
+        const x0 = ((p[0] || 0) - center[0]) / span, y0 = ((p[1] || 0) - center[1]) / span, z0 = ((p[2] || 0) - center[2]) / span;
+        const x1 = cy * x0 + sy * z0, z1 = -sy * x0 + cy * z0, y1 = cp * y0 - sp * z1, z2 = sp * y0 + cp * z1;
+        return {{ x: 280 + x1 * 370, y: 280 - y1 * 370, z: z2 }};
+      }});
+    }}
+    function selectGroup(id) {{
+      selectedId = id;
+      const group = artifact.selectable_groups.find(g => g.id === id);
+      label.value = group?.name || 'boundary';
+      kind.value = inferKind(group?.name);
+      renderGroups();
+      render();
+    }}
+    function renderGroups() {{
+      const root = document.getElementById('groups');
+      root.innerHTML = '';
+      for (const group of artifact.selectable_groups || []) {{
+        const button = document.createElement('button');
+        button.className = 'group' + (group.id === selectedId ? ' active' : '');
+        button.innerHTML = `<strong>${{group.name}}</strong><br/><small>${{group.id}}</small><br/><small>faces ${{group.face_ids?.length || 0}} · edges ${{group.edge_ids?.length || 0}}</small>`;
+        button.onclick = () => selectGroup(group.id);
+        root.appendChild(button);
+      }}
+    }}
+    function render() {{
+      const geom = artifact.viewer_geometry || {{}};
+      const points = geom.points || [], faces = geom.faces || [], edges = geom.edges || [];
+      const projected = points2d(points, Number(yaw.value), Number(pitch.value));
+      const groupByFace = new Map();
+      for (const group of artifact.selectable_groups || []) for (const faceId of group.face_ids || []) groupByFace.set(faceId, group);
+      svg.innerHTML = '';
+      faces.map((face, index) => ({{ face, index, depth: face.reduce((s,i) => s + (projected[i]?.z || 0), 0) / Math.max(face.length, 1), group: groupByFace.get(index) }}))
+        .sort((a,b) => a.depth - b.depth)
+        .forEach(item => {{
+          const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+          polygon.setAttribute('points', item.face.map(i => `${{projected[i]?.x || 0}},${{projected[i]?.y || 0}}`).join(' '));
+          polygon.setAttribute('fill', item.group?.id === selectedId ? 'rgba(34,211,238,.45)' : item.group ? 'rgba(148,163,184,.18)' : 'rgba(71,85,105,.12)');
+          polygon.setAttribute('stroke', item.group?.id === selectedId ? 'rgb(103,232,249)' : 'rgba(255,255,255,.18)');
+          polygon.setAttribute('stroke-width', item.group?.id === selectedId ? '3' : '1');
+          polygon.style.cursor = item.group ? 'pointer' : 'default';
+          if (item.group) polygon.onclick = () => selectGroup(item.group.id);
+          svg.appendChild(polygon);
+        }});
+      for (const edge of edges) {{
+        const a = projected[edge[0]], b = projected[edge[1]];
+        if (!a || !b) continue;
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', a.x); line.setAttribute('y1', a.y); line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+        line.setAttribute('stroke', 'rgba(226,232,240,.35)'); line.setAttribute('stroke-width', '1.2');
+        svg.appendChild(line);
+      }}
+    }}
+    function renderOutput() {{
+      document.getElementById('output').textContent = JSON.stringify({{ ...artifact, confirmed_boundary_labels: confirmed }}, null, 2);
+    }}
+    document.getElementById('confirm').onclick = () => {{
+      if (!selectedId) return;
+      const next = {{ target_ids: [selectedId], boundary_id: `boundary:${{label.value}}`, label: label.value, kind: kind.value, confidence: 1, confirmed_by: 'user' }};
+      confirmed = confirmed.filter(item => !item.target_ids.includes(selectedId)).concat([next]);
+      renderOutput();
+    }};
+    yaw.oninput = render; pitch.oninput = render;
+    if (selectedId) selectGroup(selectedId);
+    renderGroups(); render(); renderOutput();
+  </script>
+</body>
+</html>
+"""
+
+
+def create_geometry_labeler_viewer(input: CreateGeometryLabelerViewerInput) -> CreateGeometryLabelerViewerOutput:
+    """Create a standalone HTML viewer for confirming boundary labeling artifacts."""
+    payload = _read_json_artifact(input.labeling_artifact.uri)
+    warnings: list[str] = []
+    if payload is None:
+        return CreateGeometryLabelerViewerOutput(
+            viewer=ArtifactRef(uri=input.labeling_artifact.uri, kind="geometry_labeler_viewer", format="html"),
+            warnings=["Boundary labeling artifact is missing or invalid JSON; no viewer was created."],
+        )
+    if payload.get("schema_version") != "physicsos.boundary_labeling.v1":
+        warnings.append(f"Unexpected labeling artifact schema: {payload.get('schema_version')}")
+    source_path = Path(input.labeling_artifact.uri)
+    output_dir = source_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    viewer_path = output_dir / "geometry_labeler_viewer.html"
+    artifact_json = json.dumps(payload).replace("</", "<\\/")
+    viewer_path.write_text(_geometry_labeler_html(input.title, artifact_json), encoding="utf-8")
+    return CreateGeometryLabelerViewerOutput(
+        viewer=ArtifactRef(
+            uri=str(viewer_path),
+            kind="geometry_labeler_viewer",
+            format="html",
+            description="Standalone browser UI for confirming PhysicsOS boundary labels.",
+        ),
+        warnings=warnings,
+    )
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
@@ -1204,6 +1409,7 @@ for _tool, _input, _output in [
     (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
     (create_boundary_labeling_artifact, CreateBoundaryLabelingArtifactInput, CreateBoundaryLabelingArtifactOutput),
     (apply_boundary_labeling_artifact, ApplyBoundaryLabelingArtifactInput, ApplyBoundaryLabelingArtifactOutput),
+    (create_geometry_labeler_viewer, CreateGeometryLabelerViewerInput, CreateGeometryLabelerViewerOutput),
     (generate_geometry_encoding, GenerateGeometryEncodingInput, GenerateGeometryEncodingOutput),
     (generate_mesh, GenerateMeshInput, GenerateMeshOutput),
     (export_backend_mesh, ExportBackendMeshInput, ExportBackendMeshOutput),

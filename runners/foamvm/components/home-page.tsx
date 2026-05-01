@@ -846,9 +846,6 @@ export function HomePage({ viewer }: { viewer: ViewerContext }) {
                   <Link className="rounded-full border border-white/10 px-3 py-1 text-slate-200 transition hover:border-white/30 hover:text-white" href="/account">
                     Account
                   </Link>
-                  <Link className="rounded-full border border-cyan-300/30 bg-cyan-300/10 px-3 py-1 text-cyan-100 transition hover:border-cyan-200/50" href="/geometry-labeler">
-                    Geometry labeler
-                  </Link>
                   {viewer.isAdmin ? (
                     <Link className="rounded-full border border-amber-300/30 bg-amber-300/10 px-3 py-1 text-amber-100 transition hover:border-amber-200/50" href="/admin/tokens">
                       Admin
@@ -862,9 +859,6 @@ export function HomePage({ viewer }: { viewer: ViewerContext }) {
                   </span>
                   <Link className="rounded-full bg-cyan-300 px-4 py-1.5 font-medium text-slate-950 transition hover:bg-cyan-200" href="/auth/login">
                     Sign in
-                  </Link>
-                  <Link className="rounded-full border border-cyan-300/30 px-4 py-1.5 font-medium text-cyan-100 transition hover:border-cyan-200/50" href="/geometry-labeler">
-                    Geometry labeler
                   </Link>
                 </>
               )}

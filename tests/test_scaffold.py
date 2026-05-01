@@ -66,6 +66,7 @@ from physicsos.tools.geometry_tools import (
     ApplyBoundaryLabelingArtifactInput,
     BoundaryLabelAssignment,
     CreateBoundaryLabelingArtifactInput,
+    CreateGeometryLabelerViewerInput,
     ExportBackendMeshInput,
     GenerateGeometryEncodingInput,
     GenerateMeshInput,
@@ -77,6 +78,7 @@ from physicsos.tools.geometry_tools import (
     apply_boundary_labeling_artifact,
     assess_mesh_quality,
     create_boundary_labeling_artifact,
+    create_geometry_labeler_viewer,
     export_backend_mesh,
     generate_geometry_encoding,
     generate_mesh,
@@ -136,6 +138,7 @@ def test_tool_registry_has_core_tools() -> None:
     assert "apply_boundary_labels" in TOOL_REGISTRY
     assert "create_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "apply_boundary_labeling_artifact" in TOOL_REGISTRY
+    assert "create_geometry_labeler_viewer" in TOOL_REGISTRY
     assert "export_backend_mesh" in TOOL_REGISTRY
     assert "prepare_mesh_conversion_job" in TOOL_REGISTRY
     assert "submit_mesh_conversion_job" in TOOL_REGISTRY
@@ -1552,6 +1555,11 @@ def test_boundary_labeling_artifact_requires_confirmation_before_apply(tmp_path)
     assert payload["viewer_geometry"]["faces"]
     assert payload["suggested_boundary_labels"]
     assert payload["confirmed_boundary_labels"] == []
+    viewer = create_geometry_labeler_viewer(CreateGeometryLabelerViewerInput(labeling_artifact=labeling.artifact)).viewer
+    viewer_text = open(viewer.uri, encoding="utf-8").read()
+    assert viewer.kind == "geometry_labeler_viewer"
+    assert "PhysicsOS standalone tool" in viewer_text
+    assert "physicsos.boundary_labeling.v1" in viewer_text
 
     applied_empty = apply_boundary_labeling_artifact(
         ApplyBoundaryLabelingArtifactInput(geometry=GeometrySpec(id="geometry:empty-labels", source=geometry.source, dimension=3), labeling_artifact=labeling.artifact)
