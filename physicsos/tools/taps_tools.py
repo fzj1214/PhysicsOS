@@ -13,6 +13,7 @@ from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_1
 from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_2d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_1d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_2d
+from physicsos.backends.taps_generic import supports_coupled_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_hcurl_curl_curl_weak_form
 from physicsos.backends.taps_generic import supports_nonlinear_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_scalar_elliptic_weak_form
@@ -568,6 +569,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     space_axis_count = len([axis for axis in input.taps_problem.axes if axis.kind == "space"])
     field_count = len(input.taps_problem.weak_form.trial_fields) if input.taps_problem.weak_form is not None else 0
     has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in input.taps_problem.geometry_encodings)
+    is_coupled_reaction_diffusion_ir = supports_coupled_reaction_diffusion_weak_form(input.taps_problem)
     is_hcurl_curl_curl_ir = supports_hcurl_curl_curl_weak_form(input.taps_problem)
     is_nonlinear_reaction_diffusion_ir = supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem)
     is_scalar_elliptic_ir = supports_scalar_elliptic_weak_form(input.taps_problem)
@@ -655,7 +657,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
-    if family == "coupled_reaction_diffusion" and space_axis_count == 2 and field_count >= 2:
+    if (family == "coupled_reaction_diffusion" or is_coupled_reaction_diffusion_ir) and space_axis_count == 2 and field_count >= 2:
         artifacts, residual_report = solve_coupled_reaction_diffusion_2d(input.taps_problem)
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
@@ -666,11 +668,12 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         result = SolverResult(
             id=f"result:{input.taps_problem.id}",
             problem_id=input.problem.id,
-            backend="taps:coupled_reaction_diffusion_2d",
+            backend="taps:coupled_reaction_diffusion_2d" if family == "coupled_reaction_diffusion" else f"taps:weak_ir_coupled_reaction_diffusion_2d:{family}",
             status="success" if residual_report.converged else "needs_review",
             scalar_outputs={
                 "message": "Coupled-field TAPS 2D reaction-diffusion fixed-point kernel executed.",
                 "equation_family": family,
+                "weak_form_ir_blocks": is_coupled_reaction_diffusion_ir,
                 "field_count": field_count,
                 "tensor_rank": residual_report.rank,
                 **residual_report.residuals,

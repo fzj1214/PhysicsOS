@@ -622,6 +622,66 @@ def supports_nonlinear_reaction_diffusion_weak_form(problem: TAPSProblem) -> boo
     return _weak_form_nonlinear_reaction_diffusion_blocks(problem) is not None
 
 
+def _weak_form_coupled_reaction_diffusion_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) < 2:
+        return None
+    field_tokens = {field.lower() for field in weak_form.trial_fields}
+    blocks: list[dict[str, str]] = []
+    has_diffusion = False
+    has_reaction = False
+    has_coupling = False
+    has_source = False
+    allowed_roles = {"diffusion", "reaction", "source", "constitutive", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_diffusion = role == "diffusion" or "grad(" in expression or "laplacian" in expression or "nabla" in expression
+        is_reaction = role == "reaction" or any(token in expression for token in ("reaction", "r_i", "r(", "u^3", "v^3", "nonlinear"))
+        is_coupling = role == "constitutive" or any(
+            token in expression for token in ("coupling", "kappa", "u - v", "v - u", "u-v", "v-u", "cross_jacobian")
+        )
+        if not is_coupling and len(field_tokens) >= 2:
+            mentioned_fields = {field for field in field_tokens if field in expression}
+            is_coupling = len(mentioned_fields) >= 2 and any(token in expression for token in ("-", "+", "coupled", "between"))
+        is_source = role == "source" or any(token in expression for token in ("source", " f_u", " f_v", "rhs"))
+        if role == "custom" and not (is_diffusion or is_reaction or is_coupling or is_source):
+            return None
+        if is_diffusion:
+            has_diffusion = True
+            blocks.append({"role": "field_diffusion", "term_id": term.id, "expression": term.expression})
+        if is_reaction:
+            has_reaction = True
+            blocks.append({"role": "field_reaction", "term_id": term.id, "expression": term.expression})
+        if is_coupling:
+            has_coupling = True
+            blocks.append({"role": "coupling_operator", "term_id": term.id, "expression": term.expression})
+        if is_source:
+            has_source = True
+            blocks.append({"role": "source", "term_id": term.id, "expression": term.expression})
+    if not (has_diffusion and has_coupling):
+        return None
+    return {
+        "operator_family": "coupled_reaction_diffusion",
+        "source": "weak_form_ir",
+        "fields": weak_form.trial_fields,
+        "blocks": blocks,
+        "has_diffusion": has_diffusion,
+        "has_reaction": has_reaction,
+        "has_coupling": has_coupling,
+        "has_source": has_source,
+        "subspace_solver": "block_gauss_seidel_picard",
+    }
+
+
+def supports_coupled_reaction_diffusion_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_coupled_reaction_diffusion_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):
@@ -2860,6 +2920,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
         -D Δu + beta u + gamma u^3 + kappa (u - v) = f_u
         -D Δv + beta v + gamma v^3 + kappa (v - u) = f_v
     """
+    weak_form_blocks = _weak_form_coupled_reaction_diffusion_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
     axes = _space_axes(taps_problem)
@@ -2952,6 +3013,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
     field_names = taps_problem.weak_form.trial_fields if taps_problem.weak_form and taps_problem.weak_form.trial_fields else ["u", "v"]
     operator_payload = {
         "type": "coupled_reaction_diffusion_2d",
+        "weak_form_blocks": weak_form_blocks,
         "operator": "-D Δu + beta u + gamma u^3 + kappa(u-v) = f_u; -D Δv + beta v + gamma v^3 + kappa(v-u) = f_v",
         "axes": {axes[0]: x, axes[1]: y},
         "fields": field_names[:2],
@@ -2975,6 +3037,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
     }
     residual_payload = {
         "family": "coupled_reaction_diffusion",
+        "weak_form_blocks": weak_form_blocks,
         "normalized_coupled_residual": final_residual,
         "relative_update": final_update,
         "iterations": len(history),

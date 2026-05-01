@@ -730,6 +730,58 @@ def test_taps_coupled_reaction_diffusion_executes_2d() -> None:
     }
 
 
+def test_taps_executes_custom_coupled_field_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-coupled-rd-square", source=GeometrySource(kind="generated"), dimension=2)
+    problem = PhysicsProblem(
+        id="problem:custom-coupled-rd-2d",
+        user_intent={"raw_request": "solve a custom two-field coupled reaction diffusion weak form"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar"), FieldSpec(name="v", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-coupled-rd",
+                name="Custom coupled reaction diffusion",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["u", "v"],
+                differential_terms=[
+                    {"expression": "sum_i int_Omega grad(w_i) dot D_i grad(field_i) dOmega", "order": 2, "fields": ["u", "v"]},
+                    {"expression": "int_Omega kappa (u - v) (w_u - w_v) dOmega", "order": 0, "fields": ["u", "v"]},
+                    {"expression": "- sum_i int_Omega w_i R_i(u, v) dOmega with nonlinear reactions", "order": 0, "fields": ["u", "v"]},
+                ],
+                source_terms=[{"expression": "rhs f_u f_v"}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:custom-coupled", name="custom coupled", phase="solid", properties=[MaterialProperty(name="D", value=1.0)])],
+        boundary_conditions=[
+            {"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": 0.0},
+            {"id": "bc:v", "region_id": "boundary", "field": "v", "kind": "dirichlet", "value": 0.0},
+        ],
+        targets=[{"name": "fields", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    for axis in plan.axes:
+        axis.points = 20
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_coupled_reaction_diffusion_2d:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_coupled_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["weak_form_blocks"]["operator_family"] == "coupled_reaction_diffusion"
+    assert operator_payload["weak_form_blocks"]["subspace_solver"] == "block_gauss_seidel_picard"
+    assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {
+        "field_diffusion",
+        "coupling_operator",
+        "field_reaction",
+        "source",
+    }
+
+
 def test_geometry_encoded_taps_consumes_occupancy_mask() -> None:
     geometry = GeometrySpec(id="geometry:masked-square", source=GeometrySource(kind="generated"), dimension=2)
     encoding_output = generate_geometry_encoding(

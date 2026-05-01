@@ -1367,6 +1367,7 @@ custom scalar elliptic weak-form IR terms mapped to reusable diffusion / reactio
 custom vector elasticity weak-form IR terms mapped to reusable strain-energy / body-force assembler blocks
 custom H(curl) curl-curl weak-form IR terms mapped to reusable curl-curl / mass / source assembler blocks
 custom nonlinear reaction-diffusion weak-form IR terms mapped to reusable diffusion / nonlinear-reaction / source Picard blocks
+custom coupled-field weak-form IR terms mapped to reusable field-diffusion / coupling-operator / reaction / source subspace-solver blocks
 heat / diffusion
 Poisson
 reaction-diffusion
@@ -1377,8 +1378,29 @@ knowledge-assisted unspecified physics
 Next implementation requirement:
 
 ```text
-extend weak-form IR block mapping beyond scalar/vector/H(curl)/nonlinear
-operators into transient and coupled subspace solver blocks.
+extend weak-form IR block mapping beyond scalar/vector/H(curl)/nonlinear/coupled
+operators into transient mass/time-derivative time integrators and solver-export bridges.
+
+near-term executable IR extensions:
+1. transient mass/time-derivative blocks:
+   time_derivative + mass + stiffness/source -> M du/dt + K u = f
+   connect to explicit/implicit Euler, Crank-Nicolson, BDF-style time integrators
+   consume InitialConditionSpec and emit time-slice solution/residual histories
+2. coupled-field blocks:
+   field_block + self_operator + coupling_operator + cross_jacobian metadata
+   connect to monolithic block solve, block Gauss-Seidel, and operator-splitting policies
+3. boundary weak-term blocks:
+   Neumann / Robin / impedance / port / interface terms as first-class weak-form blocks
+   avoid hard-coded boundary semantics inside solver-specific kernels
+4. strong-form compiler:
+   normalize strong-form PDEs and paper equations into weak-form/discrete-residual IR before execution
+   use knowledge-agent when integration by parts, constitutive laws, or function spaces are ambiguous
+5. symbolic validation:
+   check dimensions, field ranks, coefficient availability, boundary compatibility, and function-space requirements
+6. adaptive fallback:
+   if IR cannot be safely mapped, ask knowledge-agent or author a reviewed runtime extension instead of guessing
+7. real backend bridge:
+   export IR blocks to FEniCSx/UFL, MFEM/PyMFEM, PETSc, or other high-fidelity open backends
 ```
 
 Neural/operator backends remain fallback, warm start, and correction engines.
@@ -1786,7 +1808,8 @@ done: custom scalar elliptic weak-form IR can execute through reusable diffusion
 done: custom vector elasticity weak-form IR can execute through reusable strain-energy/body-force assembler blocks on mesh_graph geometry.
 done: custom H(curl) curl-curl weak-form IR can execute through reusable curl-curl/mass/source blocks on the Nedelec mesh_graph EM path.
 done: custom nonlinear reaction-diffusion weak-form IR can execute through reusable diffusion/nonlinear-reaction/source Picard blocks.
-next: extend reusable weak-form IR block mapping to transient mass/time-derivative and coupled-field subspace solvers.
+done: custom coupled-field weak-form IR can execute through reusable field-diffusion/coupling/reaction/source blocks on the 2-field subspace solver path.
+next: extend reusable weak-form IR block mapping to transient mass/time-derivative time integrators, boundary weak terms, strong-form compilation, symbolic validation, adaptive fallback, and real backend export.
 ```
 
 PhysicsOS Cloud / foamvm scope:
