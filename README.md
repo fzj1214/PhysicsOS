@@ -17,7 +17,7 @@ From a local checkout:
 pip install -e .
 ```
 
-The default install includes the DeepAgents runtime, LangGraph, and the OpenAI-compatible model adapter, so `physicsos` can start the natural-language agent loop immediately after model credentials are configured.
+The default install includes the official DeepAgents CLI/TUI, LangGraph, and the OpenAI-compatible model adapter, so `physicsos` starts the natural-language PhysicsOS agent loop immediately after model credentials are configured.
 
 With Gmsh / meshio geometry tooling:
 
@@ -44,10 +44,10 @@ physicsos runner logs JOB_ID
 physicsos runner artifacts JOB_ID
 ```
 
-Running `physicsos` with no arguments starts the interactive CLI shell.
-Plain text input is sent to the DeepAgents-powered PhysicsOS orchestrator as a natural-language chat turn.
-Local control commands are prefixed with `/`, for example `/paths`, `/login`, and `/exit`.
-The shell records user inputs, assistant outputs, and errors to a session file plus the global history file.
+Running `physicsos` with no arguments launches the official DeepAgents Textual TUI with the `physicsos` agent selected.
+PhysicsOS automatically installs its DeepAgents agent prompt and subagent prompts under `~/.deepagents/physicsos/`.
+DeepAgents manages interactive threads, TUI state, model selection, MCP tools, skills, and approval prompts.
+PhysicsOS local control commands remain available as normal shell commands, for example `physicsos paths`, `physicsos auth login`, and `physicsos runner ...`.
 Device-login tokens are stored under the user config directory, not in the repository.
 
 To enable model calls, configure an OpenAI-compatible model:
@@ -56,6 +56,14 @@ To enable model calls, configure an OpenAI-compatible model:
 $env:PHYSICSOS_OPENAI_API_KEY="..."
 $env:PHYSICSOS_OPENAI_BASE_URL="https://api.tu-zi.com/v1"
 $env:PHYSICSOS_OPENAI_MODEL="gpt-5.4"
+```
+
+These variables are mapped to the official DeepAgents CLI at startup. You can still pass native DeepAgents flags through `physicsos`, for example:
+
+```bash
+physicsos --message "simulate a 1D steady heat conduction problem"
+physicsos --resume
+physicsos --model openai:gpt-5.4
 ```
 
 ## Local Data

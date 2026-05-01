@@ -3,9 +3,20 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import os
 import shlex
+import sys
 from pathlib import Path
 
+from physicsos.agents.prompts import (
+    GEOMETRY_MESH_AGENT_PROMPT,
+    KNOWLEDGE_AGENT_PROMPT,
+    PHYSICSOS_SYSTEM_PROMPT,
+    POSTPROCESS_AGENT_PROMPT,
+    SOLVER_AGENT_PROMPT,
+    TAPS_AGENT_PROMPT,
+    VERIFICATION_AGENT_PROMPT,
+)
 from physicsos.cloud.auth import start_device_login
 from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
@@ -15,9 +26,108 @@ from physicsos.config import runtime_paths
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "legacy-repl"}
+
+SUBAGENT_PROMPTS = {
+    "geometry-mesh-agent": (
+        "Build GeometrySpec and MeshSpec from geometry, CAD, mesh, text, and boundary labeling inputs.",
+        GEOMETRY_MESH_AGENT_PROMPT,
+    ),
+    "taps-agent": (
+        "Primary TAPS compiler and solver agent for equation-driven physics simulation.",
+        TAPS_AGENT_PROMPT,
+    ),
+    "solver-agent": (
+        "Route surrogate, full-solver, and hybrid fallback backends after TAPS-first planning.",
+        SOLVER_AGENT_PROMPT,
+    ),
+    "verification-agent": (
+        "Check residuals, conservation, uncertainty, mesh quality, OOD risk, and trustworthiness.",
+        VERIFICATION_AGENT_PROMPT,
+    ),
+    "postprocess-agent": (
+        "Extract KPIs, generate visualizations, and write simulation reports.",
+        POSTPROCESS_AGENT_PROMPT,
+    ),
+    "knowledge-agent": (
+        "Retrieve scientific computing, PDE, solver, materials, and TAPS knowledge.",
+        KNOWLEDGE_AGENT_PROMPT,
+    ),
+}
+
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _physicsos_agent_prompt() -> str:
+    return (
+        "# PhysicsOS\n\n"
+        + PHYSICSOS_SYSTEM_PROMPT
+        + "\n\n"
+        "You are running inside the official DeepAgents CLI/TUI as the PhysicsOS agent.\n"
+        "Use the built-in DeepAgents todo, filesystem, shell, subagent, MCP, and skills capabilities.\n"
+        "For local PhysicsOS package state, use `physicsos paths`.\n"
+        "For PhysicsOS Cloud device login, use `physicsos auth login`.\n"
+        "For cloud runner jobs, use `physicsos runner ...` commands.\n"
+        "Prefer TAPS-first reasoning and delegate to the registered PhysicsOS subagents when useful.\n"
+        "Do not claim a high-trust physics solve unless residual, conservation, and verification evidence is available.\n"
+    )
+
+
+def _ensure_deepagents_physicsos_config() -> None:
+    agent_dir = Path.home() / ".deepagents" / "physicsos"
+    agents_dir = agent_dir / "agents"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "AGENTS.md").write_text(_physicsos_agent_prompt(), encoding="utf-8")
+    for name, (description, prompt) in SUBAGENT_PROMPTS.items():
+        subagent_dir = agents_dir / name
+        subagent_dir.mkdir(parents=True, exist_ok=True)
+        content = f"---\nname: {name}\ndescription: {description}\n---\n\n{prompt}\n"
+        (subagent_dir / "AGENTS.md").write_text(content, encoding="utf-8")
+
+
+def _deepagents_model_args(argv: list[str]) -> list[str]:
+    if any(arg in {"-M", "--model", "--default-model", "--clear-default-model"} for arg in argv):
+        return []
+    model = os.getenv("PHYSICSOS_OPENAI_MODEL", "gpt-5.4")
+    return ["--model", f"openai:{model}"]
+
+
+def _deepagents_model_params_args(argv: list[str]) -> list[str]:
+    if "--model-params" in argv:
+        return []
+    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL")
+    if not base_url:
+        return []
+    return ["--model-params", json.dumps({"base_url": base_url})]
+
+
+def _prepare_deepagents_env() -> None:
+    if os.getenv("PHYSICSOS_OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.environ["PHYSICSOS_OPENAI_API_KEY"]
+
+
+def _launch_deepagents_cli(argv: list[str]) -> int:
+    if not any(arg in {"-h", "--help", "-v", "--version"} for arg in argv):
+        _ensure_deepagents_physicsos_config()
+    _prepare_deepagents_env()
+    try:
+        from deepagents_cli import cli_main
+    except ImportError as exc:
+        raise RuntimeError("deepagents-cli is required. Reinstall with `pip install -U physicsos`.") from exc
+
+    forwarded = list(argv)
+    if not any(arg in {"-a", "--agent"} for arg in forwarded):
+        forwarded = ["--agent", "physicsos", *forwarded]
+    forwarded = [*_deepagents_model_args(forwarded), *_deepagents_model_params_args(forwarded), *forwarded]
+    previous_argv = sys.argv
+    sys.argv = ["deepagents", *forwarded]
+    try:
+        cli_main()
+    finally:
+        sys.argv = previous_argv
+    return 0
 
 
 def _rich_console():
@@ -214,6 +324,11 @@ def _interactive(agent: object | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or argv[0] not in LOCAL_COMMANDS:
+        return _launch_deepagents_cli(argv)
+
     parser = argparse.ArgumentParser(prog="physicsos")
     sub = parser.add_subparsers(dest="command")
 
@@ -225,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("account")
     sub.add_parser("paths")
+    sub.add_parser("legacy-repl")
 
     runner = sub.add_parser("runner")
     runner_sub = runner.add_subparsers(dest="runner_command", required=True)
@@ -240,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.command is None:
+    if args.command == "legacy-repl":
         return _interactive()
 
     if args.command == "auth" and args.auth_command == "login":

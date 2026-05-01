@@ -1,6 +1,6 @@
 [project]
 name = "physicsos"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI-native physics simulation OS with TAPS-first physics IR, solver planning, and cloud runner tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,6 +8,7 @@ dependencies = [
   "pydantic>=2.7",
   "numpy>=1.26",
   "deepagents",
+  "deepagents-cli>=0.0.46",
   "langgraph",
   "langchain-openai",
   "rich>=13.7",

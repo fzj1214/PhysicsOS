@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from physicsos.cli import BANNER, _interactive, main as cli_main
+from physicsos.cli import BANNER, _ensure_deepagents_physicsos_config, _launch_deepagents_cli, _interactive, main as cli_main
 from physicsos.config import physicsos_home, runtime_paths
 from physicsos.schemas.boundary import InitialConditionSpec
 from physicsos.schemas.common import ComputeBudget, Provenance
@@ -168,13 +168,34 @@ def test_tool_registry_has_core_tools() -> None:
 
 def test_cli_without_args_starts_interactive_welcome(capsys) -> None:
     with patch("builtins.input", side_effect=["exit"]):
-        assert cli_main([]) == 0
+        assert cli_main(["legacy-repl"]) == 0
     output = capsys.readouterr().out
     assert BANNER == "PhysicsOS\nPhysicsOS"
     assert output.count("PhysicsOS") >= 2
     assert "TAPS-first physics simulation agent" in output
     assert "Commands" in output
     assert "paths" in output
+
+
+def test_cli_defaults_to_official_deepagents_cli(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def fake_cli_main():
+        captured["argv"] = list(__import__("sys").argv)
+
+    monkeypatch.setenv("PHYSICSOS_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHYSICSOS_OPENAI_BASE_URL", "https://api.tu-zi.com/v1")
+    monkeypatch.setenv("PHYSICSOS_OPENAI_MODEL", "gpt-5.4")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    with patch("deepagents_cli.cli_main", side_effect=fake_cli_main):
+        assert _launch_deepagents_cli(["--message", "hello"]) == 0
+    assert captured["argv"][:3] == ["deepagents", "--model", "openai:gpt-5.4"]
+    assert "--model-params" in captured["argv"]
+    assert "--agent" in captured["argv"]
+    assert "physicsos" in captured["argv"]
+    assert __import__("os").environ["OPENAI_API_KEY"] == "test-key"
+    assert (tmp_path / ".deepagents" / "physicsos" / "AGENTS.md").exists()
+    assert (tmp_path / ".deepagents" / "physicsos" / "agents" / "taps-agent" / "AGENTS.md").exists()
 
 
 def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None:
