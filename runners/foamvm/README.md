@@ -21,6 +21,29 @@ Content-Type: application/json
 }
 ```
 
+The same endpoint also accepts mesh-conversion manifests prepared by
+PhysicsOS:
+
+```text
+{
+  "schema_version": "physicsos.mesh_conversion_job.v1",
+  "job_type": "mesh_conversion",
+  "backend": "openfoam",
+  "inputs": {
+    "source_mesh_file": {
+      "path": "mesh.msh",
+      "content_base64": "..."
+    },
+    "boundary_exports": []
+  }
+}
+```
+
+For mesh conversion jobs, the runner decodes the inline `.msh`, writes
+`boundary_mapping.json`, and executes the backend-specific converter in E2B.
+OpenFOAM uses `gmshToFoam`; SU2/FEniCSx use `meshio` when available in the
+template.
+
 If `openfoam.case_files` is omitted, the runner executes the built-in
 OpenFOAM cavity smoke case from `$FOAM_TUTORIALS`. Output files are returned
 as base64 artifacts in the JSON response.

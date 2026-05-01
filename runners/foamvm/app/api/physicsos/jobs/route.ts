@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-import { runOpenFOAMManifest } from '@/lib/physicsos-openfoam-runner'
+import { runPhysicsOSManifest } from '@/lib/physicsos-openfoam-runner'
 
 export const runtime = 'nodejs'
 export const maxDuration = 1200
@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const manifest = await request.json()
-    const result = await runOpenFOAMManifest(manifest)
+    const result = await runPhysicsOSManifest(manifest)
     return NextResponse.json(result, { status: result.status === 'completed' ? 200 : 500 })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

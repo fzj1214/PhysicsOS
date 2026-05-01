@@ -12,7 +12,10 @@ Authorization: Bearer $PHYSICSOS_RUNNER_TOKEN
 Content-Type: application/json
 ```
 
-with a `physicsos.full_solver_job.v1` manifest:
+with either a `physicsos.full_solver_job.v1` full-solver manifest or a
+`physicsos.mesh_conversion_job.v1` mesh-conversion manifest.
+
+Full-solver example:
 
 ```json
 {
@@ -25,6 +28,11 @@ with a `physicsos.full_solver_job.v1` manifest:
   }
 }
 ```
+
+Mesh-conversion jobs decode inline `.msh` input, write
+`boundary_mapping.json`, and run the approved converter inside E2B. OpenFOAM
+uses `gmshToFoam`; SU2/FEniCSx use `meshio` when available in the template.
+This keeps mesh conversion out of the local CLI process.
 
 If `openfoam.case_files` is absent, the runner executes the built-in OpenFOAM cavity smoke case:
 

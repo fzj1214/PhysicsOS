@@ -1774,7 +1774,7 @@ done: Gmsh/meshio-first 3D facet layer propagates physical surfaces into `bounda
 done: user-confirmed physical-group labeling artifacts separate weak suggestions from confirmed labels before GeometrySpec mutation or solver export.
 done: standalone geometry labeler viewer tool can load boundary-labeling artifacts, rotate mesh/facet previews, select groups, and export confirmed labels without foamvm, database, or E2B.
 done: mesh conversion runner manifests can be prepared from backend mesh export manifests, inline source `.msh`, and dry-run/http submitted without local external conversion.
-next: implement the foamvm/E2B runner execution branch for `physicsos.mesh_conversion_job.v1` manifests.
+done: foamvm/E2B runner dispatches `physicsos.mesh_conversion_job.v1` manifests, decodes inline `.msh`, writes boundary mapping artifacts, and runs approved converter commands inside E2B.
 next: add higher-order Nedelec spaces after the Gmsh/meshio facet and boundary-label pipeline is stable.
 ```
 
