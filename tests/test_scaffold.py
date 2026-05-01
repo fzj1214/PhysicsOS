@@ -1633,6 +1633,38 @@ def test_triangle_nedelec_curl_curl_assembler_uses_edge_dofs() -> None:
     assert all(stiffness[i][i].real > 0.0 and abs(stiffness[i][i].imag) <= 1e-14 for i in range(3))
 
 
+def test_triangle_nedelec_order2_scaffold_uses_edge_moments_and_cell_dofs() -> None:
+    stiffness, dofs, total_area, elements = _assemble_triangle_nedelec_curl_curl(
+        points=[
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.5, 0.0],
+            [0.5, 0.5],
+            [0.0, 0.5],
+        ],
+        triangles=[[0, 1, 2, 3, 4, 5]],
+        curl_weight=1.0,
+        mass_weight=0.25,
+    )
+    assert total_area == pytest.approx(0.5)
+    assert len(dofs) == 8
+    assert sum(1 for dof in dofs if dof["kind"] == "edge_moment") == 6
+    assert sum(1 for dof in dofs if dof["kind"] == "cell_interior") == 2
+    assert len(stiffness) == 8
+    element = elements[0]
+    assert element["basis"] == "nedelec_first_kind_order2_hierarchical_scaffold_triangle"
+    assert element["edge_moment_dofs_per_edge"] == 2
+    assert element["cell_interior_dofs"] == 2
+    assert len(element["dofs"]) == 8
+    local = element["local_matrix"]
+    for i in range(8):
+        assert stiffness[i][i].real > 0.0
+        for j in range(8):
+            assert local[i][j] == pytest.approx(local[j][i])
+            assert stiffness[i][j] == pytest.approx(stiffness[j][i])
+
+
 def test_triangle_p2_assembler_uses_quadratic_cell_gradients() -> None:
     stiffness, lumped_mass, total_area, elements = _assemble_triangle_stiffness(
         points=[

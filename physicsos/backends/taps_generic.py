@@ -1123,7 +1123,10 @@ def _assemble_triangle_nedelec_curl_curl(
     triangles: list[list[int]],
     curl_weight: float | complex = 1.0,
     mass_weight: float | complex = 1.0,
-) -> tuple[list[dict[int, float | complex]], list[tuple[int, int]], float, list[dict]]:
+) -> tuple[list[dict[int, float | complex]], list, float, list[dict]]:
+    if triangles and any(len(triangle) >= 6 for triangle in triangles):
+        return _assemble_triangle_nedelec_curl_curl_order2(points, triangles, curl_weight=curl_weight, mass_weight=mass_weight)
+
     edge_index: dict[tuple[int, int], int] = {}
     edge_list: list[tuple[int, int]] = []
     for triangle in triangles:
@@ -1201,6 +1204,174 @@ def _assemble_triangle_nedelec_curl_curl(
         )
         total_area += area
     return stiffness, edge_list, total_area, element_records
+
+
+def _nedelec_p1_value_and_curl(
+    lambdas: list[float],
+    grad_lambda: list[list[float]],
+    local_a: int,
+    local_b: int,
+) -> tuple[list[float], float]:
+    value = [
+        lambdas[local_a] * grad_lambda[local_b][0] - lambdas[local_b] * grad_lambda[local_a][0],
+        lambdas[local_a] * grad_lambda[local_b][1] - lambdas[local_b] * grad_lambda[local_a][1],
+    ]
+    ga = grad_lambda[local_a]
+    gb = grad_lambda[local_b]
+    curl = 2.0 * (ga[0] * gb[1] - ga[1] * gb[0])
+    return value, curl
+
+
+def _scaled_nedelec_value_and_curl(
+    scalar_value: float,
+    scalar_gradient: list[float],
+    base_value: list[float],
+    base_curl: float,
+) -> tuple[list[float], float]:
+    value = [scalar_value * base_value[0], scalar_value * base_value[1]]
+    curl = scalar_gradient[0] * base_value[1] - scalar_gradient[1] * base_value[0] + scalar_value * base_curl
+    return value, curl
+
+
+def _assemble_triangle_nedelec_curl_curl_order2(
+    points: list[list[float]],
+    triangles: list[list[int]],
+    curl_weight: float | complex = 1.0,
+    mass_weight: float | complex = 1.0,
+) -> tuple[list[dict[int, float | complex]], list[dict], float, list[dict]]:
+    """Assemble a hierarchical second-order H(curl) scaffold on triangles.
+
+    The basis uses two edge moment DOFs per geometric edge and two interior
+    bubble-like DOFs per cell. This is intentionally explicit and artifact-rich
+    so the next promotion step can replace the scaffold basis with a formally
+    complete high-order Nedelec family without changing global DOF plumbing.
+    """
+    local_edge_pairs = [(0, 1), (1, 2), (2, 0)]
+    edge_dof_index: dict[tuple[int, int, int], int] = {}
+    dofs: list[dict] = []
+    cell_interior_dofs: dict[tuple[int, int], int] = {}
+    for cell_id, triangle in enumerate(triangles):
+        vertices = triangle[:3]
+        if len(vertices) < 3:
+            continue
+        for local_a, local_b in local_edge_pairs:
+            a = vertices[local_a]
+            b = vertices[local_b]
+            edge = (a, b) if a < b else (b, a)
+            for moment in range(2):
+                key = (edge[0], edge[1], moment)
+                if key not in edge_dof_index:
+                    edge_dof_index[key] = len(dofs)
+                    dofs.append({"kind": "edge_moment", "edge": [edge[0], edge[1]], "moment": moment})
+        for interior in range(2):
+            cell_interior_dofs[(cell_id, interior)] = len(dofs)
+            dofs.append({"kind": "cell_interior", "cell_id": cell_id, "moment": interior, "vertices": vertices})
+
+    stiffness: list[dict[int, float | complex]] = [dict() for _ in dofs]
+    total_area = 0.0
+    element_records: list[dict] = []
+    for cell_id, triangle in enumerate(triangles):
+        vertices = triangle[:3]
+        geometry = _triangle_geometry(points, vertices)
+        if geometry is None:
+            continue
+        area, grad_lambda = geometry
+        local_dofs: list[int] = []
+        local_basis_descriptors: list[dict] = []
+        orientation_signs: list[float] = []
+        for edge_number, (local_a, local_b) in enumerate(local_edge_pairs):
+            a = vertices[local_a]
+            b = vertices[local_b]
+            edge = (a, b) if a < b else (b, a)
+            sign = 1.0 if (a, b) == edge else -1.0
+            for moment in range(2):
+                local_dofs.append(edge_dof_index[(edge[0], edge[1], moment)])
+                orientation_signs.append(sign)
+                local_basis_descriptors.append(
+                    {"kind": "edge_moment", "edge_number": edge_number, "lambda_scale": local_a if moment == 0 else local_b}
+                )
+        for interior in range(2):
+            local_dofs.append(cell_interior_dofs[(cell_id, interior)])
+            orientation_signs.append(1.0)
+            local_basis_descriptors.append({"kind": "cell_interior", "interior": interior})
+
+        local_size = len(local_dofs)
+        local_matrix = [[0.0 + 0.0j for _ in range(local_size)] for _ in range(local_size)]
+        quadrature_records: list[dict] = []
+        for r, s, weight in _triangle_quadrature(2):
+            lambdas = [1.0 - r - s, r, s]
+            basis_values: list[list[float]] = []
+            basis_curls: list[float] = []
+            p1_values: list[list[float]] = []
+            p1_curls: list[float] = []
+            for local_a, local_b in local_edge_pairs:
+                value, curl = _nedelec_p1_value_and_curl(lambdas, grad_lambda, local_a, local_b)
+                p1_values.append(value)
+                p1_curls.append(curl)
+            for edge_number, (local_a, local_b) in enumerate(local_edge_pairs):
+                for scalar_index in (local_a, local_b):
+                    value, curl = _scaled_nedelec_value_and_curl(
+                        lambdas[scalar_index],
+                        grad_lambda[scalar_index],
+                        p1_values[edge_number],
+                        p1_curls[edge_number],
+                    )
+                    basis_values.append(value)
+                    basis_curls.append(curl)
+            bubble = lambdas[0] * lambdas[1] * lambdas[2]
+            bubble_grad = [
+                lambdas[1] * lambdas[2] * grad_lambda[0][0]
+                + lambdas[0] * lambdas[2] * grad_lambda[1][0]
+                + lambdas[0] * lambdas[1] * grad_lambda[2][0],
+                lambdas[1] * lambdas[2] * grad_lambda[0][1]
+                + lambdas[0] * lambdas[2] * grad_lambda[1][1]
+                + lambdas[0] * lambdas[1] * grad_lambda[2][1],
+            ]
+            for interior_base in (0, 1):
+                value, curl = _scaled_nedelec_value_and_curl(
+                    bubble,
+                    bubble_grad,
+                    p1_values[interior_base],
+                    p1_curls[interior_base],
+                )
+                basis_values.append(value)
+                basis_curls.append(curl)
+            scaled_weight = 2.0 * area * weight
+            for i in range(local_size):
+                for j in range(local_size):
+                    mass = basis_values[i][0] * basis_values[j][0] + basis_values[i][1] * basis_values[j][1]
+                    local_matrix[i][j] += orientation_signs[i] * orientation_signs[j] * (
+                        scaled_weight * (mass_weight * mass + curl_weight * basis_curls[i] * basis_curls[j])
+                    )
+            quadrature_records.append(
+                {
+                    "r": r,
+                    "s": s,
+                    "weight": weight,
+                    "basis_values": basis_values,
+                    "curl_basis": basis_curls,
+                }
+            )
+        for local_i, global_i in enumerate(local_dofs):
+            for local_j, global_j in enumerate(local_dofs):
+                value = local_matrix[local_i][local_j]
+                stiffness[global_i][global_j] = stiffness[global_i].get(global_j, 0.0) + value
+        element_records.append(
+            {
+                "vertices": vertices,
+                "dofs": local_dofs,
+                "area": area,
+                "basis": "nedelec_first_kind_order2_hierarchical_scaffold_triangle",
+                "edge_moment_dofs_per_edge": 2,
+                "cell_interior_dofs": 2,
+                "orientation_signs": orientation_signs,
+                "local_basis": local_basis_descriptors,
+                "local_matrix": [[_json_number(value) for value in row] for row in local_matrix],
+                "quadrature": quadrature_records,
+            }
+        )
+        total_area += area
+    return stiffness, dofs, total_area, element_records
 
 
 def _sparse_residual_norm(

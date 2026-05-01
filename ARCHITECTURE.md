@@ -1343,6 +1343,7 @@ constant-strain P1 / quadratic-cubic Lagrange P2-P3 triangle -> vector sparse st
 MaterialSpec -> TAPSCoefficientSpec -> backend material/source coefficients for elasticity
 Gmsh mesh -> mesh_graph encoding -> 2D first-order Nedelec EM curl-curl path
 edge DOFs + orientation signs -> H(curl) tangential continuity -> residual-checked EM edge-field artifact
+second-order Nedelec H(curl) scaffold -> two edge moment DOFs per edge + cell interior DOFs -> local curl-curl/mass assembly
 PhysicsProblem boundary_conditions -> TAPSBoundaryConditionSpec -> PEC/natural EM edge-boundary policy
 complex-valued EM coefficients -> `[real, imag]` JSON representation -> complex frequency-domain edge solve
 custom/robin EM boundary value dict -> absorbing impedance / port excitation -> boundary-edge Robin contribution
@@ -1762,6 +1763,7 @@ done: higher-order scalar FEM foundation beyond P2 via Vandermonde triangle Lagr
 done: vector-valued FEM foundation via 2D P1/P2/P3 linear elasticity weak-form routing and triangle stiffness assembly.
 done: MaterialSpec-to-TAPS coefficient compilation for elasticity material/source parameters.
 done: electromagnetic curl-curl first H(curl) executable path via 2D first-order Nedelec edge elements on mesh_graph.
+done: second-order Nedelec H(curl) local assembler scaffold with edge moment DOFs, cell interior DOFs, orientation signs, and curl-curl/mass matrices.
 done: EM boundary-condition semantics for Nedelec edge DOFs: PEC tangential-zero fixes boundary edges; natural/farfield leaves edge DOFs free.
 done: complex-valued EM frequency-domain coefficient support with JSON `[real, imag]` artifacts and complex edge-field solve.
 done: EM absorbing/impedance/port boundary policies via structured boundary value dictionaries.
@@ -1775,7 +1777,7 @@ done: user-confirmed physical-group labeling artifacts separate weak suggestions
 done: standalone geometry labeler viewer tool can load boundary-labeling artifacts, rotate mesh/facet previews, select groups, and export confirmed labels without foamvm, database, or E2B.
 done: mesh conversion runner manifests can be prepared from backend mesh export manifests, inline source `.msh`, and dry-run/http submitted without local external conversion.
 done: foamvm/E2B runner dispatches `physicsos.mesh_conversion_job.v1` manifests, decodes inline `.msh`, writes boundary mapping artifacts, and runs approved converter commands inside E2B.
-next: add higher-order Nedelec spaces after the Gmsh/meshio facet and boundary-label pipeline is stable.
+next: promote second-order Nedelec scaffold into the executable EM solve path with high-order boundary DOF selection.
 ```
 
 PhysicsOS Cloud / foamvm scope:
