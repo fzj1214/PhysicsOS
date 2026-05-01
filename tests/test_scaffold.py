@@ -375,6 +375,52 @@ def test_taps_agent_formulates_non_template_custom_operator() -> None:
     assert plan.recommended_next_action in {"compile_taps_problem", "ask_knowledge_agent"}
 
 
+def test_taps_executes_custom_scalar_elliptic_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-line", source=GeometrySource(kind="generated"), dimension=1)
+    problem = PhysicsProblem(
+        id="problem:custom-scalar-elliptic-1d",
+        user_intent={"raw_request": "solve a custom scalar weak form with grad(v) k grad(phi) and source f"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="phi", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-elliptic",
+                name="Custom scalar elliptic equation",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["phi"],
+                differential_terms=[
+                    {
+                        "expression": "int_Omega grad(v_phi) dot k grad(phi) dOmega",
+                        "order": 2,
+                        "fields": ["phi"],
+                    }
+                ],
+                source_terms=[{"expression": "int_Omega v_phi f dOmega"}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:custom", name="custom", phase="solid", properties=[MaterialProperty(name="k", value=1.0)])],
+        boundary_conditions=[
+            {"id": "bc:left", "region_id": "x=0", "field": "phi", "kind": "dirichlet", "value": 0.0},
+            {"id": "bc:right", "region_id": "x=1", "field": "phi", "kind": "dirichlet", "value": 0.0},
+        ],
+        targets=[{"name": "field", "field": "phi", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_scalar_elliptic_1d:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_assembled_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["weak_form_blocks"]["operator_family"] == "scalar_elliptic"
+    assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"diffusion", "source"}
+
+
 def test_taps_agent_requests_knowledge_for_under_specified_problem() -> None:
     geometry = GeometrySpec(id="geometry:unknown", source=GeometrySource(kind="text"), dimension=3)
     problem = PhysicsProblem(

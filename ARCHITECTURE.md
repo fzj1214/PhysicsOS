@@ -1363,6 +1363,7 @@ Current compiler IR coverage:
 
 ```text
 custom weak-form terms from OperatorSpec
+custom scalar elliptic weak-form IR terms mapped to reusable diffusion / reaction / source assembler blocks
 heat / diffusion
 Poisson
 reaction-diffusion
@@ -1373,8 +1374,8 @@ knowledge-assisted unspecified physics
 Next implementation requirement:
 
 ```text
-connect weak-form IR to generic assemblers/subspace solvers so compiled
-non-template physics can execute, not only compile.
+extend weak-form IR block mapping beyond scalar elliptic operators into vector,
+H(curl), transient, nonlinear, and coupled subspace solver blocks.
 ```
 
 Neural/operator backends remain fallback, warm start, and correction engines.
@@ -1778,7 +1779,8 @@ done: user-confirmed physical-group labeling artifacts separate weak suggestions
 done: standalone geometry labeler viewer tool can load boundary-labeling artifacts, rotate mesh/facet previews, select groups, and export confirmed labels without foamvm, database, or E2B.
 done: mesh conversion runner manifests can be prepared from backend mesh export manifests, inline source `.msh`, and dry-run/http submitted without local external conversion.
 done: foamvm/E2B runner dispatches `physicsos.mesh_conversion_job.v1` manifests, decodes inline `.msh`, writes boundary mapping artifacts, and runs approved converter commands inside E2B.
-next: extend the executable weak-form path beyond fixed PDE families by mapping weak-form IR terms onto reusable scalar/vector/H(curl) assembler blocks.
+done: custom scalar elliptic weak-form IR can execute through reusable diffusion/reaction/source assembler blocks without relying on a fixed PDE family label.
+next: extend reusable weak-form IR block mapping to vector elasticity, H(curl) curl-curl, transient mass/time-derivative, nonlinear reaction, and coupled-field subspace solvers.
 ```
 
 PhysicsOS Cloud / foamvm scope:

@@ -421,6 +421,63 @@ def _family(problem: TAPSProblem) -> str:
     return (problem.operator_weak_form or "custom").lower()
 
 
+def _term_expression(term: object) -> str:
+    expression = getattr(term, "expression", "")
+    return str(expression).lower().replace("·", " dot ").replace("路", " dot ")
+
+
+def _weak_form_scalar_elliptic_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    """Map general weak-form IR terms onto the scalar elliptic assembler blocks.
+
+    This is intentionally conservative: it only accepts one scalar field and
+    terms that can be explained as diffusion/reaction/mass/source contributions.
+    Unknown custom terms must contain recognizable grad/laplacian/source tokens.
+    """
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) != 1:
+        return None
+    blocks: list[dict[str, str]] = []
+    has_diffusion = False
+    has_source = False
+    has_reaction = False
+    allowed_roles = {"diffusion", "reaction", "mass", "source", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_diffusion = role == "diffusion" or any(token in expression for token in ("grad(", "nabla", "laplacian", "∇"))
+        is_source = role == "source" or any(token in expression for token in ("source", " rhs", " f ", "v f", "v*f", "- int_omega v"))
+        is_reaction = role in {"reaction", "mass"} or any(token in expression for token in (" v u", "v*u", "mass", "reaction"))
+        if role == "custom" and not (is_diffusion or is_source or is_reaction):
+            return None
+        if is_diffusion:
+            has_diffusion = True
+            blocks.append({"role": "diffusion", "term_id": term.id, "expression": term.expression})
+        if is_reaction:
+            has_reaction = True
+            blocks.append({"role": "reaction", "term_id": term.id, "expression": term.expression})
+        if is_source:
+            has_source = True
+            blocks.append({"role": "source", "term_id": term.id, "expression": term.expression})
+    if not has_diffusion:
+        return None
+    return {
+        "operator_family": "scalar_elliptic",
+        "source": "weak_form_ir",
+        "blocks": blocks,
+        "has_diffusion": has_diffusion,
+        "has_reaction": has_reaction,
+        "has_source": has_source,
+    }
+
+
+def supports_scalar_elliptic_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_scalar_elliptic_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):
@@ -444,6 +501,15 @@ def _reaction_value(family: str) -> float:
     if family == "helmholtz":
         # Use a non-resonant wavenumber proxy for the first executable kernel.
         return -(0.5 * math.pi) ** 2
+    return 0.0
+
+
+def _reaction_value_from_blocks(problem: TAPSProblem, family: str, blocks: dict[str, object] | None) -> float:
+    reaction = _reaction_value(family)
+    if reaction != 0.0 or blocks is None:
+        return reaction
+    if blocks.get("has_reaction"):
+        return _coefficient_number(problem, {"reaction", "reaction_rate", "mass", "beta", "c"}, 1.0)
     return 0.0
 
 
@@ -2173,10 +2239,11 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     This is deliberately small and pure Python so it can run inside agent tests.
     """
     family = _family(taps_problem)
+    weak_form_blocks = _weak_form_scalar_elliptic_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if family not in SUPPORTED_FAMILIES:
+    if family not in SUPPORTED_FAMILIES and weak_form_blocks is None:
         raise ValueError(f"Generic TAPS scalar assembler does not support family={family!r}.")
     axes = _space_axes(taps_problem)
     if len(axes) != 1:
@@ -2190,7 +2257,7 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
         raise ValueError("Generic TAPS scalar assembler requires an increasing space axis.")
 
     diffusion = _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    reaction = _reaction_value(family)
+    reaction = _reaction_value_from_blocks(taps_problem, family, weak_form_blocks)
     interior = x[1:-1]
     n = len(interior)
     lower = [-(diffusion / (dx * dx)) for _ in range(max(0, n - 1))]
@@ -2208,6 +2275,7 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     matrix_payload = {
         "type": "tridiagonal_scalar_elliptic_1d",
         "family": family,
+        "weak_form_blocks": weak_form_blocks,
         "operator": "-d/dx(k du/dx) + c u = f",
         "axis": {"name": axes[0], "values": x},
         "coefficients": {"diffusion": diffusion, "reaction": reaction},
@@ -2222,6 +2290,7 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     }
     residual_payload = {
         "family": family,
+        "weak_form_blocks": weak_form_blocks,
         "normalized_linear_residual": normalized_residual,
         "separable_rank": len(source_modes),
         "converged": normalized_residual < 1e-10,
@@ -2361,10 +2430,11 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     multidimensional Galerkin assembler is connected.
     """
     family = _family(taps_problem)
+    weak_form_blocks = _weak_form_scalar_elliptic_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if family not in SUPPORTED_FAMILIES:
+    if family not in SUPPORTED_FAMILIES and weak_form_blocks is None:
         raise ValueError(f"Generic TAPS scalar assembler does not support family={family!r}.")
     axes = _space_axes(taps_problem)
     if len(axes) != 2:
@@ -2381,7 +2451,7 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
         raise ValueError("2D generic TAPS scalar assembler requires increasing space axes.")
 
     diffusion = _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    reaction = _reaction_value(family)
+    reaction = _reaction_value_from_blocks(taps_problem, family, weak_form_blocks)
     max_x_mode = max(1, min(len(x) - 2, 8))
     max_y_mode = max(1, min(len(y) - 2, 8))
     modes = _mode_pairs(max(1, taps_problem.basis.tensor_rank), max_x_mode, max_y_mode)
@@ -2447,6 +2517,7 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     operator_payload = {
         "type": "tensorized_scalar_elliptic_2d",
         "family": family,
+        "weak_form_blocks": weak_form_blocks,
         "operator": "-k (d2u/dx2 + d2u/dy2) + c u = f",
         "axes": {
             axes[0]: x,
@@ -2475,6 +2546,7 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     }
     residual_payload = {
         "family": family,
+        "weak_form_blocks": weak_form_blocks,
         "normalized_linear_residual": normalized_residual,
         "separable_rank": len(solution_coefficients),
         "active_cell_fraction": (sum(sum(row) for row in active_mask) / (len(x) * len(y))) if active_mask is not None else 1.0,
