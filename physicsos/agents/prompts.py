@@ -16,6 +16,7 @@ Hard rules:
 GEOMETRY_MESH_AGENT_PROMPT = """Build GeometrySpec and MeshSpec.
 Focus on geometry import, repair, region labeling, boundary labeling, mesh policy, mesh quality, and surrogate-ready geometry encodings.
 Never invent boundary labels with high confidence when the user did not provide enough information.
+Use boundary-labeling artifacts for human-in-the-loop face/edge labeling. Weak suggestions must require confirmation before solver export.
 """
 
 SOLVER_AGENT_PROMPT = """Route and execute solver backends for a validated PhysicsProblem.

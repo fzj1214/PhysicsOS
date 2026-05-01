@@ -193,6 +193,228 @@ def apply_boundary_labels(input: ApplyBoundaryLabelsInput) -> ApplyBoundaryLabel
     return ApplyBoundaryLabelsOutput(geometry=geometry, applied=applied, warnings=warnings)
 
 
+class BoundaryLabelCandidate(StrictBaseModel):
+    target_ids: list[str] = Field(default_factory=list)
+    boundary_id: str
+    label: str
+    kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    confidence: float = 0.0
+    reason: str | None = None
+    requires_confirmation: bool = True
+
+
+class ConfirmedBoundaryLabel(StrictBaseModel):
+    target_ids: list[str] = Field(default_factory=list)
+    boundary_id: str
+    label: str
+    kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    confidence: float = 1.0
+    confirmed_by: str = "user"
+
+
+class CreateBoundaryLabelingArtifactInput(StrictBaseModel):
+    geometry: GeometrySpec
+    geometry_encoding: GeometryEncoding | None = None
+    include_weak_suggestions: bool = True
+
+
+class CreateBoundaryLabelingArtifactOutput(StrictBaseModel):
+    artifact: ArtifactRef
+    selectable_groups: list[dict[str, object]] = Field(default_factory=list)
+    suggestions: list[BoundaryLabelCandidate] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _weak_kind_from_group_name(name: str, dimension: int) -> tuple[str, float, str] | None:
+    lowered = name.lower()
+    if any(token in lowered for token in ["inlet", "outlet", "wall", "symmetry", "periodic", "farfield", "port"]):
+        if "inlet" in lowered:
+            kind = "inlet"
+        elif "outlet" in lowered:
+            kind = "outlet"
+        elif "wall" in lowered:
+            kind = "wall"
+        elif "symmetry" in lowered:
+            kind = "symmetry"
+        elif "periodic" in lowered:
+            kind = "periodic"
+        elif "farfield" in lowered:
+            kind = "farfield"
+        else:
+            kind = "custom"
+        if "port" in lowered:
+            kind = "custom"
+        return kind, 0.65, "Existing group name contains a common boundary-condition keyword."
+    if dimension >= 2 and lowered in {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}:
+        return "surface", 0.25, "Axis-aligned bounding-box group; physical meaning requires user confirmation."
+    return None
+
+
+def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput) -> CreateBoundaryLabelingArtifactOutput:
+    """Create a human-confirmable boundary labeling artifact for a mesh/CAD viewer."""
+    output_dir = project_root() / "scratch" / input.geometry.id.replace(":", "_") / "boundary_labeling"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    graph_payload = _mesh_graph_payload(input.geometry, input.geometry_encoding)
+    selectable_groups: list[dict[str, object]] = []
+    warnings: list[str] = []
+    suggestions: list[BoundaryLabelCandidate] = []
+
+    if graph_payload is not None:
+        for raw_group in graph_payload.get("physical_boundary_groups", []):
+            if not isinstance(raw_group, dict):
+                continue
+            name = str(raw_group.get("name") or "boundary")
+            dimension = int(raw_group.get("dimension") or (2 if raw_group.get("face_ids") else 1))
+            target_id = f"mesh_graph:physical:{raw_group.get('tag', name)}"
+            selectable = {
+                "id": target_id,
+                "source": "mesh_graph_physical_group",
+                "name": name,
+                "dimension": dimension,
+                "edge_ids": raw_group.get("edge_ids", []),
+                "face_ids": raw_group.get("face_ids", []),
+                "node_ids": raw_group.get("node_ids", []),
+                "solver_native": raw_group.get("solver_native", {}),
+            }
+            selectable_groups.append(selectable)
+            weak = _weak_kind_from_group_name(name, dimension)
+            if input.include_weak_suggestions and weak is not None:
+                kind, confidence, reason = weak
+                suggestions.append(
+                    BoundaryLabelCandidate(
+                        target_ids=[target_id],
+                        boundary_id=f"boundary:{name}",
+                        label=name,
+                        kind=kind,  # type: ignore[arg-type]
+                        confidence=confidence,
+                        reason=reason,
+                        requires_confirmation=True,
+                    )
+                )
+    else:
+        warnings.append("No mesh_graph encoding is available; labeling artifact only includes GeometrySpec boundaries.")
+
+    for boundary in input.geometry.boundaries:
+        target_ids = boundary.entity_ids or [boundary.id]
+        selectable_groups.append(
+            {
+                "id": boundary.id,
+                "source": "geometry_boundary",
+                "name": boundary.label,
+                "dimension": max(0, input.geometry.dimension - 1),
+                "entity_ids": boundary.entity_ids,
+                "confidence": boundary.confidence,
+            }
+        )
+        if input.include_weak_suggestions and boundary.confidence < 1.0:
+            suggestions.append(
+                BoundaryLabelCandidate(
+                    target_ids=target_ids,
+                    boundary_id=boundary.id,
+                    label=boundary.label,
+                    kind=boundary.kind,
+                    confidence=boundary.confidence,
+                    reason="GeometrySpec contains a non-confirmed boundary label.",
+                    requires_confirmation=True,
+                )
+            )
+
+    artifact_payload = {
+        "schema_version": "physicsos.boundary_labeling.v1",
+        "geometry_id": input.geometry.id,
+        "source": "geometry_mesh_agent",
+        "policy": {
+            "weak_suggestions_require_confirmation": True,
+            "solver_export_uses_confirmed_labels_only": True,
+        },
+        "selectable_groups": selectable_groups,
+        "suggested_boundary_labels": [suggestion.model_dump() for suggestion in suggestions],
+        "confirmed_boundary_labels": [],
+        "warnings": warnings,
+    }
+    path = output_dir / "boundary_labeling_artifact.json"
+    path.write_text(json.dumps(artifact_payload, indent=2), encoding="utf-8")
+    artifact = ArtifactRef(
+        uri=str(path),
+        kind="boundary_labeling_artifact",
+        format="json",
+        description="Human-confirmable boundary labeling artifact for viewer/CLI workflows.",
+    )
+    return CreateBoundaryLabelingArtifactOutput(
+        artifact=artifact,
+        selectable_groups=selectable_groups,
+        suggestions=suggestions,
+        warnings=warnings,
+    )
+
+
+class ApplyBoundaryLabelingArtifactInput(StrictBaseModel):
+    geometry: GeometrySpec
+    labeling_artifact: ArtifactRef
+    replace_existing: bool = False
+
+
+class ApplyBoundaryLabelingArtifactOutput(StrictBaseModel):
+    geometry: GeometrySpec
+    applied: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def apply_boundary_labeling_artifact(input: ApplyBoundaryLabelingArtifactInput) -> ApplyBoundaryLabelingArtifactOutput:
+    """Apply only confirmed boundary labels from a viewer/CLI labeling artifact."""
+    payload = _read_json_artifact(input.labeling_artifact.uri)
+    if payload is None:
+        return ApplyBoundaryLabelingArtifactOutput(geometry=input.geometry, warnings=["Boundary labeling artifact is missing or invalid JSON."])
+    raw_confirmed = payload.get("confirmed_boundary_labels", [])
+    if not isinstance(raw_confirmed, list):
+        return ApplyBoundaryLabelingArtifactOutput(geometry=input.geometry, warnings=["confirmed_boundary_labels must be a list."])
+
+    geometry = input.geometry.model_copy(deep=True)
+    if input.replace_existing:
+        geometry.boundaries = []
+    existing_entity_ids = {entity.id for entity in geometry.entities}
+    assignments: list[BoundaryLabelAssignment] = []
+    warnings: list[str] = []
+    for raw_label in raw_confirmed:
+        if not isinstance(raw_label, dict):
+            warnings.append("Skipping malformed confirmed label entry.")
+            continue
+        confirmed = ConfirmedBoundaryLabel.model_validate(raw_label)
+        entity_ids: list[str] = []
+        for target_id in confirmed.target_ids:
+            entity_id = target_id
+            if entity_id not in existing_entity_ids:
+                entity_kind = "surface" if geometry.dimension >= 3 else "curve" if geometry.dimension == 2 else "point"
+                geometry.entities.append(GeometryEntity(id=entity_id, kind=entity_kind, label=confirmed.label))  # type: ignore[arg-type]
+                existing_entity_ids.add(entity_id)
+            entity_ids.append(entity_id)
+        assignments.append(
+            BoundaryLabelAssignment(
+                entity_ids=entity_ids,
+                boundary_id=confirmed.boundary_id,
+                label=confirmed.label,
+                kind=confirmed.kind,
+                confidence=max(0.0, min(1.0, confirmed.confidence)),
+            )
+        )
+    applied = apply_boundary_labels(
+        ApplyBoundaryLabelsInput(
+            geometry=geometry,
+            assignments=assignments,
+            replace_existing=False,
+            source="user",
+        )
+    )
+    applied.geometry.transforms.append(
+        GeometryTransform(kind="custom", description=f"Applied confirmed boundary labels from {input.labeling_artifact.uri}.")
+    )
+    return ApplyBoundaryLabelingArtifactOutput(
+        geometry=applied.geometry,
+        applied=applied.applied,
+        warnings=[*warnings, *applied.warnings],
+    )
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
@@ -762,6 +984,8 @@ for _tool, _input, _output in [
     (repair_geometry, RepairGeometryInput, RepairGeometryOutput),
     (label_regions, LabelRegionsInput, LabelRegionsOutput),
     (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
+    (create_boundary_labeling_artifact, CreateBoundaryLabelingArtifactInput, CreateBoundaryLabelingArtifactOutput),
+    (apply_boundary_labeling_artifact, ApplyBoundaryLabelingArtifactInput, ApplyBoundaryLabelingArtifactOutput),
     (generate_geometry_encoding, GenerateGeometryEncodingInput, GenerateGeometryEncodingOutput),
     (generate_mesh, GenerateMeshInput, GenerateMeshOutput),
     (export_backend_mesh, ExportBackendMeshInput, ExportBackendMeshOutput),

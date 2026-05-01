@@ -63,14 +63,18 @@ from physicsos.tools.catalog_tools import (
 from physicsos.tools.geometry_tools import (
     AssessMeshQualityInput,
     ApplyBoundaryLabelsInput,
+    ApplyBoundaryLabelingArtifactInput,
     BoundaryLabelAssignment,
+    CreateBoundaryLabelingArtifactInput,
     ExportBackendMeshInput,
     GenerateGeometryEncodingInput,
     GenerateMeshInput,
     ImportGeometryInput,
     LabelRegionsInput,
     apply_boundary_labels,
+    apply_boundary_labeling_artifact,
     assess_mesh_quality,
+    create_boundary_labeling_artifact,
     export_backend_mesh,
     generate_geometry_encoding,
     generate_mesh,
@@ -126,6 +130,8 @@ def test_tool_registry_has_core_tools() -> None:
     assert "prepare_full_solver_case" in TOOL_REGISTRY
     assert "submit_full_solver_job" in TOOL_REGISTRY
     assert "apply_boundary_labels" in TOOL_REGISTRY
+    assert "create_boundary_labeling_artifact" in TOOL_REGISTRY
+    assert "apply_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "export_backend_mesh" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
@@ -1439,6 +1445,73 @@ def test_3d_gmsh_physical_surfaces_export_as_solver_face_groups(tmp_path) -> Non
     assert patches["outlet"]["face_ids"]
     assert patches["wall"]["face_ids"]
     assert exported.warnings == []
+
+
+def test_boundary_labeling_artifact_requires_confirmation_before_apply(tmp_path) -> None:
+    geo_path = tmp_path / "labeling_box.geo"
+    geo_path.write_text(
+        "\n".join(
+            [
+                'SetFactory("OpenCASCADE");',
+                "Box(1) = {0, 0, 0, 1, 1, 1};",
+                "Mesh.CharacteristicLengthMin = 0.7;",
+                "Mesh.CharacteristicLengthMax = 0.7;",
+                "Physical Volume(\"domain\") = {1};",
+                "eps = 1e-6;",
+                "inlet[] = Surface In BoundingBox{-eps, -eps, -eps, eps, 1 + eps, 1 + eps};",
+                "Physical Surface(\"inlet\") = inlet[];",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = import_geometry(ImportGeometryInput(source=GeometrySource(kind="mesh_file", uri=str(geo_path)))).geometry
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["fluid"]),
+            mesh_policy=MeshPolicy(target_element_size=0.7),
+            target_backends=["openfoam"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    labeling = create_boundary_labeling_artifact(
+        CreateBoundaryLabelingArtifactInput(geometry=geometry, geometry_encoding=encoding_output.encodings[0])
+    )
+    payload = json.loads(open(labeling.artifact.uri, encoding="utf-8").read())
+    assert payload["policy"]["weak_suggestions_require_confirmation"] is True
+    assert payload["policy"]["solver_export_uses_confirmed_labels_only"] is True
+    assert payload["suggested_boundary_labels"]
+    assert payload["confirmed_boundary_labels"] == []
+
+    applied_empty = apply_boundary_labeling_artifact(
+        ApplyBoundaryLabelingArtifactInput(geometry=GeometrySpec(id="geometry:empty-labels", source=geometry.source, dimension=3), labeling_artifact=labeling.artifact)
+    )
+    assert applied_empty.applied == []
+
+    target_id = next(group["id"] for group in payload["selectable_groups"] if group["name"] == "inlet")
+    payload["confirmed_boundary_labels"] = [
+        {
+            "target_ids": [target_id],
+            "boundary_id": "boundary:confirmed_inlet",
+            "label": "confirmed_inlet",
+            "kind": "inlet",
+            "confidence": 1.0,
+            "confirmed_by": "user",
+        }
+    ]
+    open(labeling.artifact.uri, "w", encoding="utf-8").write(json.dumps(payload, indent=2))
+    applied = apply_boundary_labeling_artifact(
+        ApplyBoundaryLabelingArtifactInput(
+            geometry=GeometrySpec(id="geometry:confirmed-labels", source=geometry.source, dimension=3),
+            labeling_artifact=labeling.artifact,
+        )
+    )
+    assert applied.applied == ["boundary:confirmed_inlet"]
+    assert applied.geometry.boundaries[0].kind == "inlet"
+    assert applied.geometry.boundaries[0].confidence == 1.0
+    assert applied.geometry.entities[0].id == target_id
 
 
 def test_triangle_p1_assembler_uses_cell_gradients() -> None:
