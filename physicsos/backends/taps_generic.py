@@ -520,6 +520,56 @@ def supports_vector_elasticity_weak_form(problem: TAPSProblem) -> bool:
     return _weak_form_vector_elasticity_blocks(problem) is not None
 
 
+def _weak_form_hcurl_curl_curl_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) != 1:
+        return None
+    blocks: list[dict[str, str]] = []
+    has_curl_curl = False
+    has_mass = False
+    has_source = False
+    allowed_roles = {"diffusion", "mass", "source", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_curl_curl = "curl(" in expression or "curl_" in expression or "curl-curl" in expression or "curl curl" in expression
+        is_mass = role == "mass" or any(token in expression for token in (" k0", "wave_number", "permittivity", "epsilon", " v dot e"))
+        is_source = role == "source" or any(token in expression for token in ("current_source", " v dot j", "source", "jz"))
+        if role == "diffusion" and is_curl_curl:
+            pass
+        elif role == "custom" and not (is_curl_curl or is_mass or is_source):
+            return None
+        elif role == "diffusion" and not is_curl_curl:
+            return None
+        if is_curl_curl:
+            has_curl_curl = True
+            blocks.append({"role": "curl_curl", "term_id": term.id, "expression": term.expression})
+        if is_mass:
+            has_mass = True
+            blocks.append({"role": "mass", "term_id": term.id, "expression": term.expression})
+        if is_source:
+            has_source = True
+            blocks.append({"role": "source", "term_id": term.id, "expression": term.expression})
+    if not has_curl_curl:
+        return None
+    return {
+        "operator_family": "hcurl_curl_curl",
+        "source": "weak_form_ir",
+        "blocks": blocks,
+        "has_curl_curl": has_curl_curl,
+        "has_mass": has_mass,
+        "has_source": has_source,
+    }
+
+
+def supports_hcurl_curl_curl_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_hcurl_curl_curl_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):
@@ -1982,6 +2032,7 @@ def solve_mesh_fem_poisson(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifac
 
 def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a 2D electromagnetic curl-curl problem with first-order Nedelec edge elements."""
+    weak_form_blocks = _weak_form_hcurl_curl_curl_blocks(taps_problem)
     graph = _load_mesh_graph(taps_problem)
     if graph is None:
         raise ValueError("mesh_graph encoding is required for mesh FEM EM curl-curl solver.")
@@ -2084,6 +2135,7 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
         "basis_order": basis_order,
         "assembly": "nedelec_first_kind_edge_element_hcurl",
         "operator": "int mu^-1 curl(v) curl(E) dOmega + int k0^2 eps v dot E dOmega = int v dot J dOmega",
+        "weak_form_blocks": weak_form_blocks,
         "source_mesh": graph.get("source_mesh"),
         "node_count": len(points),
         "dof_count": len(dof_entities),
@@ -2134,6 +2186,7 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     }
     residual_payload = {
         "family": "maxwell",
+        "weak_form_blocks": weak_form_blocks,
         "normalized_fem_residual": final_residual,
         "relative_update": final_update,
         "iterations": int(history[-1]["iteration"]) if history else 0,

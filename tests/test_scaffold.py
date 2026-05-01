@@ -1017,6 +1017,80 @@ def test_mesh_graph_taps_solves_em_curl_curl_nedelec() -> None:
     assert operator_payload["hcurl_scaffold"]["boundary_condition"] == "pec_tangential_zero"
 
 
+def test_mesh_graph_taps_executes_custom_hcurl_curl_curl_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-hcurl-square", source=GeometrySource(kind="generated"), dimension=2)
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["electromagnetic"]),
+            mesh_policy=MeshPolicy(target_element_size=0.35),
+            target_backends=["taps"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    geometry.encodings.extend(encoding_output.encodings)
+    problem = PhysicsProblem(
+        id="problem:custom-hcurl-curl-curl-2d",
+        user_intent={"raw_request": "solve a custom H(curl) curl-curl weak form on a square mesh"},
+        domain="custom",
+        geometry=geometry,
+        mesh=mesh,
+        fields=[FieldSpec(name="E", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-hcurl",
+                name="Custom Hcurl curl-curl weak form",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["E"],
+                differential_terms=[
+                    {
+                        "expression": "int_Omega mu^-1 curl(v) dot curl(E) dOmega",
+                        "order": 2,
+                        "fields": ["E"],
+                    },
+                    {
+                        "expression": "- int_Omega k0^2 epsilon v dot E dOmega",
+                        "order": 0,
+                        "fields": ["E"],
+                    },
+                ],
+                source_terms=[{"expression": "int_Omega v dot J dOmega"}],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:custom-em",
+                name="custom em",
+                phase="custom",
+                properties=[
+                    MaterialProperty(name="relative_permittivity", value=1.5),
+                    MaterialProperty(name="relative_permeability", value=1.0),
+                    MaterialProperty(name="wave_number", value=0.35),
+                    MaterialProperty(name="current_source", value=0.5),
+                ],
+            )
+        ],
+        boundary_conditions=[{"id": "bc:e", "region_id": "boundary", "field": "E_t", "kind": "dirichlet", "value": 0.0}],
+        targets=[{"name": "field", "field": "E", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_em_curl_curl:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["weak_form_blocks"]["operator_family"] == "hcurl_curl_curl"
+    assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"curl_curl", "mass", "source"}
+    assert operator_payload["hcurl_scaffold"]["edge_dofs_required"] is True
+
+
 def test_mesh_graph_taps_solves_em_curl_curl_nedelec_order2() -> None:
     geometry = GeometrySpec(id="geometry:mesh-em-p2-square", source=GeometrySource(kind="generated"), dimension=2)
     mesh = generate_mesh(
