@@ -78,7 +78,8 @@ In a source checkout, runtime artifacts stay under the repository so tests and d
 
 Default paths:
 
-- Cloud auth config: `~/.physicsos/config.toml`
+- Unified config: `~/.physicsos/config.json`
+- Cloud auth config: `~/.physicsos/config.json` under the `cloud` object
 - Interactive sessions: `~/.physicsos/sessions/session-*.jsonl` for pip installs, or `./sessions/session-*.jsonl` in a source checkout
 - Command history: `~/.physicsos/history.jsonl` for pip installs, or `./history.jsonl` in a source checkout
 - Solver/session artifacts: `~/.physicsos/scratch/...` for pip installs, or `./scratch/...` in a source checkout
@@ -87,6 +88,28 @@ Default paths:
 
 Set `PHYSICSOS_HOME=/path/to/physicsos-home` to relocate these files.
 Run `physicsos paths` to print the exact paths used by the current environment.
+
+## Config
+
+PhysicsOS creates `~/.physicsos/config.json` on first run. Edit it to set model, API, cloud, and storage preferences in one place:
+
+```json
+{
+  "model": {
+    "provider": "openai",
+    "name": "gpt-5.4",
+    "api_key": "",
+    "base_url": "https://api.tu-zi.com/v1",
+    "use_responses_api": false
+  },
+  "cloud": {
+    "runner_url": "https://foamvm.vercel.app",
+    "access_token": ""
+  }
+}
+```
+
+Environment variables such as `PHYSICSOS_OPENAI_API_KEY`, `PHYSICSOS_OPENAI_BASE_URL`, and `PHYSICSOS_OPENAI_MODEL` still override this file for one-off runs.
 
 ## Development
 

@@ -21,7 +21,7 @@ from physicsos.cloud.auth import start_device_login
 from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
-from physicsos.config import runtime_paths
+from physicsos.config import load_config, runtime_paths
 
 
 BANNER = "PhysicsOS\nPhysicsOS"
@@ -60,6 +60,40 @@ def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def _physicsos_banner() -> str:
+    return """
+██████╗ ██╗  ██╗██╗   ██╗███████╗██╗ ██████╗███████╗
+██╔══██╗██║  ██║╚██╗ ██╔╝██╔════╝██║██╔════╝██╔════╝
+██████╔╝███████║ ╚████╔╝ ███████╗██║██║     ███████╗
+██╔═══╝ ██╔══██║  ╚██╔╝  ╚════██║██║██║     ╚════██║
+██║     ██║  ██║   ██║   ███████║██║╚██████╗███████║
+╚═╝     ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝ ╚═════╝╚══════╝
+
+ ██████╗ ███████╗
+██╔═══██╗██╔════╝
+██║   ██║███████╗
+██║   ██║╚════██║
+╚██████╔╝███████║
+ ╚═════╝ ╚══════╝
+
+                 PhysicsOS
+"""
+
+
+def _patch_deepagents_banner() -> None:
+    def get_banner() -> str:
+        return _physicsos_banner()
+
+    try:
+        import deepagents_cli.config as cli_config
+        cli_config.get_banner = get_banner
+        if "deepagents_cli.widgets.welcome" in sys.modules:
+            import deepagents_cli.widgets.welcome as welcome
+            welcome.get_banner = get_banner
+    except ImportError:
+        return
+
+
 def _physicsos_agent_prompt() -> str:
     return (
         "# PhysicsOS\n\n"
@@ -90,14 +124,16 @@ def _ensure_deepagents_physicsos_config() -> None:
 def _deepagents_model_args(argv: list[str]) -> list[str]:
     if any(arg in {"-M", "--model", "--default-model", "--clear-default-model"} for arg in argv):
         return []
-    model = os.getenv("PHYSICSOS_OPENAI_MODEL", "gpt-5.4")
+    config = load_config()
+    model = os.getenv("PHYSICSOS_OPENAI_MODEL") or config.get("model", {}).get("name") or "gpt-5.4"
     return ["--model", f"openai:{model}"]
 
 
 def _deepagents_model_params_args(argv: list[str]) -> list[str]:
     if "--model-params" in argv:
         return []
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL")
+    config = load_config()
+    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or config.get("model", {}).get("base_url")
     if not base_url:
         return []
     return ["--model-params", json.dumps({"base_url": base_url})]
@@ -114,14 +150,17 @@ def _prepare_deepagents_env() -> None:
             except (OSError, ValueError):
                 pass
 
-    if os.getenv("PHYSICSOS_OPENAI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = os.environ["PHYSICSOS_OPENAI_API_KEY"]
+    config = load_config()
+    api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY") or config.get("model", {}).get("api_key")
+    if api_key and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = str(api_key)
 
 
 def _launch_deepagents_cli(argv: list[str]) -> int:
     if not any(arg in {"-h", "--help", "-v", "--version"} for arg in argv):
         _ensure_deepagents_physicsos_config()
     _prepare_deepagents_env()
+    _patch_deepagents_banner()
     try:
         from deepagents_cli import cli_main
     except ImportError as exc:
@@ -173,6 +212,7 @@ def _paths_payload() -> dict[str, str]:
     return {
         "home": str(paths.home),
         "workspace": str(paths.workspace),
+        "config_json": str(paths.config_json),
         "cloud_config": str(paths.cloud_config),
         "sessions": str(paths.sessions),
         "history": str(paths.history),

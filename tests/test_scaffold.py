@@ -3,8 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
-from physicsos.cli import BANNER, _ensure_deepagents_physicsos_config, _launch_deepagents_cli, _interactive, main as cli_main
-from physicsos.config import physicsos_home, runtime_paths
+from physicsos.cli import BANNER, _ensure_deepagents_physicsos_config, _launch_deepagents_cli, _interactive, _physicsos_banner, main as cli_main
+from physicsos.config import load_config, physicsos_home, runtime_paths
 from physicsos.schemas.boundary import InitialConditionSpec
 from physicsos.schemas.common import ComputeBudget, Provenance
 from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
@@ -200,6 +200,8 @@ def test_cli_defaults_to_official_deepagents_cli(monkeypatch, tmp_path) -> None:
     assert __import__("os").environ["PYTHONIOENCODING"] == "utf-8"
     assert (tmp_path / ".deepagents" / "physicsos" / "AGENTS.md").exists()
     assert (tmp_path / ".deepagents" / "physicsos" / "agents" / "taps-agent" / "AGENTS.md").exists()
+    assert "PhysicsOS" in _physicsos_banner()
+    assert "██████" in _physicsos_banner()
 
 
 def test_deepagents_env_keeps_explicit_python_encoding(monkeypatch, tmp_path) -> None:
@@ -219,12 +221,22 @@ def test_deepagents_env_keeps_explicit_python_encoding(monkeypatch, tmp_path) ->
     assert __import__("os").environ["PYTHONIOENCODING"] == "utf-8:replace"
 
 
+def test_physicsos_config_json_is_created_and_used(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
+    config = load_config()
+    path = tmp_path / "physicsos-home" / "config.json"
+    assert path.exists()
+    assert config["model"]["name"] == "gpt-5.4"
+    assert config["model"]["base_url"] == "https://api.tu-zi.com/v1"
+
+
 def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
     assert cli_main(["paths"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["home"] == str(tmp_path / "physicsos-home")
-    assert payload["cloud_config"].endswith("config.toml")
+    assert payload["config_json"].endswith("config.json")
+    assert payload["cloud_config"].endswith("config.json")
     assert payload["case_memory"].endswith("data\\case_memory.jsonl") or payload["case_memory"].endswith("data/case_memory.jsonl")
     assert payload["knowledge_base"].endswith("physicsos_knowledge.sqlite")
 
@@ -252,6 +264,7 @@ def test_physicsos_home_uses_environment_override(monkeypatch, tmp_path) -> None
     monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
     assert physicsos_home() == tmp_path / "home"
     assert runtime_paths().knowledge_base == tmp_path / "home" / "data" / "knowledge" / "physicsos_knowledge.sqlite"
+    assert runtime_paths().config_json == tmp_path / "home" / "config.json"
 
 
 def test_solver_routing_prefers_open_source_cfd_backend() -> None:

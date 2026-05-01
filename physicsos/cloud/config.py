@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from physicsos.config import physicsos_home
+from physicsos.config import config_path as physicsos_config_path
+from physicsos.config import load_config, save_config
 
 
 DEFAULT_RUNNER_URL = "https://foamvm.vercel.app"
@@ -21,18 +21,12 @@ def config_path() -> Path:
     override = os.environ.get("PHYSICSOS_CONFIG")
     if override:
         return Path(override).expanduser()
-    return physicsos_home() / "config.toml"
+    return physicsos_config_path()
 
 
 def load_cloud_config(path: Path | None = None) -> CloudConfig:
     target = path or config_path()
-    if not target.exists():
-        return CloudConfig(
-            runner_url=os.environ.get("PHYSICSOS_RUNNER_URL", DEFAULT_RUNNER_URL),
-            access_token=os.environ.get("PHYSICSOS_ACCESS_TOKEN"),
-        )
-
-    data = tomllib.loads(target.read_text(encoding="utf-8"))
+    data = load_config(target)
     cloud = data.get("cloud", {})
     return CloudConfig(
         runner_url=str(cloud.get("runner_url") or os.environ.get("PHYSICSOS_RUNNER_URL") or DEFAULT_RUNNER_URL),
@@ -42,12 +36,10 @@ def load_cloud_config(path: Path | None = None) -> CloudConfig:
 
 def save_cloud_config(config: CloudConfig, path: Path | None = None) -> Path:
     target = path or config_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    token = config.access_token or ""
-    content = (
-        "[cloud]\n"
-        f'runner_url = "{config.runner_url}"\n'
-        f'access_token = "{token}"\n'
-    )
-    target.write_text(content, encoding="utf-8")
-    return target
+    data = load_config(target)
+    data["cloud"] = {
+        **data.get("cloud", {}),
+        "runner_url": config.runner_url,
+        "access_token": config.access_token or "",
+    }
+    return save_config(data, target)
