@@ -329,6 +329,18 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
             "weak_suggestions_require_confirmation": True,
             "solver_export_uses_confirmed_labels_only": True,
         },
+        "viewer_geometry": (
+            {
+                "points": graph_payload.get("points", []),
+                "edges": graph_payload.get("edges", []),
+                "faces": graph_payload.get("faces", []),
+                "boundary_edge_sets": graph_payload.get("boundary_edge_sets", {}),
+                "boundary_face_sets": graph_payload.get("boundary_face_sets", {}),
+                "bbox": graph_payload.get("bbox", {}),
+            }
+            if graph_payload is not None
+            else {"points": [], "edges": [], "faces": [], "boundary_edge_sets": {}, "boundary_face_sets": {}, "bbox": {}}
+        ),
         "selectable_groups": selectable_groups,
         "suggested_boundary_labels": [suggestion.model_dump() for suggestion in suggestions],
         "confirmed_boundary_labels": [],

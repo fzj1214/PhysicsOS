@@ -1548,6 +1548,8 @@ def test_boundary_labeling_artifact_requires_confirmation_before_apply(tmp_path)
     payload = json.loads(open(labeling.artifact.uri, encoding="utf-8").read())
     assert payload["policy"]["weak_suggestions_require_confirmation"] is True
     assert payload["policy"]["solver_export_uses_confirmed_labels_only"] is True
+    assert payload["viewer_geometry"]["points"]
+    assert payload["viewer_geometry"]["faces"]
     assert payload["suggested_boundary_labels"]
     assert payload["confirmed_boundary_labels"] == []
 
