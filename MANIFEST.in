@@ -1,0 +1,27 @@
+include README.md
+include ARCHITECTURE.md
+include taps.md
+include vm.md
+include physicsOS.md
+
+recursive-exclude scratch *
+recursive-exclude data *
+recursive-exclude models *
+recursive-exclude configs *
+recursive-exclude runners *
+recursive-exclude tests *
+recursive-exclude examples *
+recursive-exclude docs *
+recursive-exclude scripts *
+
+global-exclude *.pdf
+global-exclude *.safetensors
+global-exclude *.ckpt
+global-exclude *.pt
+global-exclude *.pth
+global-exclude *.onnx
+global-exclude *.bin
+global-exclude *.sqlite
+global-exclude *.jsonl
+global-exclude .env
+global-exclude .env.*

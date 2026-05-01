@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from physicsos.config import physicsos_home
+
 
 DEFAULT_RUNNER_URL = "https://foamvm.vercel.app"
 
@@ -19,7 +21,7 @@ def config_path() -> Path:
     override = os.environ.get("PHYSICSOS_CONFIG")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".physicsos" / "config.toml"
+    return physicsos_home() / "config.toml"
 
 
 def load_cloud_config(path: Path | None = None) -> CloudConfig:

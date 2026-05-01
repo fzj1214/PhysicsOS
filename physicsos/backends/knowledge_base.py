@@ -4,13 +4,18 @@ import re
 import sqlite3
 from pathlib import Path
 
+from physicsos.config import runtime_paths
 from physicsos.schemas.knowledge import KnowledgeChunk, KnowledgeSource
 
-DEFAULT_KB_PATH = Path("data/knowledge/physicsos_knowledge.sqlite")
+DEFAULT_KB_PATH = runtime_paths().knowledge_base
 
 
-def _connect(path: str | Path = DEFAULT_KB_PATH) -> sqlite3.Connection:
-    db_path = Path(path)
+def _resolve_db_path(path: str | Path | None = None) -> Path:
+    return Path(path).expanduser() if path is not None else runtime_paths().knowledge_base
+
+
+def _connect(path: str | Path | None = None) -> sqlite3.Connection:
+    db_path = _resolve_db_path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -45,7 +50,7 @@ def _chunk_text(text: str, chunk_size: int = 1800, overlap: int = 250) -> list[s
     return chunks
 
 
-def upsert_document(source: KnowledgeSource, text: str, db_path: str | Path = DEFAULT_KB_PATH) -> int:
+def upsert_document(source: KnowledgeSource, text: str, db_path: str | Path | None = None) -> int:
     chunks = _chunk_text(text)
     with _connect(db_path) as conn:
         conn.execute(
@@ -69,7 +74,7 @@ def upsert_document(source: KnowledgeSource, text: str, db_path: str | Path = DE
     return len(chunks)
 
 
-def search_knowledge(query: str, top_k: int = 8, db_path: str | Path = DEFAULT_KB_PATH) -> list[KnowledgeChunk]:
+def search_knowledge(query: str, top_k: int = 8, db_path: str | Path | None = None) -> list[KnowledgeChunk]:
     with _connect(db_path) as conn:
         rows = _search_fts(conn, query, top_k)
         if not rows:

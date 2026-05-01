@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import Field
 
-from physicsos.config import project_root
+from physicsos.config import runtime_paths
 from physicsos.schemas.common import StrictBaseModel
 from physicsos.schemas.postprocess import PostprocessResult
 from physicsos.schemas.problem import PhysicsProblem
@@ -132,7 +132,7 @@ def store_case_result(input: StoreCaseResultInput) -> StoreCaseResultOutput:
 def _memory_path(uri: str | None = None) -> Path:
     if uri:
         return Path(uri).expanduser()
-    return project_root() / "data" / "case_memory.jsonl"
+    return runtime_paths().case_memory
 
 
 def _read_raw_records(path: Path) -> list[dict[str, Any]]:

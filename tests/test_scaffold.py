@@ -1,7 +1,10 @@
 import json
+from unittest.mock import patch
 
 import pytest
 
+from physicsos.cli import BANNER, _interactive, main as cli_main
+from physicsos.config import physicsos_home, runtime_paths
 from physicsos.schemas.boundary import InitialConditionSpec
 from physicsos.schemas.common import ComputeBudget, Provenance
 from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
@@ -161,6 +164,51 @@ def test_tool_registry_has_core_tools() -> None:
     assert TOOL_REGISTRY["submit_full_solver_job"].requires_approval is True
     assert TOOL_REGISTRY["run_full_solver"].requires_approval is True
     assert TOOL_REGISTRY["submit_mesh_conversion_job"].requires_approval is True
+
+
+def test_cli_without_args_starts_interactive_welcome(capsys) -> None:
+    with patch("builtins.input", side_effect=["exit"]):
+        assert cli_main([]) == 0
+    output = capsys.readouterr().out
+    assert BANNER.count("____  _") == 2
+    assert "TAPS-first physics simulation agent" in output
+    assert "Commands:" in output
+    assert "paths" in output
+
+
+def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
+    assert cli_main(["paths"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["home"] == str(tmp_path / "physicsos-home")
+    assert payload["cloud_config"].endswith("config.toml")
+    assert payload["case_memory"].endswith("data\\case_memory.jsonl") or payload["case_memory"].endswith("data/case_memory.jsonl")
+    assert payload["knowledge_base"].endswith("physicsos_knowledge.sqlite")
+
+
+def test_interactive_cli_routes_natural_language_to_agent(capsys, monkeypatch, tmp_path) -> None:
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def invoke(self, payload):
+            self.calls.append(payload)
+            return {"messages": [{"role": "assistant", "content": "agent response"}]}
+
+    fake_agent = FakeAgent()
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
+    with patch("builtins.input", side_effect=["solve heat equation on a rod", "/exit"]):
+        assert _interactive(agent=fake_agent) == 0
+    output = capsys.readouterr().out
+    assert "agent response" in output
+    assert fake_agent.calls[0]["messages"][0]["content"] == "solve heat equation on a rod"
+    assert (tmp_path / "physicsos-home" / "history.jsonl").exists()
+
+
+def test_physicsos_home_uses_environment_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    assert physicsos_home() == tmp_path / "home"
+    assert runtime_paths().knowledge_base == tmp_path / "home" / "data" / "knowledge" / "physicsos_knowledge.sqlite"
 
 
 def test_solver_routing_prefers_open_source_cfd_backend() -> None:
