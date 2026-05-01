@@ -1351,6 +1351,7 @@ generated Gmsh physical groups -> meshio field_data/cell_data -> named boundary 
 imported Gmsh .geo physical curves -> GeometrySpec boundaries + mesh_graph named boundary edge sets -> EM region-specific ports/walls
 mesh_graph physical_boundary_groups -> OpenFOAM patch / SU2 marker / FEniCSx facet-tag export hints
 export_backend_mesh -> solver-facing manifest without local external conversion execution
+3D Gmsh physical surfaces -> mesh_graph boundary_face_sets / physical_boundary_groups.face_ids -> solver patch/marker/facet export manifests
 ```
 
 Current compiler IR coverage:
@@ -1765,6 +1766,7 @@ done: generated Gmsh rectangle physical groups propagate through meshio into nam
 done: imported Gmsh `.geo` physical curve labels propagate into `GeometrySpec.boundaries`, `mesh_graph.boundary_edge_sets`, and EM port/wall edge selection.
 done: mesh_graph physical boundary metadata carries solver-native export hints for OpenFOAM patches, SU2 markers, and FEniCSx facet tags.
 done: `export_backend_mesh` produces OpenFOAM/SU2/FEniCSx/MFEM/TAPS mesh export manifests with physical boundary mappings and no unapproved local external conversion.
-next: CAD/STL repair hardening and executable runner-side mesh conversion from export manifests.
-next: add higher-order Nedelec spaces and harden imported CAD/STL/STEP physical-group propagation into solver-native exports.
+done: Gmsh/meshio-first 3D facet layer propagates physical surfaces into `boundary_face_sets`, `physical_boundary_groups.face_ids`, and solver export manifests.
+next: add user-confirmed physical-group labeling artifacts and executable runner-side mesh conversion from export manifests.
+next: add higher-order Nedelec spaces after the Gmsh/meshio facet and boundary-label pipeline is stable.
 ```

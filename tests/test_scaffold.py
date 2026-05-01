@@ -1378,6 +1378,69 @@ def test_backend_mesh_export_manifest_preserves_physical_boundary_groups(tmp_pat
     assert exported.warnings == []
 
 
+def test_3d_gmsh_physical_surfaces_export_as_solver_face_groups(tmp_path) -> None:
+    geo_path = tmp_path / "box_surfaces.geo"
+    geo_path.write_text(
+        "\n".join(
+            [
+                'SetFactory("OpenCASCADE");',
+                "Box(1) = {0, 0, 0, 1, 1, 1};",
+                "Mesh.CharacteristicLengthMin = 0.6;",
+                "Mesh.CharacteristicLengthMax = 0.6;",
+                "Physical Volume(\"fluid\") = {1};",
+                "eps = 1e-6;",
+                "inlet[] = Surface In BoundingBox{-eps, -eps, -eps, eps, 1 + eps, 1 + eps};",
+                "outlet[] = Surface In BoundingBox{1 - eps, -eps, -eps, 1 + eps, 1 + eps, 1 + eps};",
+                "walls[] = Surface In BoundingBox{-eps, -eps, -eps, 1 + eps, 1 + eps, 1 + eps};",
+                "walls[] -= inlet[];",
+                "walls[] -= outlet[];",
+                "Physical Surface(\"inlet\") = inlet[];",
+                "Physical Surface(\"outlet\") = outlet[];",
+                "Physical Surface(\"wall\") = walls[];",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = import_geometry(ImportGeometryInput(source=GeometrySource(kind="mesh_file", uri=str(geo_path)))).geometry
+    assert geometry.dimension == 3
+    assert {"inlet", "outlet", "wall"} <= {boundary.label for boundary in geometry.boundaries}
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["fluid"]),
+            mesh_policy=MeshPolicy(target_element_size=0.6),
+            target_backends=["openfoam"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    graph_payload = json.loads(open(encoding_output.artifacts[0].uri, encoding="utf-8").read())
+    assert graph_payload["faces"]
+    assert graph_payload["boundary_face_sets"]["boundary:inlet"]
+    assert graph_payload["boundary_face_sets"]["boundary:outlet"]
+    assert graph_payload["boundary_face_sets"]["boundary:wall"]
+    assert graph_payload["physical_boundary_groups"]
+
+    geometry.encodings.extend(encoding_output.encodings)
+    exported = export_backend_mesh(
+        ExportBackendMeshInput(
+            geometry=geometry,
+            mesh=mesh,
+            backend="openfoam",
+            geometry_encoding=encoding_output.encodings[0],
+        )
+    )
+    manifest = json.loads(open(exported.manifest.uri, encoding="utf-8").read())
+    patches = {item["backend_name"]: item for item in manifest["boundary_exports"]}
+    assert {"inlet", "outlet", "wall"} <= set(patches)
+    assert patches["inlet"]["dimension"] == 2
+    assert patches["inlet"]["face_ids"]
+    assert patches["outlet"]["face_ids"]
+    assert patches["wall"]["face_ids"]
+    assert exported.warnings == []
+
+
 def test_triangle_p1_assembler_uses_cell_gradients() -> None:
     stiffness, lumped_mass, total_area, elements = _assemble_triangle_stiffness(
         points=[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],

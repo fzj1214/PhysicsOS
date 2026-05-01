@@ -377,6 +377,7 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
                     mesh = meshio.read(msh_artifact.uri)
                     points = [[float(coord) for coord in point[:3]] for point in mesh.points]
                     edges: set[tuple[int, int]] = set()
+                    faces: set[tuple[int, ...]] = set()
                     cell_blocks = []
                     for block in mesh.cells:
                         cells = [[int(node) for node in cell] for cell in block.data.tolist()]
@@ -386,6 +387,9 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
                                 for b in cell[a_index + 1 :]:
                                     edge = (a, b) if a < b else (b, a)
                                     edges.add(edge)
+                            if block.type.startswith("triangle") or block.type.startswith("quad"):
+                                vertices = cell[:3] if block.type.startswith("triangle") else cell[:4]
+                                faces.add(tuple(sorted(vertices)))
                     mins = [min(point[axis] for point in points) for axis in range(3)] if points else [0.0, 0.0, 0.0]
                     maxs = [max(point[axis] for point in points) for axis in range(3)] if points else [0.0, 0.0, 0.0]
                     tolerance = 1e-10
@@ -410,16 +414,37 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
                     boundary_edge_sets["boundary"] = sorted(
                         {edge for edge_ids in boundary_edge_sets.values() for edge in edge_ids}
                     )
+                    sorted_faces = sorted(faces)
+                    face_index = {face: index for index, face in enumerate(sorted_faces)}
+                    boundary_face_sets: dict[str, list[int]] = {}
+                    if input.geometry.dimension == 3:
+                        for name, nodes in boundary_node_sets.items():
+                            node_set = set(nodes)
+                            boundary_face_sets[name] = [
+                                index for index, face in enumerate(sorted_faces) if all(node in node_set for node in face)
+                            ]
+                        boundary_face_sets["boundary"] = sorted(
+                            {face for face_ids in boundary_face_sets.values() for face in face_ids}
+                        )
                     field_names_by_tag = {
                         int(values[0]): name
                         for name, values in getattr(mesh, "field_data", {}).items()
-                        if len(values) >= 2 and int(values[1]) == 1
+                        if len(values) >= 2 and int(values[1]) in {1, 2}
+                    }
+                    field_dims_by_tag = {
+                        int(values[0]): int(values[1])
+                        for values in getattr(mesh, "field_data", {}).values()
+                        if len(values) >= 2 and int(values[1]) in {1, 2}
                     }
                     physical_boundary_groups: dict[int, dict[str, object]] = {}
                     physical_cell_data = getattr(mesh, "cell_data_dict", {}).get("gmsh:physical", {})
                     physical_offsets: dict[str, int] = {}
                     for block in mesh.cells:
-                        if not block.type.startswith("line"):
+                        is_line_boundary = block.type.startswith("line")
+                        is_surface_boundary = input.geometry.dimension == 3 and (
+                            block.type.startswith("triangle") or block.type.startswith("quad")
+                        )
+                        if not is_line_boundary and not is_surface_boundary:
                             continue
                         physical_tags = physical_cell_data.get(block.type)
                         if physical_tags is None:
@@ -428,22 +453,43 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
                         block_tags = physical_tags.tolist()[offset : offset + len(block.data)]
                         physical_offsets[block.type] = offset + len(block.data)
                         for cell, tag in zip(block.data.tolist(), block_tags):
-                            if len(cell) < 2:
+                            if is_line_boundary and len(cell) < 2:
                                 continue
-                            a = int(cell[0])
-                            b = int(cell[-1])
-                            edge = (a, b) if a < b else (b, a)
-                            if edge not in edge_index:
+                            if is_surface_boundary and len(cell) < 3:
                                 continue
+                            edge_id: int | None = None
+                            face_id: int | None = None
+                            edge_nodes: list[int] = []
+                            face_nodes: list[int] = []
+                            if is_line_boundary:
+                                a = int(cell[0])
+                                b = int(cell[-1])
+                                edge = (a, b) if a < b else (b, a)
+                                if edge not in edge_index:
+                                    continue
+                                edge_id = edge_index[edge]
+                                edge_nodes = [a, b]
+                            else:
+                                vertices = [int(node) for node in (cell[:3] if block.type.startswith("triangle") else cell[:4])]
+                                face = tuple(sorted(vertices))
+                                if face not in face_index:
+                                    continue
+                                face_id = face_index[face]
+                                face_nodes = vertices
                             physical_tag = int(tag)
+                            physical_dim = field_dims_by_tag.get(physical_tag)
+                            if physical_dim is not None and ((is_line_boundary and physical_dim != 1) or (is_surface_boundary and physical_dim != 2)):
+                                continue
                             physical_name = field_names_by_tag.get(physical_tag) or f"physical_{physical_tag}"
                             group = physical_boundary_groups.setdefault(
                                 physical_tag,
                                 {
                                     "tag": physical_tag,
+                                    "dimension": 1 if is_line_boundary else 2,
                                     "name": physical_name,
                                     "aliases": [f"physical:{physical_tag}", f"boundary:physical:{physical_tag}", physical_name, f"boundary:{physical_name}"],
                                     "edge_ids": [],
+                                    "face_ids": [],
                                     "node_ids": [],
                                     "solver_native": {
                                         "gmsh_physical_tag": physical_tag,
@@ -462,21 +508,30 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
                                 names.add(physical_name)
                                 names.add(f"boundary:{physical_name}")
                             for name in names:
-                                boundary_edge_sets.setdefault(name, []).append(edge_index[edge])
+                                if edge_id is not None:
+                                    boundary_edge_sets.setdefault(name, []).append(edge_id)
+                                if face_id is not None:
+                                    boundary_face_sets.setdefault(name, []).append(face_id)
                                 boundary_node_sets.setdefault(name, [])
-                                boundary_node_sets[name] = sorted(set([*boundary_node_sets[name], a, b]))
-                            group["edge_ids"] = sorted(set([*group["edge_ids"], edge_index[edge]]))  # type: ignore[index]
-                            group["node_ids"] = sorted(set([*group["node_ids"], a, b]))  # type: ignore[index]
+                                boundary_node_sets[name] = sorted(set([*boundary_node_sets[name], *edge_nodes, *face_nodes]))
+                            if edge_id is not None:
+                                group["edge_ids"] = sorted(set([*group["edge_ids"], edge_id]))  # type: ignore[index]
+                            if face_id is not None:
+                                group["face_ids"] = sorted(set([*group["face_ids"], face_id]))  # type: ignore[index]
+                            group["node_ids"] = sorted(set([*group["node_ids"], *edge_nodes, *face_nodes]))  # type: ignore[index]
                     boundary_edge_sets = {name: sorted(set(edge_ids)) for name, edge_ids in boundary_edge_sets.items()}
+                    boundary_face_sets = {name: sorted(set(face_ids)) for name, face_ids in boundary_face_sets.items()}
                     payload = {
                         "type": "mesh_graph",
                         "geometry_id": input.geometry.id,
                         "source_mesh": msh_artifact.uri,
                         "points": points,
                         "edges": [[a, b] for a, b in sorted_edges],
+                        "faces": [list(face) for face in sorted_faces],
                         "boundary_nodes": boundary_nodes,
                         "boundary_node_sets": boundary_node_sets,
                         "boundary_edge_sets": boundary_edge_sets,
+                        "boundary_face_sets": boundary_face_sets,
                         "physical_boundary_groups": sorted(physical_boundary_groups.values(), key=lambda group: str(group["name"])),
                         "bbox": {"min": mins, "max": maxs},
                         "cell_blocks": cell_blocks,
@@ -582,12 +637,15 @@ def _boundary_exports_from_graph(payload: dict[str, object], backend: str, inclu
             continue
         name = str(raw_group.get("name") or "boundary")
         edge_ids = raw_group.get("edge_ids") if isinstance(raw_group.get("edge_ids"), list) else []
+        face_ids = raw_group.get("face_ids") if isinstance(raw_group.get("face_ids"), list) else []
         node_ids = raw_group.get("node_ids") if isinstance(raw_group.get("node_ids"), list) else []
         export: dict[str, object] = {
             "source_name": name,
             "backend_name": _backend_boundary_name(raw_group, backend),
             "gmsh_physical_tag": raw_group.get("tag"),
+            "dimension": raw_group.get("dimension"),
             "edge_ids": [int(edge_id) for edge_id in edge_ids if isinstance(edge_id, int)],
+            "face_ids": [int(face_id) for face_id in face_ids if isinstance(face_id, int)],
             "node_ids": [int(node_id) for node_id in node_ids if isinstance(node_id, int)],
         }
         if include_hints and isinstance(raw_group.get("solver_native"), dict):
