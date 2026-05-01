@@ -2088,6 +2088,73 @@ def test_mesh_graph_taps_solves_linear_elasticity() -> None:
     assert operator_payload["material"]["body_force"] == pytest.approx([0.0, -2.0])
 
 
+def test_mesh_graph_taps_executes_custom_vector_elasticity_weak_form_ir() -> None:
+    geometry = GeometrySpec(id="geometry:custom-vector-elasticity-square", source=GeometrySource(kind="generated"), dimension=2)
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["solid"]),
+            mesh_policy=MeshPolicy(target_element_size=0.35),
+            target_backends=["taps"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    geometry.encodings.extend(encoding_output.encodings)
+    problem = PhysicsProblem(
+        id="problem:custom-vector-elasticity-2d",
+        user_intent={"raw_request": "solve a custom vector weak form using epsilon(v)^T C epsilon(u) and body force"},
+        domain="custom",
+        geometry=geometry,
+        mesh=mesh,
+        fields=[FieldSpec(name="u", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:custom-vector-elasticity",
+                name="Custom vector elasticity weak form",
+                domain="custom",
+                equation_class="custom",
+                form="weak",
+                fields_out=["u"],
+                differential_terms=[
+                    {
+                        "expression": "int_Omega epsilon(v)^T C(E, nu) epsilon(u) dOmega",
+                        "order": 2,
+                        "fields": ["u"],
+                    }
+                ],
+                source_terms=[{"expression": "unit_gravity_y", "units": "N/m^3"}],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:custom-vector-solid",
+                name="custom vector solid",
+                phase="solid",
+                properties=[
+                    MaterialProperty(name="young_modulus", value=10.0),
+                    MaterialProperty(name="poisson_ratio", value=0.2),
+                    MaterialProperty(name="constitutive_model", value="plane_stress"),
+                ],
+            )
+        ],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": [0.0, 0.0]}],
+        targets=[{"name": "displacement", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    assert result.status == "success"
+    assert result.backend == "taps:weak_ir_linear_elasticity:custom"
+    assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_elasticity_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["weak_form_blocks"]["operator_family"] == "vector_linear_elasticity"
+    assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"strain_energy", "body_force"}
+
+
 def test_mesh_graph_taps_solves_p2_linear_elasticity() -> None:
     geometry = GeometrySpec(id="geometry:mesh-p2-elasticity-square", source=GeometrySource(kind="generated"), dimension=2)
     mesh = generate_mesh(

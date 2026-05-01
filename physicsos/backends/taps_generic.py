@@ -478,6 +478,48 @@ def supports_scalar_elliptic_weak_form(problem: TAPSProblem) -> bool:
     return _weak_form_scalar_elliptic_blocks(problem) is not None
 
 
+def _weak_form_vector_elasticity_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) != 1:
+        return None
+    blocks: list[dict[str, str]] = []
+    has_strain_energy = False
+    has_body_force = False
+    allowed_roles = {"constitutive", "source", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_strain_energy = role == "constitutive" or any(
+            token in expression for token in ("epsilon(", "strain", "stress", "c(", "constitutive", "symgrad")
+        )
+        is_body_force = role == "source" or any(token in expression for token in ("body_force", " v dot b", "v_i b_i", "traction"))
+        if role == "custom" and not (is_strain_energy or is_body_force):
+            return None
+        if is_strain_energy:
+            has_strain_energy = True
+            blocks.append({"role": "strain_energy", "term_id": term.id, "expression": term.expression})
+        if is_body_force:
+            has_body_force = True
+            blocks.append({"role": "body_force", "term_id": term.id, "expression": term.expression})
+    if not has_strain_energy:
+        return None
+    return {
+        "operator_family": "vector_linear_elasticity",
+        "source": "weak_form_ir",
+        "blocks": blocks,
+        "has_strain_energy": has_strain_energy,
+        "has_body_force": has_body_force,
+    }
+
+
+def supports_vector_elasticity_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_vector_elasticity_blocks(problem) is not None
+
+
 def _mode_pairs(rank: int, max_x_mode: int, max_y_mode: int) -> list[tuple[int, int, float]]:
     pairs: list[tuple[int, int, float]] = []
     for mode_sum in range(2, max_x_mode + max_y_mode + 1):
@@ -1738,6 +1780,7 @@ def _dense_complex_solve(
 
 def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Assemble and solve a P1 triangle 2D linear-elasticity system from mesh_graph."""
+    weak_form_blocks = _weak_form_vector_elasticity_blocks(taps_problem)
     graph = _load_mesh_graph(taps_problem)
     if graph is None:
         raise ValueError("mesh_graph encoding is required for mesh FEM linear-elasticity solver.")
@@ -1786,6 +1829,7 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
         "basis_order": basis_order,
         "assembly": "constant_strain_triangle_galerkin",
         "operator": "int epsilon(v)^T C epsilon(u) dOmega = int v dot b dOmega",
+        "weak_form_blocks": weak_form_blocks,
         "source_mesh": graph.get("source_mesh"),
         "node_count": len(points),
         "triangle_count": len(triangles),
@@ -1813,6 +1857,7 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
     }
     residual_payload = {
         "family": "linear_elasticity",
+        "weak_form_blocks": weak_form_blocks,
         "normalized_fem_residual": final_residual,
         "relative_update": final_update,
         "iterations": int(history[-1]["iteration"]) if history else 0,

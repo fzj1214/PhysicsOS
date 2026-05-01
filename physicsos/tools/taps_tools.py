@@ -14,6 +14,7 @@ from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_2
 from physicsos.backends.taps_generic import solve_scalar_elliptic_1d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_2d
 from physicsos.backends.taps_generic import supports_scalar_elliptic_weak_form
+from physicsos.backends.taps_generic import supports_vector_elasticity_weak_form
 from physicsos.backends.taps_thermal import solve_transient_heat_1d
 from physicsos.schemas.common import ArtifactRef, Provenance, StrictBaseModel
 from physicsos.schemas.knowledge import KnowledgeContext
@@ -566,6 +567,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     field_count = len(input.taps_problem.weak_form.trial_fields) if input.taps_problem.weak_form is not None else 0
     has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in input.taps_problem.geometry_encodings)
     is_scalar_elliptic_ir = supports_scalar_elliptic_weak_form(input.taps_problem)
+    is_vector_elasticity_ir = supports_vector_elasticity_weak_form(input.taps_problem)
     if family in {"maxwell", "curl_curl", "electromagnetic"} and has_mesh_graph:
         artifacts, residual_report = solve_mesh_fem_em_curl_curl(input.taps_problem)
         artifact_refs = []
@@ -590,7 +592,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
-    if family in {"elasticity", "linear_elasticity"} and has_mesh_graph:
+    if (family in {"elasticity", "linear_elasticity"} or is_vector_elasticity_ir) and has_mesh_graph:
         artifacts, residual_report = solve_mesh_fem_linear_elasticity(input.taps_problem)
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
@@ -601,11 +603,12 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         result = SolverResult(
             id=f"result:{input.taps_problem.id}",
             problem_id=input.problem.id,
-            backend=f"taps:mesh_fem_linear_elasticity:{family}",
+            backend=f"taps:{'weak_ir' if family not in {'elasticity', 'linear_elasticity'} else 'mesh_fem'}_linear_elasticity:{family}",
             status="success" if residual_report.converged else "needs_review",
             scalar_outputs={
-                "message": "Triangle P1 vector FEM-like TAPS linear-elasticity kernel executed on mesh_graph geometry encoding.",
+                "message": "Triangle vector FEM-like TAPS linear-elasticity kernel executed from reusable strain/body-force blocks.",
                 "equation_family": family,
+                "weak_form_ir_blocks": is_vector_elasticity_ir,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
