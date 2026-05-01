@@ -18,7 +18,9 @@ from physicsos.tools.geometry_tools import (
     generate_mesh,
     import_geometry,
     label_regions,
+    prepare_mesh_conversion_job,
     repair_geometry,
+    submit_mesh_conversion_job,
 )
 from physicsos.tools.knowledge_tools import build_knowledge_context, ingest_knowledge_document, run_deepsearch, search_arxiv, search_knowledge_base
 from physicsos.tools.memory_tools import search_case_memory, store_case_result
@@ -45,6 +47,8 @@ SUBAGENTS = [
             generate_geometry_encoding,
             generate_mesh,
             export_backend_mesh,
+            prepare_mesh_conversion_job,
+            submit_mesh_conversion_job,
             assess_mesh_quality,
         ],
     },

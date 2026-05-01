@@ -1354,6 +1354,7 @@ export_backend_mesh -> solver-facing manifest without local external conversion 
 3D Gmsh physical surfaces -> mesh_graph boundary_face_sets / physical_boundary_groups.face_ids -> solver patch/marker/facet export manifests
 boundary_labeling_artifact -> viewer/CLI selectable face/edge groups + weak suggestions requiring explicit confirmation
 confirmed_boundary_labels -> apply_boundary_labeling_artifact -> GeometrySpec.boundaries for solver export
+backend mesh export manifest -> mesh_conversion_runner_manifest with inline .msh + boundary mapping -> dry-run/http runner submit contract
 ```
 
 Current compiler IR coverage:
@@ -1770,6 +1771,7 @@ done: mesh_graph physical boundary metadata carries solver-native export hints f
 done: `export_backend_mesh` produces OpenFOAM/SU2/FEniCSx/MFEM/TAPS mesh export manifests with physical boundary mappings and no unapproved local external conversion.
 done: Gmsh/meshio-first 3D facet layer propagates physical surfaces into `boundary_face_sets`, `physical_boundary_groups.face_ids`, and solver export manifests.
 done: user-confirmed physical-group labeling artifacts separate weak suggestions from confirmed labels before GeometrySpec mutation or solver export.
-next: add executable runner-side mesh conversion from export manifests.
+done: mesh conversion runner manifests can be prepared from backend mesh export manifests, inline source `.msh`, and dry-run/http submitted without local external conversion.
+next: implement the foamvm/E2B runner execution branch for `physicsos.mesh_conversion_job.v1` manifests.
 next: add higher-order Nedelec spaces after the Gmsh/meshio facet and boundary-label pipeline is stable.
 ```

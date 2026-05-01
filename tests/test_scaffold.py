@@ -71,6 +71,8 @@ from physicsos.tools.geometry_tools import (
     GenerateMeshInput,
     ImportGeometryInput,
     LabelRegionsInput,
+    PrepareMeshConversionJobInput,
+    SubmitMeshConversionJobInput,
     apply_boundary_labels,
     apply_boundary_labeling_artifact,
     assess_mesh_quality,
@@ -80,6 +82,8 @@ from physicsos.tools.geometry_tools import (
     generate_mesh,
     import_geometry,
     label_regions,
+    prepare_mesh_conversion_job,
+    submit_mesh_conversion_job,
 )
 from physicsos.workflows import run_physicsos_workflow, run_taps_thermal_workflow
 from physicsos.backends.taps_generic import (
@@ -133,11 +137,14 @@ def test_tool_registry_has_core_tools() -> None:
     assert "create_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "apply_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "export_backend_mesh" in TOOL_REGISTRY
+    assert "prepare_mesh_conversion_job" in TOOL_REGISTRY
+    assert "submit_mesh_conversion_job" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
     assert "recommend_runtime_stack" in TOOL_REGISTRY
     assert TOOL_REGISTRY["submit_full_solver_job"].requires_approval is True
     assert TOOL_REGISTRY["run_full_solver"].requires_approval is True
+    assert TOOL_REGISTRY["submit_mesh_conversion_job"].requires_approval is True
 
 
 def test_solver_routing_prefers_open_source_cfd_backend() -> None:
@@ -1445,6 +1452,65 @@ def test_3d_gmsh_physical_surfaces_export_as_solver_face_groups(tmp_path) -> Non
     assert patches["outlet"]["face_ids"]
     assert patches["wall"]["face_ids"]
     assert exported.warnings == []
+
+
+def test_mesh_conversion_runner_manifest_inlines_exported_msh_and_dry_runs(tmp_path) -> None:
+    geo_path = tmp_path / "conversion_box.geo"
+    geo_path.write_text(
+        "\n".join(
+            [
+                'SetFactory("OpenCASCADE");',
+                "Box(1) = {0, 0, 0, 1, 1, 1};",
+                "Mesh.CharacteristicLengthMin = 0.8;",
+                "Mesh.CharacteristicLengthMax = 0.8;",
+                "Physical Volume(\"fluid\") = {1};",
+                "eps = 1e-6;",
+                "inlet[] = Surface In BoundingBox{-eps, -eps, -eps, eps, 1 + eps, 1 + eps};",
+                "Physical Surface(\"inlet\") = inlet[];",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = import_geometry(ImportGeometryInput(source=GeometrySource(kind="mesh_file", uri=str(geo_path)))).geometry
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["fluid"]),
+            mesh_policy=MeshPolicy(target_element_size=0.8),
+            target_backends=["openfoam"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    export = export_backend_mesh(
+        ExportBackendMeshInput(
+            geometry=geometry,
+            mesh=mesh,
+            backend="openfoam",
+            geometry_encoding=encoding_output.encodings[0],
+        )
+    )
+    prepared = prepare_mesh_conversion_job(
+        PrepareMeshConversionJobInput(
+            mesh_export_manifest=export.manifest,
+            service_base_url="https://foamvm.vercel.app",
+        )
+    )
+    manifest = json.loads(open(prepared.runner_manifest.uri, encoding="utf-8").read())
+    assert manifest["schema_version"] == "physicsos.mesh_conversion_job.v1"
+    assert manifest["job_type"] == "mesh_conversion"
+    assert manifest["backend"] == "openfoam"
+    assert manifest["inputs"]["source_mesh_file"]["content_base64"]
+    assert manifest["conversion_plan"]["allowed_converters"] == ["gmshToFoam", "meshio"]
+    assert manifest["execution_policy"]["local_external_process_execution"] is False
+    assert prepared.warnings == []
+
+    dry_run = submit_mesh_conversion_job(SubmitMeshConversionJobInput(runner_manifest=prepared.runner_manifest, mode="dry_run"))
+    response = json.loads(open(dry_run.runner_response.uri, encoding="utf-8").read())
+    assert dry_run.submitted is False
+    assert dry_run.status == "validated"
+    assert response["message"].endswith("no external conversion service or CLI was invoked.")
 
 
 def test_boundary_labeling_artifact_requires_confirmation_before_apply(tmp_path) -> None:

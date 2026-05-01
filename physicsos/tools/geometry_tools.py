@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 from pathlib import Path
 from typing import Literal
+from urllib import request
 
 from pydantic import Field
 
@@ -948,6 +950,210 @@ def export_backend_mesh(input: ExportBackendMeshInput) -> ExportBackendMeshOutpu
     return ExportBackendMeshOutput(manifest=manifest, artifacts=[manifest], boundary_exports=boundary_exports, warnings=warnings)
 
 
+class PrepareMeshConversionJobInput(StrictBaseModel):
+    mesh_export_manifest: ArtifactRef
+    service_base_url: str | None = None
+    inline_source_mesh: bool = True
+    max_inline_bytes: int = 5_000_000
+
+
+class PrepareMeshConversionJobOutput(StrictBaseModel):
+    runner_manifest: ArtifactRef
+    requires_approval: bool = True
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SubmitMeshConversionJobInput(StrictBaseModel):
+    runner_manifest: ArtifactRef
+    mode: Literal["dry_run", "http"] = "dry_run"
+    approval_token: str | None = None
+    service_base_url: str | None = None
+
+
+class SubmitMeshConversionJobOutput(StrictBaseModel):
+    runner_response: ArtifactRef
+    submitted: bool = False
+    status: Literal["validated", "submitted"] = "validated"
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _load_mesh_export_manifest(artifact: ArtifactRef) -> dict[str, object]:
+    if artifact.kind != "backend_mesh_export_manifest":
+        raise ValueError(f"Expected backend_mesh_export_manifest artifact, got {artifact.kind}.")
+    payload = _read_json_artifact(artifact.uri)
+    if payload is None:
+        raise ValueError(f"Could not read backend mesh export manifest: {artifact.uri}")
+    if payload.get("schema_version") != "physicsos.backend_mesh_export.v1":
+        raise ValueError(f"Unsupported backend mesh export manifest schema: {payload.get('schema_version')}")
+    return payload
+
+
+def _inline_source_mesh(source_mesh: object, max_inline_bytes: int) -> tuple[dict[str, object] | None, str | None]:
+    if not isinstance(source_mesh, dict):
+        return None, "Mesh export manifest does not include a source_mesh artifact."
+    uri = source_mesh.get("uri")
+    if not isinstance(uri, str):
+        return None, "source_mesh.uri is missing; runner must receive the mesh by another channel."
+    path = Path(uri)
+    if not path.exists():
+        return None, f"source mesh path is not readable from this workspace: {uri}"
+    size = path.stat().st_size
+    if size > max_inline_bytes:
+        return None, f"source mesh is {size} bytes, larger than max_inline_bytes={max_inline_bytes}; upload by artifact channel instead."
+    return (
+        {
+            "path": path.name,
+            "format": source_mesh.get("format"),
+            "kind": source_mesh.get("kind"),
+            "size": size,
+            "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        },
+        None,
+    )
+
+
+def _mesh_conversion_workspace(export_manifest: dict[str, object]) -> Path:
+    geometry_id = str(export_manifest.get("geometry_id") or "geometry")
+    backend = str(export_manifest.get("backend") or "generic")
+    path = project_root() / "scratch" / geometry_id.replace(":", "_") / "mesh_conversion" / backend
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def prepare_mesh_conversion_job(input: PrepareMeshConversionJobInput) -> PrepareMeshConversionJobOutput:
+    """Prepare a runner-side mesh conversion job from a backend mesh export manifest."""
+    export_manifest = _load_mesh_export_manifest(input.mesh_export_manifest)
+    workspace = _mesh_conversion_workspace(export_manifest)
+    warnings = list(export_manifest.get("warnings", [])) if isinstance(export_manifest.get("warnings"), list) else []
+    source_mesh_file = None
+    if input.inline_source_mesh:
+        source_mesh_file, warning = _inline_source_mesh(export_manifest.get("source_mesh"), input.max_inline_bytes)
+        if warning is not None:
+            warnings.append(warning)
+
+    backend = str(export_manifest.get("backend") or "generic")
+    runner_manifest = {
+        "schema_version": "physicsos.mesh_conversion_job.v1",
+        "job_type": "mesh_conversion",
+        "geometry_id": export_manifest.get("geometry_id"),
+        "mesh_id": export_manifest.get("mesh_id"),
+        "backend": backend,
+        "service": {
+            "base_url": input.service_base_url,
+            "mode": "prepare_only",
+            "requires_approval_token": True,
+        },
+        "inputs": {
+            "mesh_export_manifest": export_manifest,
+            "source_mesh_file": source_mesh_file,
+            "boundary_exports": export_manifest.get("boundary_exports", []),
+        },
+        "conversion_plan": {
+            "target": export_manifest.get("target", {}),
+            "backend": backend,
+            "runner_required": True,
+            "allowed_converters": {
+                "openfoam": ["gmshToFoam", "meshio"],
+                "su2": ["meshio"],
+                "fenicsx": ["meshio-xdmf"],
+                "mfem": ["meshio-mfem"],
+                "taps": ["physicsos-mesh-graph"],
+                "generic": ["copy-msh-and-boundary-manifest"],
+            }.get(backend, ["meshio"]),
+        },
+        "execution_policy": {
+            "sandboxed_workspace": str(workspace),
+            "local_external_process_execution": False,
+            "runner_external_process_execution": "requires_approval_token",
+            "network_access": "runner_service_only",
+            "artifact_collection": ["converted_mesh", "boundary_mapping", "conversion_log"],
+        },
+        "warnings": warnings,
+    }
+    path = workspace / "mesh_conversion_runner_manifest.json"
+    path.write_text(json.dumps(runner_manifest, indent=2), encoding="utf-8")
+    artifact = ArtifactRef(
+        uri=str(path),
+        kind="mesh_conversion_runner_manifest",
+        format="json",
+        description="Prepared runner-side mesh conversion manifest.",
+    )
+    return PrepareMeshConversionJobOutput(runner_manifest=artifact, warnings=warnings)
+
+
+def _load_mesh_conversion_manifest(artifact: ArtifactRef) -> dict[str, object]:
+    if artifact.kind != "mesh_conversion_runner_manifest":
+        raise ValueError(f"Expected mesh_conversion_runner_manifest artifact, got {artifact.kind}.")
+    payload = _read_json_artifact(artifact.uri)
+    if payload is None:
+        raise ValueError(f"Could not read mesh conversion runner manifest: {artifact.uri}")
+    if payload.get("schema_version") != "physicsos.mesh_conversion_job.v1":
+        raise ValueError(f"Unsupported mesh conversion runner manifest schema: {payload.get('schema_version')}")
+    return payload
+
+
+def _mesh_conversion_response_path(manifest: dict[str, object], mode: str) -> Path:
+    workspace = manifest.get("execution_policy", {}).get("sandboxed_workspace") if isinstance(manifest.get("execution_policy"), dict) else None
+    path = Path(str(workspace)) if workspace else _mesh_conversion_workspace({"geometry_id": manifest.get("geometry_id"), "backend": manifest.get("backend")})
+    path.mkdir(parents=True, exist_ok=True)
+    safe_mode = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in mode)
+    return path / f"mesh_conversion_response_{safe_mode}.json"
+
+
+def _write_mesh_conversion_response(manifest: dict[str, object], payload: dict[str, object]) -> ArtifactRef:
+    path = _mesh_conversion_response_path(manifest, str(payload.get("mode", "runner")))
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return ArtifactRef(uri=str(path), kind="mesh_conversion_runner_response", format="json")
+
+
+def _http_submit_mesh_conversion(manifest: dict[str, object], service_base_url: str, approval_token: str) -> dict[str, object]:
+    endpoint = service_base_url.rstrip("/") + "/api/physicsos/jobs"
+    body = json.dumps(manifest).encode("utf-8")
+    req = request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {approval_token}",
+        },
+    )
+    with request.urlopen(req, timeout=30) as response:
+        text = response.read().decode("utf-8")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = {"raw_response": text}
+    return {"endpoint": endpoint, "status": "submitted", "response": parsed}
+
+
+def submit_mesh_conversion_job(input: SubmitMeshConversionJobInput) -> SubmitMeshConversionJobOutput:
+    """Submit a mesh conversion runner manifest, or validate it in dry-run mode."""
+    manifest = _load_mesh_conversion_manifest(input.runner_manifest)
+    warnings = list(manifest.get("warnings", [])) if isinstance(manifest.get("warnings"), list) else []
+    if input.mode == "dry_run":
+        payload = {
+            "mode": "dry_run",
+            "status": "validated",
+            "submitted": False,
+            "message": "Mesh conversion manifest is valid; no external conversion service or CLI was invoked.",
+            "manifest": manifest,
+        }
+        response = _write_mesh_conversion_response(manifest, payload)
+        return SubmitMeshConversionJobOutput(runner_response=response, submitted=False, status="validated", warnings=warnings)
+
+    service_base_url = input.service_base_url or (
+        manifest.get("service", {}).get("base_url") if isinstance(manifest.get("service"), dict) else None
+    )
+    if not service_base_url:
+        raise ValueError("HTTP mesh conversion mode requires service_base_url in input or manifest.")
+    if not input.approval_token:
+        raise PermissionError("HTTP mesh conversion mode requires approval_token.")
+    payload = _http_submit_mesh_conversion(manifest, str(service_base_url), input.approval_token)
+    response = _write_mesh_conversion_response(manifest, payload)
+    return SubmitMeshConversionJobOutput(runner_response=response, submitted=True, status="submitted", warnings=warnings)
+
+
 class AssessMeshQualityInput(StrictBaseModel):
     mesh: MeshSpec
     physics: PhysicsSpec
@@ -989,8 +1195,11 @@ for _tool, _input, _output in [
     (generate_geometry_encoding, GenerateGeometryEncodingInput, GenerateGeometryEncodingOutput),
     (generate_mesh, GenerateMeshInput, GenerateMeshOutput),
     (export_backend_mesh, ExportBackendMeshInput, ExportBackendMeshOutput),
+    (prepare_mesh_conversion_job, PrepareMeshConversionJobInput, PrepareMeshConversionJobOutput),
+    (submit_mesh_conversion_job, SubmitMeshConversionJobInput, SubmitMeshConversionJobOutput),
     (assess_mesh_quality, AssessMeshQualityInput, AssessMeshQualityOutput),
 ]:
     _tool.input_model = _input
     _tool.output_model = _output
     _tool.side_effects = "workspace artifacts only"
+    _tool.requires_approval = _tool.__name__ == "submit_mesh_conversion_job"
