@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import inspect
 import json
 import os
 import shlex
 import sys
+import textwrap
 from pathlib import Path
 
 from physicsos.agents.prompts import (
@@ -22,6 +24,7 @@ from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
 from physicsos.config import load_config, runtime_paths
+from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 
 
 BANNER = "PhysicsOS\nPhysicsOS"
@@ -94,6 +97,195 @@ def _patch_deepagents_banner() -> None:
         return
 
 
+def _patch_deepagents_allow_blocking() -> None:
+    """Force DeepAgents' local LangGraph server to allow local sync I/O."""
+    try:
+        import deepagents_cli.server as cli_server
+    except ImportError:
+        return
+
+    original = cli_server._build_server_cmd
+    if getattr(original, "_physicsos_allow_blocking", False):
+        return
+
+    def build_server_cmd(*args: object, **kwargs: object) -> list[str]:
+        cmd = list(original(*args, **kwargs))
+        if "--allow-blocking" not in cmd:
+            cmd.append("--allow-blocking")
+        return cmd
+
+    build_server_cmd._physicsos_allow_blocking = True  # type: ignore[attr-defined]
+    cli_server._build_server_cmd = build_server_cmd
+
+
+def _patch_deepagents_physicsos_tools() -> None:
+    """Inject scoped PhysicsOS tools into the DeepAgents CLI server graph."""
+    try:
+        import deepagents_cli.server_manager as server_manager
+    except ImportError:
+        return
+
+    original = server_manager._scaffold_workspace
+    if getattr(original, "_physicsos_tools", False):
+        return
+
+    def scaffold_workspace(work_dir: Path) -> None:
+        original(work_dir)
+        server_graph = work_dir / "server_graph.py"
+        source = server_graph.read_text(encoding="utf-8")
+        old = (
+            "    from deepagents_cli.config import settings\n"
+            "    from deepagents_cli.tools import fetch_url, web_search\n\n"
+            "    tools: list[Any] = [fetch_url]\n"
+        )
+        new = (
+            "    from deepagents_cli.config import settings\n"
+            "    from deepagents_cli.tools import fetch_url, web_search\n\n"
+            "    try:\n"
+            "        from physicsos.tools.registry import MAIN_AGENT_TOOLS\n"
+            "        from physicsos.events import wrap_tools_for_events\n"
+            "    except Exception:\n"
+            "        MAIN_AGENT_TOOLS = []\n\n"
+            "        def wrap_tools_for_events(tools):\n"
+            "            return tools\n\n"
+            "    tools: list[Any] = [fetch_url, *wrap_tools_for_events(MAIN_AGENT_TOOLS)]\n"
+        )
+        if old in source and "MAIN_AGENT_TOOLS" not in source:
+            source = source.replace(old, new)
+
+        marker = "    async_subagents = load_async_subagents() or None\n\n"
+        injection = (
+            "    try:\n"
+            "        from physicsos.tools.registry import SUBAGENT_TOOL_GROUPS\n"
+            "        from physicsos.events import wrap_tools_for_events\n"
+            "    except Exception:\n"
+            "        SUBAGENT_TOOL_GROUPS = {}\n\n"
+            "        def wrap_tools_for_events(tools):\n"
+            "            return tools\n\n"
+            "    import deepagents_cli.agent as cli_agent\n"
+            "    original_load_subagents = cli_agent.list_subagents\n\n"
+            "    def load_scoped_subagents(*args, **kwargs):\n"
+            "        subagents = original_load_subagents(*args, **kwargs)\n"
+            "        for subagent in subagents:\n"
+            "            tools_for_agent = SUBAGENT_TOOL_GROUPS.get(subagent.get(\"name\"))\n"
+            "            if tools_for_agent is not None:\n"
+            "                subagent[\"tools\"] = wrap_tools_for_events(tools_for_agent)\n"
+            "        return subagents\n\n"
+            "    cli_agent.list_subagents = load_scoped_subagents\n\n"
+        )
+        if marker in source and "load_scoped_subagents" not in source:
+            source = source.replace(marker, marker + injection)
+
+        server_graph.write_text(source, encoding="utf-8")
+
+    scaffold_workspace._physicsos_tools = True  # type: ignore[attr-defined]
+    server_manager._scaffold_workspace = scaffold_workspace
+
+
+def _patch_deepagents_physicsos_tui_events() -> None:
+    """Render PhysicsOS custom stream events inside the DeepAgents Textual TUI."""
+    try:
+        import deepagents_cli.textual_adapter as textual_adapter
+    except ImportError:
+        return
+
+    original = textual_adapter.execute_task_textual
+    if getattr(original, "_physicsos_tui_events", False):
+        return
+
+    try:
+        source = inspect.getsource(original)
+    except (OSError, TypeError):
+        return
+
+    old_stream_mode = 'stream_mode=["messages", "updates"],'
+    new_stream_mode = 'stream_mode=["messages", "updates", "custom"],'
+    if old_stream_mode not in source:
+        return
+
+    custom_branch_marker = "                # Handle MESSAGES stream - for content and tool calls\n"
+    custom_branch = (
+        "                # Handle CUSTOM stream - PhysicsOS typed workflow events\n"
+        "                elif current_stream_mode == \"custom\":\n"
+        "                    try:\n"
+        "                        from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events\n"
+        "                        physicsos_events = collect_physicsos_events(data)\n"
+        "                        if physicsos_events:\n"
+        "                            renderer = PhysicsOSEventRenderer()\n"
+        "                            for rendered_event in renderer.render_many(physicsos_events):\n"
+        "                                await adapter._mount_message(AppMessage(rendered_event))\n"
+        "                            if adapter._set_spinner and not adapter._current_tool_messages:\n"
+        "                                await adapter._set_spinner(\"Thinking\")\n"
+        "                    except Exception:\n"
+        "                        logger.debug(\"Failed to render PhysicsOS custom event\", exc_info=True)\n"
+        "                    continue\n\n"
+    )
+    if custom_branch_marker not in source:
+        return
+
+    patched_source = source.replace(old_stream_mode, new_stream_mode, 1)
+    patched_source = patched_source.replace(custom_branch_marker, custom_branch + custom_branch_marker, 1)
+    namespace = textual_adapter.__dict__
+    exec(compile(textwrap.dedent(patched_source), "<physicsos_deepagents_tui_patch>", "exec"), namespace)
+    textual_adapter.execute_task_textual._physicsos_tui_events = True  # type: ignore[attr-defined]
+    textual_adapter.execute_task_textual._physicsos_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+
+
+def _patch_deepagents_physicsos_noninteractive_events() -> None:
+    """Render PhysicsOS custom stream events in DeepAgents non-interactive mode."""
+    try:
+        import deepagents_cli.non_interactive as non_interactive
+    except ImportError:
+        return
+
+    process_stream_chunk = non_interactive._process_stream_chunk
+    if not getattr(process_stream_chunk, "_physicsos_noninteractive_events", False):
+        original_process_stream_chunk = process_stream_chunk
+
+        def patched_process_stream_chunk(chunk, state, console, file_op_tracker):  # type: ignore[no-untyped-def]
+            if isinstance(chunk, tuple) and len(chunk) == 3:
+                namespace, stream_mode, data = chunk
+                if not namespace and stream_mode == "custom":
+                    try:
+                        from rich.text import Text
+                        from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events
+
+                        renderer = PhysicsOSEventRenderer()
+                        for rendered_event in renderer.render_many(collect_physicsos_events(data)):
+                            if state.spinner:
+                                state.spinner.stop()
+                            console.print(Text(rendered_event, style="dim"), highlight=False)
+                        if state.spinner:
+                            state.spinner.start()
+                    except Exception:
+                        non_interactive.logger.debug(
+                            "Failed to render PhysicsOS non-interactive custom event",
+                            exc_info=True,
+                        )
+                    return
+            return original_process_stream_chunk(chunk, state, console, file_op_tracker)
+
+        patched_process_stream_chunk._physicsos_noninteractive_events = True  # type: ignore[attr-defined]
+        non_interactive._process_stream_chunk = patched_process_stream_chunk
+
+    stream_agent = non_interactive._stream_agent
+    if getattr(stream_agent, "_physicsos_noninteractive_stream_modes", False):
+        return
+    try:
+        source = inspect.getsource(stream_agent)
+    except (OSError, TypeError):
+        return
+
+    old_stream_mode = 'stream_mode=["messages", "updates"],'
+    new_stream_mode = 'stream_mode=["messages", "updates", "custom"],'
+    if old_stream_mode not in source:
+        return
+    patched_source = source.replace(old_stream_mode, new_stream_mode, 1)
+    namespace = non_interactive.__dict__
+    exec(compile(textwrap.dedent(patched_source), "<physicsos_deepagents_noninteractive_patch>", "exec"), namespace)
+    non_interactive._stream_agent._physicsos_noninteractive_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+
+
 def _physicsos_agent_prompt() -> str:
     return (
         "# PhysicsOS\n\n"
@@ -142,6 +334,10 @@ def _deepagents_model_params_args(argv: list[str]) -> list[str]:
 def _prepare_deepagents_env() -> None:
     os.environ.setdefault("PYTHONUTF8", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    # DeepAgents CLI starts a local langgraph dev server. Its local filesystem
+    # and shell tools perform synchronous I/O, which LangGraph otherwise rejects
+    # as BlockingError when the agent writes or edits files.
+    os.environ.setdefault("LANGGRAPH_ALLOW_BLOCKING", "true")
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
@@ -161,6 +357,10 @@ def _launch_deepagents_cli(argv: list[str]) -> int:
         _ensure_deepagents_physicsos_config()
     _prepare_deepagents_env()
     _patch_deepagents_banner()
+    _patch_deepagents_allow_blocking()
+    _patch_deepagents_physicsos_tools()
+    _patch_deepagents_physicsos_tui_events()
+    _patch_deepagents_physicsos_noninteractive_events()
     try:
         from deepagents_cli import cli_main
     except ImportError as exc:
@@ -298,6 +498,16 @@ def _extract_agent_text(result: object) -> str:
     return str(result)
 
 
+def _render_physicsos_events(result: object, *, session_path: Path | None = None) -> str | None:
+    events = collect_physicsos_events(result)
+    if not events and session_path is not None:
+        events = read_physicsos_events(session_path)
+    if not events:
+        return None
+    renderer = PhysicsOSEventRenderer()
+    return "\n".join(renderer.render_many(events[-12:]))
+
+
 def _create_agent() -> object:
     model = create_openai_compatible_model()
     return create_physicsos_agent(model=model)
@@ -365,6 +575,9 @@ def _interactive(agent: object | None = None) -> int:
             messages.append({"role": "user", "content": raw})
             result = agent.invoke({"messages": messages})
             text = _extract_agent_text(result)
+            event_text = _render_physicsos_events(result, session_path=session_path)
+            if event_text:
+                print(event_text)
             print(text)
             messages.append({"role": "assistant", "content": text})
             _append_session_event(session_path, "assistant", {"content": text})

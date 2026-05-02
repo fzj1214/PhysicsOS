@@ -1826,6 +1826,33 @@ done: `prepare_taps_backend_case_bundle` emits auditable backend case bundles wi
 done: strong-form diffusion/time/reaction/curl token patterns compile into reviewed weak-form IR terms.
 done: Neumann/Robin/interface/custom boundary conditions compile into first-class boundary weak-term IR metadata.
 next: turn auditable backend case bundles into executable exports only after dependency checks, mesh export manifests, coefficient binding, boundary-tag binding, and explicit user approval are satisfied.
+next: normalize agent-facing paths across Windows, macOS, and Linux. Internally use `pathlib.Path`, but every path shown to agents, stored in prompts, emitted in tool results, or passed to DeepAgents filesystem/shell tools must use a single portable display form with forward slashes. Do not mix `\` and `/` in agent-visible paths. Keep OS-native paths only at the final local filesystem boundary.
+next: separate file path semantics from URI semantics. `ArtifactRef.uri` and geometry/source artifact fields must document whether the value is a workspace-relative portable path, a `file://` URI, or a remote URL. Prefer workspace-relative forward-slash paths for local artifacts so agents can reliably `ls`, read, edit, and reference files on Windows/macOS/Linux.
+next: add a path normalization helper used by all tools that return or consume local artifact paths. It should convert local `Path` objects to agent-facing workspace-relative POSIX-style paths when possible, preserve real URLs, and convert incoming agent paths back to local `Path` objects at the boundary.
+next: replace the current DeepAgents CLI all-tools inheritance workaround with scoped tool injection. The main PhysicsOS agent should expose only orchestration/catalog/problem-validation tools, while each subagent receives only its domain tools:
+  geometry-mesh-agent -> geometry import/repair/label/mesh/encoding/export/quality tools
+  taps-agent -> PhysicsProblem validation, knowledge lookup, TAPS formulation/build/validate/bridge/fallback/run/residual tools
+  solver-agent -> surrogate routing/inference, full-solver preparation/submission/run, hybrid solver tools
+  verification-agent -> residual, conservation, slice validation, uncertainty, OOD tools
+  postprocess-agent -> KPI, visualization, report tools
+  knowledge-agent -> local KB, arXiv, DeepSearch, ingest, case-memory tools
+next: make scoped tool ownership explicit in code, not only in prompts. Keep a single source of truth mapping subagent name -> allowed tool callables, test that every subagent tool exists in the registry, and test that no subagent accidentally inherits unrelated tools in the CLI runtime.
+next: reduce long `thinking` tails by narrowing tool choice and tightening delegation policy. The main agent should not delegate if it already has enough information to answer, and subagents should return a final structured report immediately after their owned tool sequence completes instead of exploring unrelated tools.
+next: upgrade case memory from a final archival step into a shared workflow memory layer. Keep the final `case-memory-agent` as the curator/indexer, but expose case memory to the main agent and all core subagents as a shared read/append store:
+  read/search: main-agent, knowledge-agent, geometry-mesh-agent, taps-agent, solver-agent, verification-agent, postprocess-agent
+  append_event: all core agents can append typed stage events, failed attempts, solver-routing reasons, geometry decisions, verification findings, user corrections, and fallback decisions
+  commit_final_case/update_index: only case-memory-agent, or main-agent after explicit workflow completion, should write the canonical searchable case record
+  architecture: introduce `CaseMemoryContext`, `CaseMemoryEvent`, and `CaseMemoryCommit` Pydantic models; store event log and canonical case index separately; keep event writes idempotent by `run_id`, `case_id`, `stage`, and `event_id`
+  workflow placement: search similar cases immediately after `build_physics_problem`, pass `CaseMemoryContext` through typed workflow state, allow every subagent input to receive relevant prior cases, and commit the final case after verification/postprocess
+  storage path: start with the existing JSONL implementation for compatibility, but define the interface so it can move to SQLite/FTS/vector indexes without changing agent contracts
+next: make DeepAgents CLI display PhysicsOS typed workflow events and tool returns with a stream style comparable to the existing CLI/TUI. Do not rely on the assistant final message to summarize structured results. Add a PhysicsOS event bus with a stable event schema and a renderer layer:
+  event schema: `PhysicsOSEvent(run_id, case_id, event, stage, status, summary, payload, artifacts, timestamp, display)`
+  event types: `workflow.started`, `agent.started`, `agent.output`, `tool.started`, `tool.output`, `validation.retry`, `artifact.created`, `case_memory.hit`, `case_memory.event`, `workflow.completed`, `workflow.failed`
+  producers: typed workflow, PhysicsOS tools, case-memory tools, and DeepAgents subagent wrappers emit events to the session JSONL log and, when running interactively, to a live sink
+  renderer: build one shared `PhysicsOSEventRenderer` used by legacy CLI, DeepAgents CLI patches, and future web UI; default view is compact stage lines, while `--verbose`, `/events`, or an expandable TUI panel shows full typed Pydantic JSON payloads
+  DeepAgents CLI integration: patch or wrap LangGraph streaming rather than only calling `invoke`; consume graph stream updates/tool messages/custom events, map them into `PhysicsOSEvent`, and render them using the same visual hierarchy, colors, status labels, and collapsed/expanded behavior as the existing DeepAgents CLI
+  UX target: users should see progress such as `[knowledge] retrieved 4 chunks`, `[geometry] mesh ready`, `[validate] retry 1/2`, `[taps] backend=taps:thermal_1d`, `[verification] accepted`, plus clickable/visible artifact paths and a final typed workflow summary
+  persistence: every displayed event must also be written to the session log so `/last-result`, `/events`, `/artifacts`, and debugging after a crash can reconstruct the full run
 ```
 
 PhysicsOS Cloud / foamvm scope:

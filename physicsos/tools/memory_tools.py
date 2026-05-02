@@ -4,10 +4,12 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import Field
 
 from physicsos.config import runtime_paths
+from physicsos.events import PhysicsOSEvent, emit_physicsos_event
 from physicsos.schemas.common import StrictBaseModel
 from physicsos.schemas.postprocess import PostprocessResult
 from physicsos.schemas.problem import PhysicsProblem
@@ -50,6 +52,51 @@ class SearchCaseMemoryOutput(StrictBaseModel):
     memory_uri: str
 
 
+class CaseMemoryContext(StrictBaseModel):
+    problem_id: str
+    hits: list[CaseMemoryHit] = Field(default_factory=list)
+    memory_uri: str
+    searched_records: int = 0
+
+
+class CaseMemoryEvent(StrictBaseModel):
+    event_id: str = Field(default_factory=lambda: f"case-memory-event:{uuid4().hex}")
+    run_id: str
+    case_id: str
+    stage: str
+    event: str
+    summary: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AppendCaseMemoryEventInput(StrictBaseModel):
+    event: CaseMemoryEvent
+    events_uri: str | None = None
+
+
+class AppendCaseMemoryEventOutput(StrictBaseModel):
+    event_id: str
+    events_uri: str
+    appended: bool = True
+
+
+class ReadCaseMemoryEventsInput(StrictBaseModel):
+    case_id: str | None = None
+    run_id: str | None = None
+    events_uri: str | None = None
+
+
+class ReadCaseMemoryEventsOutput(StrictBaseModel):
+    events: list[CaseMemoryEvent] = Field(default_factory=list)
+    events_uri: str
+
+
+class CaseMemoryCommit(StrictBaseModel):
+    case_id: str
+    stored: StoreCaseResultOutput
+    context: CaseMemoryContext | None = None
+
+
 def search_case_memory(input: SearchCaseMemoryInput) -> SearchCaseMemoryOutput:
     """Retrieve similar historical cases by physics, geometry, BCs, materials, and solver metadata."""
     path = _memory_path(input.memory_uri)
@@ -84,6 +131,17 @@ def search_case_memory(input: SearchCaseMemoryInput) -> SearchCaseMemoryOutput:
 
     hits.sort(key=lambda item: item.score, reverse=True)
     return SearchCaseMemoryOutput(cases=hits[: max(input.top_k, 0)], searched_records=searched, memory_uri=str(path))
+
+
+def build_case_memory_context(input: SearchCaseMemoryInput) -> CaseMemoryContext:
+    """Build the shared memory context that can be passed through typed workflow state."""
+    output = search_case_memory(input)
+    return CaseMemoryContext(
+        problem_id=input.problem.id,
+        hits=output.cases,
+        memory_uri=output.memory_uri,
+        searched_records=output.searched_records,
+    )
 
 
 class StoreCaseResultInput(StrictBaseModel):
@@ -129,10 +187,58 @@ def store_case_result(input: StoreCaseResultInput) -> StoreCaseResultOutput:
     return StoreCaseResultOutput(case_id=input.problem.id, indexed_features=indexed_features, memory_uri=str(path))
 
 
+def append_case_memory_event(input: AppendCaseMemoryEventInput) -> AppendCaseMemoryEventOutput:
+    """Append a typed workflow event to the shared case-memory event log."""
+    path = _events_path(input.events_uri)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_raw_event_records(path)
+    if not any(item.get("event_id") == input.event.event_id for item in existing):
+        existing.append(input.event.model_dump(mode="json"))
+        path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False, sort_keys=True) for item in existing) + "\n",
+            encoding="utf-8",
+        )
+    emit_physicsos_event(
+        PhysicsOSEvent(
+            run_id=input.event.run_id,
+            case_id=input.event.case_id,
+            event="case_memory.event",
+            stage=input.event.stage,
+            status="complete",
+            summary=input.event.summary,
+            payload=input.event.payload,
+        )
+    )
+    return AppendCaseMemoryEventOutput(event_id=input.event.event_id, events_uri=str(path))
+
+
+def read_case_memory_events(input: ReadCaseMemoryEventsInput) -> ReadCaseMemoryEventsOutput:
+    """Read typed case-memory stage events for a run or case."""
+    path = _events_path(input.events_uri)
+    events: list[CaseMemoryEvent] = []
+    for item in _read_raw_event_records(path):
+        try:
+            event = CaseMemoryEvent.model_validate(item)
+        except ValueError:
+            continue
+        if input.case_id is not None and event.case_id != input.case_id:
+            continue
+        if input.run_id is not None and event.run_id != input.run_id:
+            continue
+        events.append(event)
+    return ReadCaseMemoryEventsOutput(events=events, events_uri=str(path))
+
+
 def _memory_path(uri: str | None = None) -> Path:
     if uri:
         return Path(uri).expanduser()
     return runtime_paths().case_memory
+
+
+def _events_path(uri: str | None = None) -> Path:
+    if uri:
+        return Path(uri).expanduser()
+    return runtime_paths().case_memory.with_name("case_memory_events.jsonl")
 
 
 def _read_raw_records(path: Path) -> list[dict[str, Any]]:
@@ -149,6 +255,10 @@ def _read_raw_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             records.append(payload)
     return records
+
+
+def _read_raw_event_records(path: Path) -> list[dict[str, Any]]:
+    return _read_raw_records(path)
 
 
 def _read_records(path: Path) -> list[CaseMemoryRecord]:
@@ -253,6 +363,8 @@ def _passes_filters(record: CaseMemoryRecord, filters: dict[str, str | float | i
 for _tool, _input, _output in [
     (search_case_memory, SearchCaseMemoryInput, SearchCaseMemoryOutput),
     (store_case_result, StoreCaseResultInput, StoreCaseResultOutput),
+    (append_case_memory_event, AppendCaseMemoryEventInput, AppendCaseMemoryEventOutput),
+    (read_case_memory_events, ReadCaseMemoryEventsInput, ReadCaseMemoryEventsOutput),
 ]:
     _tool.input_model = _input
     _tool.output_model = _output

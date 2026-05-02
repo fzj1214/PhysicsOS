@@ -2,9 +2,24 @@ import json
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
-from physicsos.cli import BANNER, _ensure_deepagents_physicsos_config, _launch_deepagents_cli, _interactive, _physicsos_banner, main as cli_main
+from physicsos.cli import (
+    BANNER,
+    _ensure_deepagents_physicsos_config,
+    _interactive,
+    _launch_deepagents_cli,
+    _patch_deepagents_allow_blocking,
+    _patch_deepagents_physicsos_tools,
+    _patch_deepagents_physicsos_noninteractive_events,
+    _patch_deepagents_physicsos_tui_events,
+    _physicsos_banner,
+    main as cli_main,
+)
 from physicsos.config import load_config, physicsos_home, runtime_paths
+from physicsos.events import PhysicsOSEvent, PhysicsOSEventRenderer, read_physicsos_events
+from physicsos.paths import from_agent_path, to_agent_path
+from physicsos.schemas.agents import TAPSAgentOutput
 from physicsos.schemas.boundary import InitialConditionSpec
 from physicsos.schemas.common import ComputeBudget, Provenance
 from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
@@ -15,7 +30,8 @@ from physicsos.schemas.operators import FieldSpec, OperatorSpec
 from physicsos.schemas.operators import PhysicsSpec
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverPolicy
-from physicsos.tools.registry import TOOL_REGISTRY
+from physicsos.tools.registry import MAIN_AGENT_TOOLS, SUBAGENT_TOOL_GROUPS, TOOL_REGISTRY
+from physicsos.tools.workflow_tools import RunTypedPhysicsOSWorkflowInput, run_typed_physicsos_workflow
 from physicsos.tools.solver_tools import (
     EstimateSolverSupportInput,
     PrepareFullSolverCaseInput,
@@ -63,7 +79,17 @@ from physicsos.agents.runtime import DeepAgentsRuntimeConfig, build_runtime_kwar
 from physicsos.backends.knowledge_base import search_knowledge, upsert_document
 from physicsos.schemas.knowledge import KnowledgeSource
 from physicsos.tools.knowledge_tools import BuildKnowledgeContextInput, build_knowledge_context
-from physicsos.tools.memory_tools import SearchCaseMemoryInput, StoreCaseResultInput, search_case_memory, store_case_result
+from physicsos.tools.memory_tools import (
+    AppendCaseMemoryEventInput,
+    CaseMemoryEvent,
+    ReadCaseMemoryEventsInput,
+    SearchCaseMemoryInput,
+    StoreCaseResultInput,
+    append_case_memory_event,
+    read_case_memory_events,
+    search_case_memory,
+    store_case_result,
+)
 from physicsos.tools.catalog_tools import (
     ListOperatorTemplatesInput,
     ListSolverBackendsInput,
@@ -161,9 +187,93 @@ def test_tool_registry_has_core_tools() -> None:
     assert "run_full_solver" in TOOL_REGISTRY
     assert "list_operator_templates" in TOOL_REGISTRY
     assert "recommend_runtime_stack" in TOOL_REGISTRY
+    assert "append_case_memory_event" in TOOL_REGISTRY
+    assert "read_case_memory_events" in TOOL_REGISTRY
     assert TOOL_REGISTRY["submit_full_solver_job"].requires_approval is True
     assert TOOL_REGISTRY["run_full_solver"].requires_approval is True
     assert TOOL_REGISTRY["submit_mesh_conversion_job"].requires_approval is True
+
+
+def test_subagent_tool_groups_are_scoped_and_registered() -> None:
+    main_tool_names = {tool.__name__ for tool in MAIN_AGENT_TOOLS}
+    assert "build_physics_problem" in main_tool_names
+    assert "run_typed_physicsos_workflow" in main_tool_names
+    assert "run_taps_backend" not in main_tool_names
+    for agent_name, tools in SUBAGENT_TOOL_GROUPS.items():
+        assert tools, agent_name
+        tool_names = {tool.__name__ for tool in tools}
+        assert main_tool_names <= tool_names
+        assert {
+            "search_knowledge_base",
+            "build_knowledge_context",
+            "search_case_memory",
+            "append_case_memory_event",
+            "read_case_memory_events",
+        } <= tool_names
+        for tool in tools:
+            assert tool.__name__ in TOOL_REGISTRY
+    assert "run_taps_backend" in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["taps-agent"]}
+    assert "run_taps_backend" not in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["postprocess-agent"]}
+    assert "generate_mesh" in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["geometry-mesh-agent"]}
+    assert "run_full_solver" in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["solver-agent"]}
+    assert "route_solver_backend" in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["solver-agent"]}
+    assert "route_solver_backend" not in {tool.__name__ for tool in SUBAGENT_TOOL_GROUPS["taps-agent"]}
+
+
+def test_agent_paths_are_forward_slash_and_round_trip(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    native = workspace / "scratch" / "case-1" / "result.json"
+    agent_path = to_agent_path(native, workspace=workspace)
+    assert agent_path == "scratch/case-1/result.json"
+    assert "\\" not in agent_path
+    assert from_agent_path(agent_path, workspace=workspace) == native
+    assert to_agent_path("https://example.com/a\\b", workspace=workspace) == "https://example.com/a\\b"
+
+
+def test_deepagents_cli_server_graph_uses_scoped_physicsos_tools(tmp_path) -> None:
+    pytest.importorskip("deepagents_cli")
+    _patch_deepagents_allow_blocking()
+    _patch_deepagents_physicsos_tools()
+
+    import deepagents_cli.server as cli_server
+    import deepagents_cli.server_manager as server_manager
+
+    server_manager._scaffold_workspace(tmp_path)
+    command = cli_server._build_server_cmd(tmp_path / "langgraph.json", host="127.0.0.1", port=2024)
+    source = (tmp_path / "server_graph.py").read_text(encoding="utf-8")
+    assert "--allow-blocking" in command
+    assert "MAIN_AGENT_TOOLS" in source
+    assert "SUBAGENT_TOOL_GROUPS" in source
+    assert "load_scoped_subagents" in source
+    assert "PHYSICSOS_TOOLS" not in source
+
+
+def test_deepagents_tui_stream_renders_physicsos_custom_events() -> None:
+    pytest.importorskip("deepagents_cli")
+    import deepagents_cli.textual_adapter as textual_adapter
+
+    _patch_deepagents_physicsos_tui_events()
+    assert getattr(textual_adapter.execute_task_textual, "_physicsos_tui_events") is True
+    assert getattr(textual_adapter.execute_task_textual, "_physicsos_stream_modes") == ("messages", "updates", "custom")
+    constants = set(textual_adapter.execute_task_textual.__code__.co_consts)
+    names = set(textual_adapter.execute_task_textual.__code__.co_names)
+    assert "custom" in constants
+    assert "PhysicsOSEventRenderer" in names
+    assert "collect_physicsos_events" in names
+    assert "AppMessage" in textual_adapter.execute_task_textual.__globals__
+
+
+def test_deepagents_noninteractive_stream_renders_physicsos_custom_events() -> None:
+    pytest.importorskip("deepagents_cli")
+    import deepagents_cli.non_interactive as non_interactive
+
+    _patch_deepagents_physicsos_noninteractive_events()
+    assert getattr(non_interactive._stream_agent, "_physicsos_noninteractive_stream_modes") == (
+        "messages",
+        "updates",
+        "custom",
+    )
+    assert getattr(non_interactive._process_stream_chunk, "_physicsos_noninteractive_events") is True
 
 
 def test_cli_without_args_starts_interactive_welcome(capsys) -> None:
@@ -248,13 +358,26 @@ def test_interactive_cli_routes_natural_language_to_agent(capsys, monkeypatch, t
 
         def invoke(self, payload):
             self.calls.append(payload)
-            return {"messages": [{"role": "assistant", "content": "agent response"}]}
+            return {
+                "messages": [{"role": "assistant", "content": "agent response"}],
+                "physicsos_events": [
+                    {
+                        "run_id": "run:test",
+                        "case_id": "problem:test",
+                        "event": "agent.output",
+                        "stage": "taps",
+                        "status": "complete",
+                        "summary": "backend=taps:thermal_1d",
+                    }
+                ],
+            }
 
     fake_agent = FakeAgent()
     monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
     with patch("builtins.input", side_effect=["solve heat equation on a rod", "/exit"]):
         assert _interactive(agent=fake_agent) == 0
     output = capsys.readouterr().out
+    assert "[taps] backend=taps:thermal_1d" in output
     assert "agent response" in output
     assert fake_agent.calls[0]["messages"][0]["content"] == "solve heat equation on a rod"
     assert (tmp_path / "physicsos-home" / "history.jsonl").exists()
@@ -446,6 +569,36 @@ def test_case_memory_stores_and_retrieves_similar_cases(tmp_path) -> None:
     assert hits.cases[0].verification_status == result.verification.status
 
 
+def test_case_memory_events_are_shared_append_only_records(tmp_path) -> None:
+    events_path = tmp_path / "case_memory_events.jsonl"
+    event = CaseMemoryEvent(
+        run_id="run:test",
+        case_id="problem:test",
+        stage="geometry",
+        event="agent_output",
+        summary="mesh ready",
+        payload={"mesh_ready": True},
+    )
+    appended = append_case_memory_event(AppendCaseMemoryEventInput(event=event, events_uri=str(events_path)))
+    append_case_memory_event(AppendCaseMemoryEventInput(event=event, events_uri=str(events_path)))
+    read = read_case_memory_events(ReadCaseMemoryEventsInput(case_id="problem:test", events_uri=str(events_path)))
+    assert appended.appended
+    assert len(read.events) == 1
+    assert read.events[0].payload["mesh_ready"] is True
+
+
+def test_physicsos_event_renderer_outputs_compact_stage_lines() -> None:
+    event = PhysicsOSEvent(
+        run_id="run:test",
+        case_id="problem:test",
+        event="agent.output",
+        stage="taps",
+        status="complete",
+        summary="backend=taps:thermal_1d",
+    )
+    assert PhysicsOSEventRenderer().render(event) == "[taps] backend=taps:thermal_1d"
+
+
 def test_taps_thermal_workflow_writes_artifacts() -> None:
     result = run_taps_thermal_workflow(rank=8, use_knowledge=False)
     assert result.result.backend == "taps:thermal_1d"
@@ -460,9 +613,19 @@ def test_taps_thermal_workflow_writes_artifacts() -> None:
 
 def test_universal_workflow_runs_taps_first_loop() -> None:
     result = run_physicsos_workflow(use_knowledge=False, taps_rank=8)
+    assert result.run_id.startswith("workflow:")
+    assert result.case_memory_context is not None
     assert result.solver_result.backend == "taps:thermal_1d"
+    assert result.geometry is not None
     assert result.taps_problem is not None
     assert result.taps_residual is not None
+    assert result.taps is not None
+    assert result.taps.handoff.agent_name == "taps-agent"
+    assert result.taps.result == result.solver_result
+    assert result.solver.handoff.agent_name == "taps-agent"
+    assert result.verification_agent.report == result.verification
+    assert result.postprocess_agent.result == result.postprocess
+    assert result.case_memory.stored == result.case_store
     assert result.verification.status == "accepted"
     assert result.verification.recommended_next_action == "accept"
     assert result.postprocess.report is not None
@@ -473,7 +636,85 @@ def test_universal_workflow_runs_taps_first_loop() -> None:
     assert "## Verification Appendix" in report_text
     assert "## Artifact Manifest" in report_text
     assert result.verification.uncertainty
+    assert [step.name for step in result.trace[:3]] == ["problem", "geometry-mesh-agent", "validate_physics_problem"]
     assert result.trace[-1].name == "case-memory"
+    assert result.state.geometry == result.geometry
+    assert result.state.taps == result.taps
+    assert result.state.solver == result.solver
+    event_names = [event.event for event in result.events]
+    assert event_names[0] == "workflow.started"
+    assert "case_memory.hit" in event_names
+    assert "workflow.completed" in event_names
+    rendered = PhysicsOSEventRenderer().render_many(result.events)
+    assert any(line.startswith("[taps]") for line in rendered)
+    event_log_name = "events-" + "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in result.run_id) + ".jsonl"
+    event_log = read_physicsos_events(runtime_paths().sessions / event_log_name)
+    assert any(event.event == "workflow.completed" for event in event_log)
+
+
+def test_core_workflow_agent_outputs_are_strict_pydantic_contracts() -> None:
+    result = run_physicsos_workflow(use_knowledge=False, taps_rank=8)
+    payload = result.taps.model_dump(mode="json")
+    assert TAPSAgentOutput.model_validate(payload).handoff.agent_name == "taps-agent"
+    with pytest.raises(ValidationError):
+        TAPSAgentOutput.model_validate({"support": payload["support"]})
+
+
+def test_universal_workflow_orders_knowledge_before_geometry_and_taps() -> None:
+    result = run_physicsos_workflow(use_knowledge=True, arxiv_max_results=0, taps_rank=8)
+    step_names = [step.name for step in result.trace]
+    assert step_names.index("knowledge-agent") < step_names.index("geometry-mesh-agent")
+    assert step_names.index("geometry-mesh-agent") < step_names.index("validate_physics_problem")
+    assert step_names.index("validate_physics_problem") < step_names.index("taps-agent.support")
+    assert result.knowledge is not None
+    assert result.geometry is not None
+    assert result.knowledge.handoff.recommended_next_agent == "geometry-mesh-agent"
+    assert result.geometry.handoff.recommended_next_agent == "taps-agent"
+
+
+def test_universal_workflow_returns_typed_retry_context_on_validation_failure() -> None:
+    problem = _minimal_fluid_problem()
+    result = run_physicsos_workflow(problem=problem, use_knowledge=False, max_validation_attempts=2)
+    assert result.solver_result is None
+    assert result.taps is None
+    assert result.validation_attempts
+    assert len(result.validation_attempts) == 2
+    assert result.state.validation_attempts == result.validation_attempts
+    assert result.trace[-1].status == "retry_exhausted"
+    assert "boundary condition" in " ".join(result.validation_attempts[-1].errors).lower()
+    assert result.validation_attempts[-1].input_context["geometry_available"] is True
+
+
+def test_core_workflow_retries_typed_subagent_failures(monkeypatch) -> None:
+    def broken_taps(_input):
+        raise ValueError("typed taps output failed validation")
+
+    monkeypatch.setattr("physicsos.workflows.universal._run_taps_agent", broken_taps)
+    result = run_physicsos_workflow(use_knowledge=False, max_validation_attempts=2)
+    assert result.solver_result is None
+    assert result.taps is None
+    assert result.trace[-1].name == "taps-agent"
+    assert result.trace[-1].status == "retry_exhausted"
+    assert [attempt.agent_name for attempt in result.validation_attempts] == ["taps-agent", "taps-agent"]
+    assert "typed taps output failed validation" in result.validation_attempts[-1].errors[0]
+    assert "agent_input" in result.validation_attempts[-1].input_context
+
+
+def test_natural_language_entry_runs_typed_workflow_for_1d_heat_conduction() -> None:
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="帮我模拟一维稳定热传导",
+            use_knowledge=False,
+            max_validation_attempts=2,
+        )
+    )
+    assert output.build.problem is not None
+    assert output.initial_validation is not None
+    assert output.workflow is not None
+    assert output.workflow.problem.domain == "thermal"
+    assert output.workflow.problem.geometry.dimension == 1
+    assert output.workflow.validation_attempts == []
+    assert output.workflow.solver_result is not None
 
 
 def test_geometry_mesh_tools_report_real_backend_availability() -> None:
