@@ -43,11 +43,13 @@ from physicsos.schemas.verification import VerificationReport
 from physicsos.schemas.operators import PhysicsSpec
 from physicsos.tools.geometry_tools import (
     CreateBoundaryLabelingArtifactInput,
+    CreateGeometryLabelerViewerInput,
     GenerateGeometryEncodingInput,
     GenerateMeshInput,
     GeometryMeshPlanInput,
     LabelRegionsInput,
     create_boundary_labeling_artifact,
+    create_geometry_labeler_viewer,
     generate_geometry_encoding,
     generate_mesh,
     label_regions,
@@ -84,20 +86,27 @@ from physicsos.tools.taps_tools import (
     EstimateTAPSResidualInput,
     EstimateTAPSSupportInput,
     FormulateTAPSEquationInput,
+    NumericalSolvePlanInput,
     RunTAPSBackendInput,
     ValidateTAPSIRInput,
+    ValidateNumericalSolvePlanInput,
     build_taps_problem,
     estimate_taps_residual,
     estimate_taps_support,
     formulate_taps_equation,
     formulate_taps_equation_structured,
+    plan_numerical_solve,
+    plan_numerical_solve_structured,
     run_taps_backend,
+    validate_numerical_solve_plan,
     validate_taps_ir,
 )
 from physicsos.tools.verification_tools import (
+    CheckBoundaryConditionApplicationInput,
     CheckConservationLawsInput,
     EstimateUncertaintyInput,
     ValidateSelectedSlicesInput,
+    check_boundary_condition_application,
     check_conservation_laws,
     estimate_uncertainty,
     validate_selected_slices,
@@ -211,10 +220,11 @@ def _verify_taps_result(problem: PhysicsProblem, taps_problem: TAPSProblem, resu
     ).report
     conservation = check_conservation_laws(CheckConservationLawsInput(problem=problem, result=result))
     slices = validate_selected_slices(ValidateSelectedSlicesInput(problem=problem, result=result))
+    boundary_application = check_boundary_condition_application(CheckBoundaryConditionApplicationInput(problem=problem, result=result))
     uncertainty = estimate_uncertainty(EstimateUncertaintyInput(problem=problem, result=result, method="residual_proxy"))
     conservation_skipped_only = bool(conservation.skipped_quantities) and not conservation.conservation_errors
     conservation_acceptable = conservation.passes or conservation_skipped_only
-    verification_passed = residual.converged and conservation_acceptable and slices.passes
+    verification_passed = residual.converged and conservation_acceptable and slices.passes and boundary_application.passes
     status = "accepted" if residual.converged else "needs_full_solver"
     warnings: list[str] = []
     if conservation_skipped_only:
@@ -229,6 +239,12 @@ def _verify_taps_result(problem: PhysicsProblem, taps_problem: TAPSProblem, resu
     if residual.converged and conservation_acceptable and not slices.passes:
         status = "accepted_with_warnings"
         warnings.append("Selected-slice validation did not fully pass.")
+    if residual.converged and not boundary_application.passes:
+        status = "needs_full_solver"
+        warnings.append(
+            "Boundary-condition application check failed: "
+            f"errors={boundary_application.errors}; missing={boundary_application.missing_boundaries}"
+        )
     action = "accept" if verification_passed else "run_full_solver"
     explanation = "TAPS result accepted by residual, conservation, and selected-slice checks."
     if warnings:
@@ -241,6 +257,8 @@ def _verify_taps_result(problem: PhysicsProblem, taps_problem: TAPSProblem, resu
             failed.append("conservation check failed")
         if not slices.passes:
             failed.append("selected-slice validation failed")
+        if not boundary_application.passes:
+            failed.append("boundary-condition application check failed")
         explanation = "TAPS result requires follow-up: " + "; ".join(failed) + "."
     verification = VerificationReport(
         problem_id=problem.id,
@@ -362,6 +380,7 @@ def _run_geometry_mesh_agent_with_planner(
     problem = input.problem
     geometry = problem.geometry
     artifacts = []
+    warnings = list(plan.warnings)
     if not geometry.boundaries or not geometry.regions:
         labeled = label_regions(LabelRegionsInput(geometry=geometry, physics_domain=problem.domain)).geometry
         geometry = labeled
@@ -369,38 +388,55 @@ def _run_geometry_mesh_agent_with_planner(
     mesh = problem.mesh
     quality = mesh.quality if mesh is not None else None
     if mesh is None and geometry.dimension > 1:
-        mesh = generate_mesh(
-            GenerateMeshInput(
-                geometry=geometry,
-                physics=PhysicsSpec(domains=[problem.domain]),
-                mesh_policy=plan.mesh_policy,
-                target_backends=plan.target_backends or input.target_backends,
-            )
-        ).mesh
-        quality = mesh.quality
+        try:
+            mesh = generate_mesh(
+                GenerateMeshInput(
+                    geometry=geometry,
+                    physics=PhysicsSpec(domains=[problem.domain]),
+                    mesh_policy=plan.mesh_policy,
+                    target_backends=plan.target_backends or input.target_backends,
+                )
+            ).mesh
+            quality = mesh.quality
+        except Exception as exc:
+            if not plan.require_boundary_confirmation:
+                raise
+            warnings.append(f"Mesh generation was deferred until boundary/source confirmation: {exc}")
 
     encodings = list(geometry.encodings)
     requested = plan.requested_encodings or input.requested_encodings
     if requested:
-        generated = generate_geometry_encoding(
-            GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=requested)
-        )
-        encodings.extend(generated.encodings)
-        artifacts.extend(generated.artifacts)
-        geometry = geometry.model_copy(update={"encodings": encodings})
+        try:
+            generated = generate_geometry_encoding(
+                GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=requested)
+            )
+            encodings.extend(generated.encodings)
+            artifacts.extend(generated.artifacts)
+            geometry = geometry.model_copy(update={"encodings": encodings})
+        except Exception as exc:
+            if not plan.require_boundary_confirmation:
+                raise
+            warnings.append(f"Geometry encoding was deferred until boundary/source confirmation: {exc}")
 
     if plan.require_boundary_confirmation:
         labeling = create_boundary_labeling_artifact(CreateBoundaryLabelingArtifactInput(geometry=geometry))
+        viewer = create_geometry_labeler_viewer(
+            CreateGeometryLabelerViewerInput(
+                labeling_artifact=labeling.artifact,
+                title=f"PhysicsOS Boundary Labels: {geometry.id}",
+            )
+        )
         artifacts.append(labeling.artifact)
+        artifacts.append(viewer.viewer)
         return GeometryMeshAgentOutput(
             handoff=_handoff(
                 agent_name="geometry-mesh-agent",
                 status="needs_user_input",
                 problem_id=problem.id,
-                summary="Geometry boundary labels require confirmation before solver execution.",
+                summary="Geometry boundary labels require confirmation before solver execution. Open the geometry_labeler_viewer artifact, confirm physical groups, then apply the updated boundary_labeling_artifact.",
                 recommended_next_agent="main-agent",
                 recommended_next_action="confirm_boundary_labels",
-            ).model_copy(update={"artifacts": artifacts, "warnings": [*plan.warnings, *labeling.warnings]}),
+            ).model_copy(update={"artifacts": artifacts, "warnings": [*warnings, *labeling.warnings, *viewer.warnings]}),
             geometry=geometry,
             mesh=mesh,
             encodings=encodings,
@@ -415,7 +451,7 @@ def _run_geometry_mesh_agent_with_planner(
             summary=f"geometry={geometry.id}; mesh={'ready' if mesh is not None else 'not_required_or_not_generated'}; encodings={len(encodings)}",
             recommended_next_agent="taps-agent",
             recommended_next_action="validate_and_compile_taps_problem",
-        ).model_copy(update={"artifacts": artifacts, "warnings": plan.warnings}),
+        ).model_copy(update={"artifacts": artifacts, "warnings": warnings}),
         geometry=geometry,
         mesh=mesh,
         encodings=encodings,
@@ -519,6 +555,25 @@ def _formulate_taps_with_llm_first_fallback(
     return formulate_taps_equation(input).plan
 
 
+def _plan_numerical_solve_with_llm_first_fallback(
+    input: NumericalSolvePlanInput,
+    *,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
+):
+    if (
+        structured_client is not None
+        and core_agent_config is not None
+        and core_agent_config.mode in {"llm", "hybrid"}
+    ):
+        return plan_numerical_solve_structured(
+            input,
+            client=structured_client,
+            config=core_agent_config,
+        )
+    return plan_numerical_solve(input)
+
+
 def _run_taps_agent(
     input: TAPSAgentInput,
     *,
@@ -579,11 +634,49 @@ def _run_taps_agent(
                 contract_review=contract_review,
             )
     ir_validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=taps_problem))
+    numerical_plan = _plan_numerical_solve_with_llm_first_fallback(
+        NumericalSolvePlanInput(
+            problem=input.problem,
+            taps_problem=taps_problem,
+            problem_contract=input.problem_contract,
+            compilation_plan=compilation_plan,
+            knowledge_context=input.knowledge_context,
+            budget=ComputeBudget(max_wall_time_seconds=input.max_wall_time_seconds),
+        ),
+        structured_client=structured_client,
+        core_agent_config=core_agent_config,
+    )
+    numerical_plan_validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(
+            problem=input.problem,
+            taps_problem=taps_problem,
+            plan=numerical_plan,
+            problem_contract=input.problem_contract,
+        )
+    )
+    if not numerical_plan_validation.valid and not ir_validation.fallback_recommended:
+        return TAPSAgentOutput(
+            handoff=_handoff(
+                agent_name="taps-agent",
+                status="failed",
+                problem_id=input.problem.id,
+                summary="Numerical solve plan validation failed before execution: "
+                + "; ".join(numerical_plan_validation.errors),
+                recommended_next_agent="taps-agent",
+                recommended_next_action="retry_numerical_solve_planning",
+            ),
+            support=support,
+            compilation_plan=compilation_plan,
+            taps_problem=taps_problem,
+            numerical_plan=numerical_plan,
+            contract_review=contract_review,
+        )
     solver_result = run_taps_backend(
         RunTAPSBackendInput(
             problem=input.problem,
             taps_problem=taps_problem,
             budget=ComputeBudget(max_wall_time_seconds=input.max_wall_time_seconds),
+            numerical_plan=numerical_plan,
         )
     ).result
     residual = estimate_taps_residual(
@@ -601,6 +694,7 @@ def _run_taps_agent(
         support=support,
         compilation_plan=compilation_plan,
         taps_problem=taps_problem,
+        numerical_plan=numerical_plan,
         contract_review=contract_review,
         result=solver_result,
         residual=residual,

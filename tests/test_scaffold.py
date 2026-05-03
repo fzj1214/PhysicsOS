@@ -25,11 +25,11 @@ from physicsos.agents.prompts import PHYSICSOS_SYSTEM_PROMPT
 from physicsos.agents.structured import CoreAgentLLMConfig, call_structured_agent, create_openai_structured_client, structured_agent_event_context
 from physicsos.backends import geometry_mesh as geometry_mesh_backend
 from physicsos.paths import from_agent_path, to_agent_path
-from physicsos.schemas.agents import TAPSAgentOutput
+from physicsos.schemas.agents import GeometryMeshAgentInput, TAPSAgentOutput
 from physicsos.schemas.boundary import BoundaryConditionSpec, InitialConditionSpec
 from physicsos.schemas.common import ArtifactRef, ComputeBudget, Provenance, StrictBaseModel
 from physicsos.schemas.contracts import build_physics_problem_contract, review_problem_to_taps_contract
-from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
+from physicsos.schemas.geometry import BoundaryRegionSpec, GeometryEntity, GeometrySource, GeometrySpec
 from physicsos.schemas.geometry import GeometryEncoding
 from physicsos.schemas.materials import MaterialProperty, MaterialSpec
 from physicsos.schemas.mesh import MeshPolicy
@@ -45,7 +45,7 @@ from physicsos.tools.workflow_tools import (
     build_physics_problem_structured,
     run_typed_physicsos_workflow,
 )
-from physicsos.tools.problem_tools import BuildPhysicsProblemInput, build_physics_problem
+from physicsos.tools.problem_tools import CanonicalPhysicsProblemInput, build_physics_problem, canonicalize_physics_problem, BuildPhysicsProblemInput
 from physicsos.tools.postprocess_tools import (
     GenerateVisualizationsInput,
     PostprocessPlanInput,
@@ -90,6 +90,7 @@ from physicsos.tools.taps_tools import (
     plan_backend_preparation,
     plan_backend_preparation_structured,
     plan_numerical_solve,
+    plan_numerical_solve_structured,
     plan_taps_adaptive_fallback,
     prepare_taps_backend_case_bundle,
     run_taps_backend,
@@ -97,11 +98,13 @@ from physicsos.tools.taps_tools import (
     validate_taps_ir,
 )
 from physicsos.tools.verification_tools import (
+    CheckBoundaryConditionApplicationInput,
     CheckConservationLawsInput,
     ComputePhysicsResidualsInput,
     DetectOODCaseInput,
     EstimateUncertaintyInput,
     ValidateSelectedSlicesInput,
+    check_boundary_condition_application,
     check_conservation_laws,
     compute_physics_residuals,
     detect_ood_case,
@@ -163,7 +166,12 @@ from physicsos.tools.geometry_tools import (
 )
 from physicsos.workflows import run_physicsos_workflow, run_taps_thermal_workflow
 from physicsos.workflows.taps_thermal import build_default_thermal_problem
+from physicsos.workflows.universal import _run_geometry_mesh_agent
 from physicsos.backends.taps_generic import (
+    _assemble_tetra_elasticity_stiffness,
+    _assemble_tetra_nedelec_curl_curl,
+    _assemble_tetra_raviart_thomas_div,
+    _assemble_tetra_stiffness,
     _assemble_triangle_elasticity_stiffness,
     _assemble_triangle_nedelec_curl_curl,
     _assemble_triangle_stiffness,
@@ -1032,6 +1040,49 @@ def test_structured_agent_writes_attempt_events_and_artifacts(monkeypatch, tmp_p
     assert any(event.stage == "test-structured-agent" for event in logged_events)
 
 
+def test_call_structured_agent_semantic_validator_retries_in_single_attempt_stream(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(workspace))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    events = []
+    calls = []
+
+    class Output(StrictBaseModel):
+        value: int
+
+    class Input(StrictBaseModel):
+        prompt: str
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {"value": -1}
+        return {"value": 3}
+
+    with structured_agent_event_context(run_id="workflow:semantic", case_id="problem:test", events=events):
+        result = call_structured_agent(
+            agent_name="semantic-agent",
+            input_model=Input(prompt="return a positive value"),
+            output_model=Output,
+            system_prompt="Return structured output.",
+            client=fake_client,
+            config=CoreAgentLLMConfig(max_structured_attempts=3),
+            semantic_validator=lambda output: ["value must be positive"] if output.value <= 0 else [],
+            semantic_feedback_builder=lambda output, errors: [
+                json.dumps({"invalid_output": output.model_dump(mode="json"), "errors": errors})
+            ],
+        )
+
+    assert result.output is not None
+    assert result.output.value == 3
+    assert [event.payload["attempt"] for event in events] == [1, 2]
+    assert [event.payload["max_attempts"] for event in events] == [3, 3]
+    assert [event.event for event in events] == ["validation.retry", "agent.output"]
+    assert events[0].payload["validation_errors"] == ["value must be positive"]
+    assert json.loads(calls[1]["validation_feedback"][0])["invalid_output"] == {"value": -1}
+
+
 def test_llm_build_physics_problem_falls_back_without_client(monkeypatch) -> None:
     monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
     output = run_typed_physicsos_workflow(
@@ -1166,6 +1217,26 @@ def test_llm_taps_formulation_uses_structured_client_for_custom_smooth_pde(monke
             }
         if request["agent_name"] == "postprocess-planning-agent":
             return _postprocess_plan_payload()
+        if request["agent_name"] == "numerical-solve-planning-agent":
+            return {
+                "problem_id": problem.id,
+                "status": "fallback_required",
+                "solver_family": "cahn_hilliard",
+                "backend_target": "taps",
+                "field_bindings": {"primary": "c", "secondary": "mu"},
+                "discretization": {"dimension": 2, "node_counts": {"x": 32, "y": 32}, "element_order": 1, "quadrature_order": 2},
+                "coefficient_bindings": [{"name": "diffusion", "role": "diffusion", "value": 1.0, "source_name": "fallback"}],
+                "source_bindings": [{"name": "zero_source", "value": 0.0, "expression": "0"}],
+                "boundary_condition_bindings": [
+                    {"id": "bc:left", "region_id": "boundary:x_min", "field": "c", "kind": "neumann", "value": 0.0},
+                    {"id": "bc:right", "region_id": "boundary:x_max", "field": "c", "kind": "neumann", "value": 0.0},
+                ],
+                "expected_artifacts": ["taps_weak_form_ir"],
+                "validation_checks": ["unsupported_local_kernel"],
+                "fallback_decision": "author_runtime_extension",
+                "assumptions": ["No local Cahn-Hilliard numerical kernel selected."],
+                "unsupported_reasons": ["No deterministic Cahn-Hilliard kernel is connected."],
+            }
         assert request["agent_name"] == "taps-formulation-agent"
         return {
             "plan": {
@@ -1223,7 +1294,9 @@ def test_llm_taps_formulation_uses_structured_client_for_custom_smooth_pde(monke
     assert output.workflow is not None
     assert output.workflow.taps is not None
     assert output.workflow.taps.compilation_plan is not None
+    assert output.workflow.taps.numerical_plan is not None
     assert output.workflow.taps.compilation_plan.equation_family == "cahn_hilliard"
+    assert output.workflow.taps.numerical_plan.solver_family == "cahn_hilliard"
     assert output.workflow.taps.contract_review is not None
     assert output.workflow.taps.contract_review.status == "accepted"
     assert output.workflow.solver_result is not None
@@ -1232,8 +1305,360 @@ def test_llm_taps_formulation_uses_structured_client_for_custom_smooth_pde(monke
         "build-physics-problem-agent",
         "geometry-mesh-planning-agent",
         "taps-formulation-agent",
+        "numerical-solve-planning-agent",
         "postprocess-planning-agent",
     ]
+
+
+def test_llm_numerical_plan_drives_tetra_elasticity_workflow(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    mesh_graph_path = tmp_path / "tetra_elasticity_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-star",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [
+                    {"type": "tetra", "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    problem = PhysicsProblem(
+        id="problem:llm-tetra-elasticity-3d",
+        user_intent={"raw_request": "solve 3D linear elasticity on a tetrahedral mesh"},
+        domain="solid",
+        geometry=GeometrySpec(
+            id="geometry:llm-tetra-elasticity",
+            source=GeometrySource(kind="generated"),
+            dimension=3,
+            encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+        ),
+        fields=[FieldSpec(name="u", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:elasticity",
+                name="Linear elasticity",
+                domain="solid",
+                equation_class="linear_elasticity",
+                form="weak",
+                fields_out=["u"],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:llm-solid",
+                name="llm solid",
+                phase="solid",
+                properties=[
+                    MaterialProperty(name="young_modulus", value=8.0),
+                    MaterialProperty(name="poisson_ratio", value=0.25),
+                    MaterialProperty(name="body_force", value=[0.0, 0.0, -1.0]),
+                ],
+            )
+        ],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:u", region_id="boundary", field="u", kind="dirichlet", value=[0.0, 0.0, 0.0])],
+        targets=[{"name": "displacement", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["llm extracted 3d elasticity"]}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "reuse", "target_element_size": 0.25, "element_order": 1},
+                "requested_encodings": ["mesh_graph"],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": ["mesh graph already provided"],
+                "warnings": [],
+            }
+        if request["agent_name"] == "taps-formulation-agent":
+            return {"plan": formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan.model_dump(mode="json")}
+        if request["agent_name"] == "numerical-solve-planning-agent":
+            return {
+                "problem_id": problem.id,
+                "status": "ready",
+                "solver_family": "mesh_fem_linear_elasticity",
+                "backend_target": "taps",
+                "field_bindings": {"primary": "u"},
+                "discretization": {"dimension": 3, "node_counts": {"x": 64, "y": 64, "z": 64}, "element_order": 1, "quadrature_order": 2},
+                "coefficient_bindings": [
+                    {"name": "diffusion", "role": "diffusion", "value": 1.0, "source_name": "default"},
+                    {"name": "young_modulus", "role": "operator", "value": 8.0, "source_name": "young_modulus"},
+                    {"name": "poisson_ratio", "role": "operator", "value": 0.25, "source_name": "poisson_ratio"},
+                    {"name": "body_force", "role": "source", "value": [0.0, 0.0, -1.0], "source_name": "body_force"},
+                    {"name": "max_iterations", "role": "solver", "value": 20000, "source_name": "llm"},
+                    {"name": "tolerance", "role": "solver", "value": 1e-8, "source_name": "llm"},
+                ],
+                "source_bindings": [{"name": "zero_source", "value": 0.0, "expression": "0"}],
+                "boundary_condition_bindings": [
+                    {"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": [0.0, 0.0, 0.0]}
+                ],
+                "expected_artifacts": ["taps_mesh_fem_elasticity_operator", "taps_mesh_fem_displacement_field", "taps_iteration_history"],
+                "validation_checks": ["mesh_graph_present", "coefficient_bound", "linear_residual"],
+                "assumptions": ["llm selected 3d tetra vector fem"],
+            }
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        raise AssertionError(request["agent_name"])
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="solve 3D linear elasticity on a tetrahedral mesh",
+            use_knowledge=False,
+            core_agents_mode="llm",
+            taps_max_wall_time_seconds=20.0,
+        ),
+        structured_client=fake_client,
+    )
+
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.numerical_plan is not None
+    assert output.workflow.taps.numerical_plan.solver_family == "mesh_fem_linear_elasticity"
+    assert output.workflow.solver_result is not None
+    assert output.workflow.solver_result.status == "success"
+    assert output.workflow.solver_result.residuals["fem_tetrahedra"] == 4.0
+    assert any(call["agent_name"] == "numerical-solve-planning-agent" for call in calls)
+
+
+def test_llm_numerical_plan_drives_tetra10_poisson_workflow(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    mesh_graph_path = tmp_path / "tetra10_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra10",
+                "node_count": 10,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.5, 0.0],
+                    [0.0, 0.5, 0.0],
+                    [0.0, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                    [0.0, 0.5, 0.5],
+                ],
+                "edges": [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra10", "cells": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    problem = PhysicsProblem(
+        id="problem:llm-tetra10-poisson-3d",
+        user_intent={"raw_request": "solve 3D Poisson on a second-order tetrahedral mesh"},
+        domain="custom",
+        geometry=GeometrySpec(
+            id="geometry:llm-tetra10-poisson",
+            source=GeometrySource(kind="generated"),
+            dimension=3,
+            encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+        ),
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:poisson",
+                name="Poisson",
+                domain="custom",
+                equation_class="poisson",
+                form="weak",
+                fields_out=["u"],
+            )
+        ],
+        materials=[],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:u", region_id="boundary", field="u", kind="dirichlet", value=0.0)],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["llm extracted tetra10 poisson"]}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "reuse", "target_element_size": 0.25, "element_order": 2},
+                "requested_encodings": ["mesh_graph"],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": ["mesh graph already provided"],
+                "warnings": [],
+            }
+        if request["agent_name"] == "taps-formulation-agent":
+            return {"plan": formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan.model_dump(mode="json")}
+        if request["agent_name"] == "numerical-solve-planning-agent":
+            return {
+                "problem_id": problem.id,
+                "status": "ready",
+                "solver_family": "mesh_fem_poisson",
+                "backend_target": "taps",
+                "field_bindings": {"primary": "u"},
+                "discretization": {"dimension": 3, "node_counts": {"x": 64, "y": 64, "z": 64}, "element_order": 2, "quadrature_order": 2},
+                "coefficient_bindings": [{"name": "diffusion", "role": "diffusion", "value": 1.0, "source_name": "llm"}],
+                "source_bindings": [{"name": "zero_source", "value": 0.0, "expression": "0"}],
+                "boundary_condition_bindings": [
+                    {"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": 0.0}
+                ],
+                "expected_artifacts": ["taps_mesh_fem_operator", "taps_mesh_fem_solution_field", "taps_iteration_history"],
+                "validation_checks": ["mesh_graph_present", "coefficient_bound", "linear_residual"],
+                "assumptions": ["llm selected second-order tetra scalar FEM"],
+            }
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        raise AssertionError(request["agent_name"])
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="solve 3D Poisson on a second-order tetrahedral mesh",
+            use_knowledge=False,
+            core_agents_mode="llm",
+            taps_max_wall_time_seconds=20.0,
+        ),
+        structured_client=fake_client,
+    )
+
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.numerical_plan is not None
+    assert output.workflow.taps.numerical_plan.solver_family == "mesh_fem_poisson"
+    assert output.workflow.taps.numerical_plan.discretization.element_order == 2
+    assert output.workflow.solver_result is not None
+    assert output.workflow.solver_result.status == "success"
+    assert output.workflow.solver_result.residuals["fem_basis_order"] == 2.0
+    assert any(call["agent_name"] == "numerical-solve-planning-agent" for call in calls)
+
+
+def test_llm_invalid_numerical_plan_stops_before_taps_execution(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    problem = build_default_thermal_problem()
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["llm extracted heat"]}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "structured", "target_element_size": 0.1, "element_order": 1},
+                "requested_encodings": [],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": [],
+                "warnings": [],
+            }
+        if request["agent_name"] == "taps-formulation-agent":
+            return {"plan": formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan.model_dump(mode="json")}
+        if request["agent_name"] == "numerical-solve-planning-agent":
+            return {
+                "problem_id": problem.id,
+                "status": "ready",
+                "solver_family": "scalar_elliptic_1d",
+                "backend_target": "taps",
+                "field_bindings": {"primary": "T"},
+                "discretization": {"dimension": 1, "node_counts": {"x": 64}, "element_order": 1, "quadrature_order": 2},
+                "coefficient_bindings": [{"name": "diffusion", "role": "diffusion", "value": 1.0, "source_name": "llm"}],
+                "source_bindings": [{"name": "zero_source", "value": 0.0, "expression": "0"}],
+                "boundary_condition_bindings": [
+                    {"id": "bc:left", "region_id": "x=0", "field": "T", "kind": "dirichlet", "value": 999.0}
+                ],
+                "expected_artifacts": [],
+                "validation_checks": [],
+                "assumptions": ["invalid drift"],
+            }
+        raise AssertionError(request["agent_name"])
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.handoff.status == "failed"
+    assert output.workflow.taps.result is None
+    assert output.workflow.solver_result is None
+    assert any("Numerical solve plan validation failed" in step.summary for step in output.workflow.trace)
+
+
+def test_numerical_solve_planner_structured_contract_retry(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+    compilation_plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=compilation_plan)).taps_problem
+    problem_contract = build_physics_problem_contract(problem)
+    valid_plan = plan_numerical_solve(
+        NumericalSolvePlanInput(
+            problem=problem,
+            taps_problem=taps_problem,
+            compilation_plan=compilation_plan,
+            problem_contract=problem_contract,
+        )
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            invalid_plan = valid_plan.model_dump(mode="json")
+            invalid_plan["boundary_condition_bindings"] = [
+                {"id": "bc:left", "region_id": "x=0", "field": "T", "kind": "dirichlet", "value": 999.0}
+            ]
+            return invalid_plan
+        return valid_plan.model_dump(mode="json")
+
+    events = []
+    with structured_agent_event_context(run_id="run:numerical-plan", case_id=problem.id, events=events):
+        output = plan_numerical_solve_structured(
+            NumericalSolvePlanInput(
+                problem=problem,
+                taps_problem=taps_problem,
+                compilation_plan=compilation_plan,
+                problem_contract=problem_contract,
+            ),
+            client=fake_client,
+            config=CoreAgentLLMConfig(mode="llm", max_structured_attempts=2),
+        )
+
+    assert len(calls) == 2
+    assert output.solver_family == valid_plan.solver_family
+    assert [event.payload["attempt"] for event in events] == [1, 2]
+    assert [event.payload["max_attempts"] for event in events] == [2, 2]
+    assert events[0].event == "validation.retry"
+    feedback = json.loads(calls[1]["validation_feedback"][0])
+    assert "invalid_plan" in feedback
+    assert "problem_contract" in feedback
+    assert feedback["errors"]
+    assert "Repair only the invalid NumericalSolvePlanOutput" in feedback["instruction"]
 
 
 def test_llm_taps_formulation_falls_back_after_validation_failures() -> None:
@@ -1574,6 +1999,14 @@ def test_backend_preparation_planner_structured_semantic_retry(monkeypatch, tmp_
     assert output.approval_gate["execute_external_solver"] is False
     assert output.solver_controls["external_execution_enabled"] is False
     assert [event.stage for event in events] == ["backend-preparation-planning-agent", "backend-preparation-planning-agent"]
+    assert [event.payload["attempt"] for event in events] == [1, 2]
+    assert [event.payload["max_attempts"] for event in events] == [2, 2]
+    assert [event.event for event in events] == ["validation.retry", "agent.output"]
+    assert calls[1]["validation_feedback"]
+    feedback = json.loads(calls[1]["validation_feedback"][0])
+    assert "invalid_plan" in feedback
+    assert feedback["errors"]
+    assert "Do not enable external execution" in feedback["instruction"]
 
 
 def test_geometry_mesh_planner_requests_boundary_confirmation_for_imported_geometry() -> None:
@@ -1583,6 +2016,25 @@ def test_geometry_mesh_planner_requests_boundary_confirmation_for_imported_geome
     plan = plan_geometry_mesh(GeometryMeshPlanInput(problem=problem, target_backends=["fenicsx"]))
     assert plan.require_boundary_confirmation is True
     assert "mesh_graph" in plan.requested_encodings
+
+
+def test_geometry_mesh_handoff_includes_boundary_labeler_viewer(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    geometry = GeometrySpec(id="geometry:imported-box", source=GeometrySource(kind="mesh_file", uri="box.msh"), dimension=3)
+    problem = build_default_thermal_problem().model_copy(update={"geometry": geometry})
+    output = _run_geometry_mesh_agent(
+        GeometryMeshAgentInput(problem=problem, requested_encodings=[], target_backends=["openfoam"])
+    )
+    artifact_kinds = {artifact.kind for artifact in output.handoff.artifacts}
+    viewer = next(artifact for artifact in output.handoff.artifacts if artifact.kind == "geometry_labeler_viewer")
+    labeling = next(artifact for artifact in output.handoff.artifacts if artifact.kind == "boundary_labeling_artifact")
+    assert output.handoff.status == "needs_user_input"
+    assert output.handoff.recommended_next_action == "confirm_boundary_labels"
+    assert {"boundary_labeling_artifact", "geometry_labeler_viewer"} <= artifact_kinds
+    assert Path(viewer.uri).exists()
+    assert Path(labeling.uri).exists()
+    assert "geometry_labeler_viewer artifact" in output.handoff.summary
 
 
 def test_workflow_events_include_structured_geometry_attempt(monkeypatch, tmp_path) -> None:
@@ -2168,9 +2620,12 @@ def test_taps_executes_custom_scalar_elliptic_weak_form_ir() -> None:
     )
     plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
     taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    solve_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=problem, taps_problem=taps_problem, plan=solve_plan)
+    )
+    assert validation.valid
     result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
-    assert result.status == "success"
-    assert result.backend == "taps:weak_ir_scalar_elliptic_1d:custom"
     assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
     operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_assembled_operator")
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
@@ -2213,6 +2668,191 @@ def test_taps_1d_steady_heat_applies_nonzero_dirichlet_boundaries() -> None:
     assert values[-1] == 350.0
     assert middle == pytest.approx(325.0, abs=1.0)
     assert solution["boundary_values_applied"] == {"left": 300.0, "right": 350.0}
+
+
+def test_taps_1d_steady_heat_accepts_llm_boundary_ids() -> None:
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K")
+    ).problem
+    assert problem is not None
+    problem = problem.model_copy(
+        update={
+            "boundary_conditions": [
+                condition.model_copy(update={"region_id": "bnd_x0" if condition.value == 300.0 else "bnd_x1"})
+                for condition in problem.boundary_conditions
+            ]
+        }
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+
+    assert result.status == "success"
+    assert solution["boundary_values_applied"] == {"left": 300.0, "right": 350.0}
+    assert solution["values"][0] == 300.0
+    assert solution["values"][-1] == 350.0
+
+
+def test_canonicalize_physics_problem_assigns_explicit_roles_for_opaque_boundary_ids() -> None:
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K")
+    ).problem
+    assert problem is not None
+    problem = problem.model_copy(
+        update={
+            "boundary_conditions": [
+                BoundaryConditionSpec(
+                    id="bc:hot",
+                    region_id="surface_hot_end",
+                    boundary_role="x_min",
+                    field="T",
+                    kind="dirichlet",
+                    value=300.0,
+                    units="K",
+                ),
+                BoundaryConditionSpec(
+                    id="bc:cold",
+                    region_id="surface_cold_end",
+                    boundary_role="x_max",
+                    field="T",
+                    kind="dirichlet",
+                    value=350.0,
+                    units="K",
+                ),
+            ]
+        }
+    )
+
+    canonical = canonicalize_physics_problem(CanonicalPhysicsProblemInput(problem=problem))
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=canonical.problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=canonical.problem, compilation_plan=plan)).taps_problem
+    solve_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=canonical.problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=canonical.problem, taps_problem=taps_problem, plan=solve_plan)
+    )
+    result = run_taps_backend(RunTAPSBackendInput(problem=canonical.problem, taps_problem=taps_problem, numerical_plan=solve_plan)).result
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+
+    assert canonical.status == "ready"
+    assert canonical.role_assignments == {"bc:hot": "x_min", "bc:cold": "x_max"}
+    assert validation.valid
+    assert result.status == "success"
+    assert solution["boundary_values_applied"] == {"left": 300.0, "right": 350.0}
+
+
+def test_workflow_stops_imported_geometry_with_missing_solver_critical_boundary_roles(monkeypatch) -> None:
+    geometry = GeometrySpec(id="geometry:imported-opaque", source=GeometrySource(kind="mesh_file", uri="opaque.msh"), dimension=3)
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(
+            user_request="simulate heat on imported mesh",
+            geometry=geometry,
+        )
+    ).problem
+    assert problem is not None
+    problem = problem.model_copy(
+        update={
+            "boundary_conditions": [
+                BoundaryConditionSpec(id="bc:hot", region_id="surface_17", field="T", kind="dirichlet", value=300.0),
+                BoundaryConditionSpec(id="bc:cold", region_id="surface_42", field="T", kind="dirichlet", value=350.0),
+            ]
+        }
+    )
+
+    def fake_client(request):
+        assert request["agent_name"] == "build-physics-problem-agent"
+        return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["opaque imported groups"]}
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate heat on imported mesh",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+
+    assert output.workflow is None
+    assert output.canonicalization is not None
+    assert output.canonicalization.status == "needs_user_input"
+    assert output.canonicalization.missing_boundary_roles == ["bc:hot", "bc:cold"]
+
+
+def test_verification_rejects_solver_artifact_with_wrong_boundary_values(tmp_path) -> None:
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K")
+    ).problem
+    assert problem is not None
+    solution_path = tmp_path / "solution_field.json"
+    solution_path.write_text(
+        json.dumps(
+            {
+                "field": "T",
+                "axis": "x",
+                "x": [0.0, 1.0],
+                "values": [0.0, 0.0],
+                "boundary_values_applied": {"left": 0.0, "right": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = SolverResult(
+        id=f"result:taps:{problem.id}",
+        problem_id=problem.id,
+        backend="taps:weak_ir_scalar_elliptic_1d:test",
+        status="success",
+        residuals={"normalized_linear_residual": 0.0, "boundary_condition_error": 0.0},
+        artifacts=[ArtifactRef(uri=str(solution_path), kind="taps_solution_field", format="json")],
+        provenance=Provenance(created_by="test"),
+    )
+
+    check = check_boundary_condition_application(CheckBoundaryConditionApplicationInput(problem=problem, result=result))
+
+    assert not check.passes
+    assert check.errors == {"bc:left": 300.0, "bc:right": 350.0}
+
+
+def test_verification_checks_boundary_values_by_canonical_role_and_boundary_id(tmp_path) -> None:
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K")
+    ).problem
+    assert problem is not None
+    problem = problem.model_copy(
+        update={
+            "boundary_conditions": [
+                BoundaryConditionSpec(id="bc:hot", region_id="surface_hot", boundary_role="x_min", field="T", kind="dirichlet", value=300.0),
+                BoundaryConditionSpec(id="bc:cold", region_id="surface_cold", boundary_role="x_max", field="T", kind="dirichlet", value=350.0),
+            ]
+        }
+    )
+    solution_path = tmp_path / "solution_field_roles.json"
+    solution_path.write_text(
+        json.dumps(
+            {
+                "field": "T",
+                "values": [300.0, 349.0],
+                "boundary_values_applied": {"x_min": 300.0, "bc:cold": 349.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = SolverResult(
+        id=f"result:taps:{problem.id}",
+        problem_id=problem.id,
+        backend="taps:test",
+        status="success",
+        residuals={"normalized_linear_residual": 0.0},
+        artifacts=[ArtifactRef(uri=str(solution_path), kind="taps_solution_field", format="json")],
+        provenance=Provenance(created_by="test"),
+    )
+
+    check = check_boundary_condition_application(CheckBoundaryConditionApplicationInput(problem=problem, result=result))
+
+    assert not check.passes
+    assert check.checked_boundaries == ["bc:hot", "bc:cold"]
+    assert check.errors == {"bc:cold": 1.0}
 
 
 def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
@@ -2318,9 +2958,12 @@ def test_taps_compiles_strong_form_and_boundary_weak_terms() -> None:
     assert "grad(v_u)" in taps_problem.weak_form.terms[0].expression
     assert taps_problem.weak_form.boundary_terms
     assert taps_problem.weak_form.boundary_terms[0].integration_domain == "x=1"
-    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
-    assert result.status == "success"
-    assert result.backend == "taps:weak_ir_scalar_elliptic_1d:custom"
+    solve_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=problem, taps_problem=taps_problem, plan=solve_plan)
+    )
+    assert not validation.valid
+    assert any("requires canonical Dirichlet boundary_role values x_min and x_max" in error for error in validation.errors)
 
 
 def test_taps_agent_requests_knowledge_for_under_specified_problem() -> None:
@@ -2550,6 +3193,55 @@ def test_taps_2d_scalar_elliptic_applies_nonzero_dirichlet_boundary_lifting() ->
     assert all(value == 5.0 for value in values[0])
     assert all(value == 5.0 for value in values[-1])
     assert all(row[0] == 5.0 and row[-1] == 5.0 for row in values)
+
+
+def test_taps_generic_scalar_assembler_executes_3d_heat_with_endpoint_roles() -> None:
+    geometry = GeometrySpec(id="geometry:cylinder-structured-3d", source=GeometrySource(kind="generated"), dimension=3)
+    problem = PhysicsProblem(
+        id="problem:heat-3d-structured",
+        user_intent={"raw_request": "solve 3D steady heat conduction with x_min=300 K and x_max=350 K"},
+        domain="thermal",
+        geometry=geometry,
+        fields=[FieldSpec(name="T", kind="scalar", units="K")],
+        operators=[
+            OperatorSpec(
+                id="operator:heat-3d",
+                name="Steady heat conduction",
+                domain="thermal",
+                equation_class="elliptic PDE",
+                form="weak",
+                fields_out=["T"],
+                differential_terms=[{"expression": "div(k grad(T)) = 0", "order": 2, "fields": ["T"]}],
+            )
+        ],
+        materials=[MaterialSpec(id="material:solid", name="solid", phase="solid", properties=[MaterialProperty(name="thermal_conductivity", value=15.0)])],
+        boundary_conditions=[
+            {"id": "bc:xmin", "region_id": "bnd_hot_min", "boundary_role": "x_min", "field": "T", "kind": "dirichlet", "value": 300.0, "units": "K"},
+            {"id": "bc:xmax", "region_id": "bnd_hot_max", "boundary_role": "x_max", "field": "T", "kind": "dirichlet", "value": 350.0, "units": "K"},
+        ],
+        targets=[{"name": "temperature", "field": "T", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    for axis in plan.axes:
+        if axis.kind == "space":
+            axis.points = 8
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    residual = estimate_taps_residual(EstimateTAPSResidualInput(problem=problem, taps_problem=taps_problem, result=result)).report
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    bc_check = check_boundary_condition_application(CheckBoundaryConditionApplicationInput(problem=problem, result=result))
+
+    assert result.backend.startswith("taps:weak_ir_scalar_elliptic_3d")
+    assert result.status == "success"
+    assert residual.converged
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "scalar_elliptic_3d"
+    assert solution_payload["boundary_values_applied"]["left"] == 300.0
+    assert solution_payload["boundary_values_applied"]["right"] == 350.0
+    assert solution_payload["values"][0][0][0] == 300.0
+    assert solution_payload["values"][-1][0][0] == 350.0
+    assert bc_check.passes
 
 
 def test_taps_nonlinear_reaction_diffusion_executes_1d() -> None:
@@ -2996,6 +3688,381 @@ def test_mesh_graph_taps_solves_fem_poisson() -> None:
     }
 
 
+def test_tetra_p1_fem_assembly_unit_tetra() -> None:
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    stiffness, lumped_mass, total_volume, elements = _assemble_tetra_stiffness(points, [[0, 1, 2, 3]])
+
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert lumped_mass == pytest.approx([1.0 / 24.0] * 4)
+    assert elements[0]["basis"] == "p1_tetra"
+    expected_gradients = [[-1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    for actual, expected in zip(elements[0]["grad_phi"], expected_gradients):
+        assert actual == pytest.approx(expected)
+    dense = [[stiffness[row].get(col, 0.0) for col in range(4)] for row in range(4)]
+    assert dense[0][0] == pytest.approx(0.5)
+    assert dense[0][1] == pytest.approx(-1.0 / 6.0)
+    assert dense[1][1] == pytest.approx(1.0 / 6.0)
+
+
+def test_tetra_p2_scalar_assembly_uses_tetra10_nodes() -> None:
+    points = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+    ]
+    stiffness, lumped_mass, total_volume, elements = _assemble_tetra_stiffness(points, [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert sum(lumped_mass) == pytest.approx(1.0 / 6.0)
+    assert len(stiffness) == 10
+    assert elements[0]["basis"] == "p2_tetra"
+    assert elements[0]["geometry"] == "isoparametric_quadratic_tetra"
+    assert len(elements[0]["local_stiffness"]) == 10
+    assert len(elements[0]["quadrature"]) == 4
+    assert len(elements[0]["quadrature"][0]["grad_phi"]) == 10
+    local = elements[0]["local_stiffness"]
+    for i in range(10):
+        for j in range(10):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-12)
+        assert sum(local[i]) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_tetra_p2_isoparametric_geometry_uses_curved_mid_edge_nodes() -> None:
+    straight_points = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+    ]
+    curved_points = [point[:] for point in straight_points]
+    curved_points[8] = [0.65, 0.0, 0.65]
+
+    _, _, straight_volume, straight_elements = _assemble_tetra_stiffness(straight_points, [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    _, _, curved_volume, curved_elements = _assemble_tetra_stiffness(curved_points, [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+
+    assert straight_elements[0]["geometry"] == "isoparametric_quadratic_tetra"
+    assert curved_elements[0]["geometry"] == "isoparametric_quadratic_tetra"
+    assert straight_volume == pytest.approx(1.0 / 6.0)
+    assert curved_volume != pytest.approx(straight_volume)
+    assert [record["det_j"] for record in curved_elements[0]["quadrature"]] != pytest.approx(
+        [record["det_j"] for record in straight_elements[0]["quadrature"]]
+    )
+
+
+def test_tetra10_poisson_flags_inverted_curved_element_quality(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra10_inverted_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-inverted-tetra10",
+                "node_count": 10,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.5, 0.0],
+                    [0.0, 0.5, 0.0],
+                    [0.0, 0.0, 0.5],
+                    [-3.0, 0.0, 1.0],
+                    [0.0, 0.5, 0.5],
+                ],
+                "edges": [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra10", "cells": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra10-inverted-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra10-inverted-poisson-3d",
+        user_intent={"raw_request": "solve 3D Poisson on an inverted second-order tetrahedral mesh graph"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[OperatorSpec(id="operator:poisson", name="Poisson", domain="custom", equation_class="poisson", form="weak", fields_out=["u"])],
+        materials=[],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:u", region_id="boundary", field="u", kind="dirichlet", value=0.0)],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+
+    assert result.status == "needs_review"
+    assert result.residuals["mesh_quality_passes"] == 0.0
+    assert operator_payload["mesh_quality"]["passes"] is False
+    assert any("Jacobian determinant changes sign" in issue for issue in operator_payload["mesh_quality"]["issues"])
+
+
+def test_mesh_graph_taps_solves_tetra_fem_poisson(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-star",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [
+                    {
+                        "type": "tetra",
+                        "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-poisson-3d",
+        user_intent={"raw_request": "solve 3D Poisson on a tetrahedral mesh graph"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:poisson",
+                name="Poisson",
+                domain="custom",
+                equation_class="poisson",
+                form="weak",
+                fields_out=["u"],
+            )
+        ],
+        materials=[],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": 0.0}],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert result.backend.startswith("taps:mesh_fem_poisson")
+    assert result.status == "success"
+    assert result.residuals["fem_tetrahedra"] == 4
+    assert result.residuals["fem_triangles"] == 0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    assert operator_payload["type"] == "tetra_p1_fem_poisson"
+    assert operator_payload["total_volume"] == pytest.approx(1.0 / 6.0)
+
+
+def test_mesh_graph_taps_solves_tetra10_fem_poisson(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra10_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra10",
+                "node_count": 10,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.5, 0.0],
+                    [0.0, 0.5, 0.0],
+                    [0.0, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                    [0.0, 0.5, 0.5],
+                ],
+                "edges": [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra10", "cells": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra10-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra10-poisson-3d",
+        user_intent={"raw_request": "solve 3D Poisson on a second-order tetrahedral mesh graph"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:poisson",
+                name="Poisson",
+                domain="custom",
+                equation_class="poisson",
+                form="weak",
+                fields_out=["u"],
+            )
+        ],
+        materials=[],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": 0.0}],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert result.backend.startswith("taps:mesh_fem_poisson")
+    assert result.status == "success"
+    assert result.residuals["fem_tetrahedra"] == 1
+    assert result.residuals["fem_basis_order"] == 2
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    assert operator_payload["type"] == "tetra_p2_fem_poisson"
+    assert any(element["basis"] == "p2_tetra" for element in operator_payload["elements"])
+
+
+def test_mesh_graph_tetra_fem_poisson_applies_nonzero_dirichlet_roles(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_bc_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-star-bc",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "boundary_node_sets": {"x_min": [0, 2, 3], "x_max": [1]},
+                "cell_blocks": [
+                    {"type": "tetra", "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-bc-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-poisson-bc-3d",
+        user_intent={"raw_request": "solve 3D Poisson on a tetra mesh with x_min=2 and x_max=5"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[OperatorSpec(id="operator:poisson", name="Poisson", domain="custom", equation_class="poisson", form="weak", fields_out=["u"])],
+        materials=[],
+        boundary_conditions=[
+            BoundaryConditionSpec(id="bc:xmin", region_id="x_min", boundary_role="x_min", field="u", kind="dirichlet", value=2.0),
+            BoundaryConditionSpec(id="bc:xmax", region_id="x_max", boundary_role="x_max", field="u", kind="dirichlet", value=5.0),
+        ],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    numerical_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem, numerical_plan=numerical_plan)).result
+
+    assert result.status == "success"
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_solution_field")
+    solution_payload = json.loads(Path(solution_artifact.uri).read_text(encoding="utf-8"))
+    assert solution_payload["values"][0] == pytest.approx(2.0)
+    assert solution_payload["values"][2] == pytest.approx(2.0)
+    assert solution_payload["values"][3] == pytest.approx(2.0)
+    assert solution_payload["values"][1] == pytest.approx(5.0)
+    assert solution_payload["boundary_values_applied"] == {"0": 2.0, "1": 5.0, "2": 2.0, "3": 2.0}
+
+
+def test_mesh_graph_fem_poisson_applies_neumann_and_robin_boundary_terms() -> None:
+    geometry = GeometrySpec(id="geometry:mesh-poisson-mixed-bc-square", source=GeometrySource(kind="generated"), dimension=2)
+    mesh = generate_mesh(
+        GenerateMeshInput(
+            geometry=geometry,
+            physics=PhysicsSpec(domains=["custom"]),
+            mesh_policy=MeshPolicy(target_element_size=0.5),
+            target_backends=["taps"],
+        )
+    ).mesh
+    encoding_output = generate_geometry_encoding(
+        GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=["mesh_graph"])
+    )
+    geometry.encodings.extend(encoding_output.encodings)
+    problem = PhysicsProblem(
+        id="problem:mesh-poisson-mixed-bc-2d",
+        user_intent={"raw_request": "solve mesh FEM Poisson with Dirichlet, Neumann, and Robin boundaries"},
+        domain="custom",
+        geometry=geometry,
+        mesh=mesh,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[OperatorSpec(id="operator:poisson", name="Poisson", domain="custom", equation_class="poisson", form="weak", fields_out=["u"])],
+        materials=[],
+        boundary_conditions=[
+            BoundaryConditionSpec(id="bc:left", region_id="x_min", boundary_role="x_min", field="u", kind="dirichlet", value=0.0),
+            BoundaryConditionSpec(id="bc:right_flux", region_id="x_max", boundary_role="x_max", field="u", kind="neumann", value=2.0),
+            BoundaryConditionSpec(id="bc:top_robin", region_id="y_max", boundary_role="y_max", field="u", kind="robin", value={"h": 3.0, "r": 1.5}),
+        ],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_solution_field")
+    solution_payload = json.loads(Path(solution_artifact.uri).read_text(encoding="utf-8"))
+
+    assert result.status in {"success", "needs_review"}
+    applied = operator_payload["boundary_weak_terms_applied"]
+    assert {item["id"] for item in applied} == {"bc:right_flux", "bc:top_robin"}
+    assert next(item for item in applied if item["id"] == "bc:right_flux")["value"] == pytest.approx(2.0)
+    assert next(item for item in applied if item["id"] == "bc:top_robin")["coefficient"] == pytest.approx(3.0)
+    assert solution_payload["boundary_weak_terms_applied"] == applied
+
+
 def test_mesh_graph_taps_solves_p2_fem_poisson_from_second_order_gmsh_mesh() -> None:
     geometry = GeometrySpec(id="geometry:mesh-p2-square", source=GeometrySource(kind="generated"), dimension=2)
     mesh = generate_mesh(
@@ -3340,6 +4407,298 @@ def test_mesh_graph_taps_em_order2_boundary_policy_selects_high_order_dofs() -> 
     assert operator_payload["active_boundary_edge_count"] >= operator_payload["active_boundary_geometric_edge_count"]
     active_dof_entities = [operator_payload["dofs"][index] for index in operator_payload["active_boundary_dofs"]]
     assert all(entity["kind"] == "edge_moment" for entity in active_dof_entities)
+
+
+def test_tetra_nedelec_order1_assembly_unit_tetra() -> None:
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    stiffness, edges, faces, total_volume, elements = _assemble_tetra_nedelec_curl_curl(points, [[0, 1, 2, 3]])
+
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert len(edges) == 6
+    assert len(faces) == 4
+    assert len(stiffness) == 6
+    assert elements[0]["basis"] == "nedelec_first_kind_order1_tetra"
+    assert len(elements[0]["quadrature"]) == 4
+    assert len(elements[0]["curl_basis"]) == 6
+    local = elements[0]["local_matrix"]
+    for i in range(6):
+        for j in range(6):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-12)
+    assert all(row for row in stiffness)
+
+
+def test_mesh_graph_taps_solves_tetra_em_curl_curl(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_em_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-em",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [
+                    {"type": "tetra", "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-em-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-em-curl-curl-3d",
+        user_intent={"raw_request": "solve a 3D electromagnetic curl-curl problem on a tetrahedral mesh graph"},
+        domain="electromagnetic",
+        geometry=geometry,
+        fields=[FieldSpec(name="E", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:maxwell",
+                name="Maxwell curl-curl",
+                domain="electromagnetic",
+                equation_class="maxwell",
+                form="weak",
+                fields_out=["E"],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:tetra-em",
+                name="tetra em",
+                phase="custom",
+                properties=[
+                    MaterialProperty(name="relative_permittivity", value=1.5),
+                    MaterialProperty(name="relative_permeability", value=1.0),
+                    MaterialProperty(name="wave_number", value=0.25),
+                    MaterialProperty(name="current_source", value=0.5),
+                ],
+            )
+        ],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:e", region_id="boundary", field="E_t", kind="dirichlet", value=0.0)],
+        targets=[{"name": "field", "field": "E", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    residual = estimate_taps_residual(EstimateTAPSResidualInput(problem=problem, taps_problem=taps_problem, result=result)).report
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+
+    assert result.backend.startswith("taps:mesh_fem_em_curl_curl")
+    assert result.status == "success"
+    assert residual.converged
+    assert result.residuals["fem_tetrahedra"] == 4.0
+    assert operator_payload["type"] == "tetra_nedelec_order1_em_curl_curl"
+    assert operator_payload["element_shape"] == "tetra"
+    assert operator_payload["tetra_count"] == 4
+    assert operator_payload["triangle_count"] == 0
+    assert operator_payload["basis_order"] == 1
+    assert operator_payload["assembly"] == "nedelec_first_kind_edge_element_hcurl"
+    assert operator_payload["edge_dof_count"] == operator_payload["dof_count"]
+    assert operator_payload["active_boundary_face_count"] >= 1
+    assert operator_payload["faces"]
+    assert any(element["basis"] == "nedelec_first_kind_order1_tetra" for element in operator_payload["elements"])
+    assert len(solution_payload["values"]) == operator_payload["dof_count"]
+    assert solution_payload["field_kind"] == "hcurl_edge_field"
+
+
+def test_tetra_nedelec_order2_scaffold_has_edge_face_and_cell_dofs() -> None:
+    points = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+    ]
+    stiffness, dofs, faces, total_volume, elements = _assemble_tetra_nedelec_curl_curl(points, [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert len(dofs) == 17
+    assert len(faces) == 4
+    assert sum(1 for dof in dofs if dof["kind"] == "edge_moment") == 12
+    assert sum(1 for dof in dofs if dof["kind"] == "face_tangent") == 4
+    assert sum(1 for dof in dofs if dof["kind"] == "cell_interior") == 1
+    assert elements[0]["basis"] == "nedelec_first_kind_order2_hierarchical_scaffold_tetra"
+    assert len(elements[0]["quadrature"]) == 4
+    local = elements[0]["local_matrix"]
+    for i in range(len(local)):
+        for j in range(len(local)):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-12)
+    assert len(stiffness) == len(dofs)
+
+
+def test_tetra_raviart_thomas_rt0_div_scaffold_unit_tetra() -> None:
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    stiffness, dofs, total_volume, elements = _assemble_tetra_raviart_thomas_div(points, [[0, 1, 2, 3]])
+
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert len(dofs) == 4
+    assert all(dof["kind"] == "face_flux" for dof in dofs)
+    assert elements[0]["basis"] == "raviart_thomas_order0_tetra"
+    assert len(elements[0]["divergence_basis"]) == 4
+    local = elements[0]["local_matrix"]
+    for i in range(4):
+        for j in range(4):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-12)
+    assert all(row for row in stiffness)
+
+
+def test_mesh_graph_taps_solves_tetra_hdiv_div_scaffold(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_hdiv_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-hdiv-tetra",
+                "node_count": 4,
+                "points": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "edges": [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra", "cells": [[0, 1, 2, 3]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-hdiv-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-hdiv-darcy-3d",
+        user_intent={"raw_request": "solve a 3D Darcy flux problem on a tetrahedral mesh"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="q", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:darcy",
+                name="Darcy mixed flux",
+                domain="custom",
+                equation_class="darcy",
+                form="weak",
+                fields_out=["q"],
+            )
+        ],
+        materials=[MaterialSpec(id="material:porous", name="porous", phase="custom", properties=[MaterialProperty(name="permeability", value=2.0)])],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:flux", region_id="boundary", field="q", kind="neumann", value=0.0)],
+        targets=[{"name": "flux", "field": "q", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    numerical_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=problem, taps_problem=taps_problem, plan=numerical_plan)
+    )
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem, numerical_plan=numerical_plan)).result
+
+    assert numerical_plan.solver_family == "mesh_fem_hdiv_div"
+    assert validation.valid
+    assert result.backend.startswith("taps:mesh_fem_hdiv_div")
+    assert result.status == "success"
+    assert result.residuals["fem_tetrahedra"] == 1.0
+    assert result.residuals["fem_face_dofs"] == 4.0
+    assert result.residuals["hdiv_scaffold"] == 1.0
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_hdiv_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    assert operator_payload["type"] == "tetra_raviart_thomas_order0_hdiv_div_scaffold"
+    assert operator_payload["hdiv_scaffold"]["status"] == "raviart_thomas_order0_tetra_scaffold"
+    assert operator_payload["material"]["permeability"] == pytest.approx(2.0)
+
+
+def test_mesh_graph_taps_solves_tetra10_em_curl_curl_order2_scaffold(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra10_em_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra10-em",
+                "node_count": 10,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.5, 0.0],
+                    [0.0, 0.5, 0.0],
+                    [0.0, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                    [0.0, 0.5, 0.5],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra10", "cells": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra10-em-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra10-em-curl-curl-3d",
+        user_intent={"raw_request": "solve a second-order 3D electromagnetic curl-curl problem on a tetrahedral mesh graph"},
+        domain="electromagnetic",
+        geometry=geometry,
+        fields=[FieldSpec(name="E", kind="vector")],
+        operators=[OperatorSpec(id="operator:maxwell", name="Maxwell curl-curl", domain="electromagnetic", equation_class="maxwell", form="weak", fields_out=["E"])],
+        materials=[
+            MaterialSpec(
+                id="material:tetra10-em",
+                name="tetra10 em",
+                phase="custom",
+                properties=[
+                    MaterialProperty(name="relative_permittivity", value=1.2),
+                    MaterialProperty(name="relative_permeability", value=1.0),
+                    MaterialProperty(name="wave_number", value=0.2),
+                    MaterialProperty(name="current_source", value=0.25),
+                ],
+            )
+        ],
+        boundary_conditions=[BoundaryConditionSpec(id="bc:e", region_id="boundary", field="E_t", kind="dirichlet", value=0.0)],
+        targets=[{"name": "field", "field": "E", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+
+    assert result.status == "success"
+    assert result.residuals["fem_basis_order"] == 2.0
+    assert operator_payload["type"] == "tetra_nedelec_order2_em_curl_curl"
+    assert operator_payload["element_shape"] == "tetra"
+    assert operator_payload["face_tangent_dof_count"] == 4
+    assert operator_payload["cell_interior_dof_count"] == 1
+    assert operator_payload["hcurl_scaffold"]["face_tangent_dofs"] == 4
+    assert any(element["basis"] == "nedelec_first_kind_order2_hierarchical_scaffold_tetra" for element in operator_payload["elements"])
 
 
 def test_mesh_graph_taps_em_curl_curl_supports_natural_boundary_policy() -> None:
@@ -3961,6 +5320,88 @@ def test_boundary_labeling_artifact_requires_confirmation_before_apply(tmp_path)
     assert applied.geometry.entities[0].id == target_id
 
 
+def test_cli_applies_confirmed_boundary_labels_with_roles(tmp_path, capsys) -> None:
+    geometry_path = tmp_path / "geometry.json"
+    labeling_path = tmp_path / "boundary_labeling_artifact.json"
+    output_path = tmp_path / "geometry.confirmed.json"
+    geometry = GeometrySpec(
+        id="geometry:cli-labels",
+        source=GeometrySource(kind="mesh_file", uri="box.msh"),
+        dimension=3,
+    )
+    geometry_path.write_text(geometry.model_dump_json(indent=2), encoding="utf-8")
+    labeling_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "physicsos.boundary_labeling.v1",
+                "geometry_id": geometry.id,
+                "confirmed_boundary_labels": [
+                    {
+                        "target_ids": ["face:left"],
+                        "boundary_id": "boundary:left",
+                        "label": "left end",
+                        "kind": "surface",
+                        "role": "x_min",
+                        "confidence": 1.0,
+                        "confirmed_by": "user",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli_main(["geometry", "apply-boundary-labels", str(geometry_path), str(labeling_path), "--output", str(output_path)])
+    stdout = capsys.readouterr().out
+    payload = json.loads(stdout)
+    confirmed = GeometrySpec.model_validate_json(output_path.read_text(encoding="utf-8"))
+
+    assert code == 0
+    assert payload["applied"] == ["boundary:left"]
+    assert payload["boundary_count"] == 1
+    assert confirmed.boundaries[0].role == "x_min"
+    assert confirmed.boundaries[0].entity_ids == ["face:left"]
+
+
+def test_cli_resumes_workflow_with_confirmed_geometry(tmp_path, capsys) -> None:
+    problem = build_default_thermal_problem()
+    confirmed_geometry = problem.geometry.model_copy(
+        update={
+            "id": "geometry:confirmed-workflow",
+            "boundaries": [
+                BoundaryRegionSpec(id="boundary:x_min", label="left", kind="surface", role="x_min", confidence=1.0),
+                BoundaryRegionSpec(id="boundary:x_max", label="right", kind="surface", role="x_max", confidence=1.0),
+            ],
+        }
+    )
+    problem_path = tmp_path / "problem.json"
+    geometry_path = tmp_path / "geometry.confirmed.json"
+    output_path = tmp_path / "workflow_result.json"
+    problem_path.write_text(problem.model_dump_json(indent=2), encoding="utf-8")
+    geometry_path.write_text(confirmed_geometry.model_dump_json(indent=2), encoding="utf-8")
+
+    code = cli_main(
+        [
+            "workflow",
+            "resume-confirmed-geometry",
+            str(problem_path),
+            str(geometry_path),
+            "--output",
+            str(output_path),
+            "--taps-max-wall-time-seconds",
+            "30",
+        ]
+    )
+    stdout = capsys.readouterr().out
+    payload = json.loads(stdout)
+
+    assert code == 0
+    assert output_path.exists()
+    assert payload["geometry_id"] == "geometry:confirmed-workflow"
+    assert payload["verification_status"] in {"accepted", "accepted_with_warnings"}
+    assert any(step["name"] == "taps-agent.solve" for step in payload["trace"])
+
+
 def test_triangle_p1_assembler_uses_cell_gradients() -> None:
     stiffness, lumped_mass, total_area, elements = _assemble_triangle_stiffness(
         points=[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
@@ -4193,6 +5634,92 @@ def test_triangle_p3_elasticity_element_has_rigid_body_modes() -> None:
         assert internal_force == pytest.approx([0.0] * 20, abs=1e-9)
 
 
+def test_tetra_p1_elasticity_element_has_3d_rigid_body_modes() -> None:
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    stiffness, lumped_mass, total_volume, elements = _assemble_tetra_elasticity_stiffness(
+        points=points,
+        tetrahedra=[[0, 1, 2, 3]],
+        young_modulus=2.0,
+        poisson_ratio=0.25,
+    )
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert lumped_mass == pytest.approx([1.0 / 24.0] * 4)
+    assert len(stiffness) == 12
+    assert elements[0]["basis"] == "p1_vector_tetra"
+    local = elements[0]["local_stiffness"]
+    assert len(local) == 12
+    for i in range(12):
+        for j in range(12):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-12)
+
+    modes: list[list[float]] = []
+    for axis in range(3):
+        mode = []
+        for _ in points:
+            mode.extend([1.0 if component == axis else 0.0 for component in range(3)])
+        modes.append(mode)
+    rotation_x = []
+    rotation_y = []
+    rotation_z = []
+    for x, y, z in points:
+        rotation_x.extend([0.0, -z, y])
+        rotation_y.extend([z, 0.0, -x])
+        rotation_z.extend([-y, x, 0.0])
+    modes.extend([rotation_x, rotation_y, rotation_z])
+    for mode in modes:
+        internal_force = [sum(local[i][j] * mode[j] for j in range(12)) for i in range(12)]
+        assert internal_force == pytest.approx([0.0] * 12, abs=1e-12)
+
+
+def test_tetra_p2_elasticity_element_has_3d_rigid_body_modes() -> None:
+    points = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+    ]
+    stiffness, lumped_mass, total_volume, elements = _assemble_tetra_elasticity_stiffness(
+        points=points,
+        tetrahedra=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],
+        young_modulus=2.0,
+        poisson_ratio=0.25,
+    )
+    assert total_volume == pytest.approx(1.0 / 6.0)
+    assert sum(lumped_mass) == pytest.approx(1.0 / 6.0)
+    assert len(stiffness) == 30
+    assert elements[0]["basis"] == "p2_vector_tetra"
+    assert elements[0]["geometry"] == "isoparametric_quadratic_tetra"
+    local = elements[0]["local_stiffness"]
+    assert len(local) == 30
+    for i in range(30):
+        for j in range(30):
+            assert local[i][j] == pytest.approx(local[j][i], abs=1e-10)
+
+    modes: list[list[float]] = []
+    for axis in range(3):
+        mode = []
+        for _ in points:
+            mode.extend([1.0 if component == axis else 0.0 for component in range(3)])
+        modes.append(mode)
+    rotation_x = []
+    rotation_y = []
+    rotation_z = []
+    for x, y, z in points:
+        rotation_x.extend([0.0, -z, y])
+        rotation_y.extend([z, 0.0, -x])
+        rotation_z.extend([-y, x, 0.0])
+    modes.extend([rotation_x, rotation_y, rotation_z])
+    for mode in modes:
+        internal_force = [sum(local[i][j] * mode[j] for j in range(30)) for i in range(30)]
+        assert internal_force == pytest.approx([0.0] * 30, abs=1e-9)
+
+
 def test_mesh_graph_taps_solves_linear_elasticity() -> None:
     geometry = GeometrySpec(id="geometry:mesh-elasticity-square", source=GeometrySource(kind="generated"), dimension=2)
     mesh = generate_mesh(
@@ -4340,6 +5867,224 @@ def test_mesh_graph_taps_executes_custom_vector_elasticity_weak_form_ir() -> Non
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
     assert operator_payload["weak_form_blocks"]["operator_family"] == "vector_linear_elasticity"
     assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"strain_energy", "body_force"}
+
+
+def test_mesh_graph_taps_solves_tetra_linear_elasticity(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_elasticity_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-star",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [
+                    {
+                        "type": "tetra",
+                        "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-elasticity-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-elasticity-3d",
+        user_intent={"raw_request": "solve 3D small-strain linear elasticity on a tetrahedral mesh graph"},
+        domain="solid",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="vector")],
+        operators=[
+            OperatorSpec(
+                id="operator:elasticity",
+                name="Linear elasticity",
+                domain="solid",
+                equation_class="linear_elasticity",
+                form="weak",
+                fields_out=["u"],
+                source_terms=[{"expression": "body_force", "units": "N/m^3"}],
+            )
+        ],
+        materials=[
+            MaterialSpec(
+                id="material:tetra-solid",
+                name="tetra solid",
+                phase="solid",
+                properties=[
+                    MaterialProperty(name="young_modulus", value=8.0),
+                    MaterialProperty(name="poisson_ratio", value=0.25),
+                    MaterialProperty(name="body_force", value=[0.0, 0.0, -1.0]),
+                ],
+            )
+        ],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": [0.0, 0.0, 0.0]}],
+        targets=[{"name": "displacement", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert result.backend.startswith("taps:mesh_fem_linear_elasticity")
+    assert result.status == "success"
+    assert result.residuals["fem_tetrahedra"] == 4
+    assert result.residuals["fem_triangles"] == 0
+    assert result.residuals["fem_dofs"] == pytest.approx(3.0 * result.residuals["fem_nodes"])
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_elasticity_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    assert operator_payload["type"] == "tetra_p1_fem_linear_elasticity"
+    assert operator_payload["material"]["constitutive_model"] == "isotropic_3d"
+    assert operator_payload["material"]["body_force"] == pytest.approx([0.0, 0.0, -1.0])
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_displacement_field")
+    solution_payload = json.loads(Path(solution_artifact.uri).read_text(encoding="utf-8"))
+    assert solution_payload["components"] == ["ux", "uy", "uz"]
+    assert all(len(value) == 3 for value in solution_payload["values"])
+
+
+def test_mesh_graph_taps_solves_tetra10_linear_elasticity(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra10_elasticity_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra10",
+                "node_count": 10,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.5, 0.0, 0.0],
+                    [0.5, 0.5, 0.0],
+                    [0.0, 0.5, 0.0],
+                    [0.0, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                    [0.0, 0.5, 0.5],
+                ],
+                "edges": [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "cell_blocks": [{"type": "tetra10", "cells": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra10-elasticity-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra10-elasticity-3d",
+        user_intent={"raw_request": "solve second-order 3D small-strain linear elasticity on a tetrahedral mesh graph"},
+        domain="solid",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="vector")],
+        operators=[OperatorSpec(id="operator:elasticity", name="Linear elasticity", domain="solid", equation_class="linear_elasticity", form="weak", fields_out=["u"])],
+        materials=[
+            MaterialSpec(
+                id="material:tetra10-solid",
+                name="tetra10 solid",
+                phase="solid",
+                properties=[
+                    MaterialProperty(name="young_modulus", value=8.0),
+                    MaterialProperty(name="poisson_ratio", value=0.25),
+                    MaterialProperty(name="body_force", value=[0.0, 0.0, -1.0]),
+                ],
+            )
+        ],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": [0.0, 0.0, 0.0]}],
+        targets=[{"name": "displacement", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert result.backend.startswith("taps:mesh_fem_linear_elasticity")
+    assert result.status == "success"
+    assert result.residuals["fem_tetrahedra"] == 1
+    assert result.residuals["fem_basis_order"] == 2
+    assert result.residuals["fem_dofs"] == pytest.approx(30.0)
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_elasticity_operator")
+    operator_payload = json.loads(Path(operator_artifact.uri).read_text(encoding="utf-8"))
+    assert operator_payload["type"] == "tetra_p2_fem_linear_elasticity"
+    assert any(element["basis"] == "p2_vector_tetra" for element in operator_payload["elements"])
+
+
+def test_mesh_graph_tetra_elasticity_applies_nonzero_dirichlet_roles(tmp_path: Path) -> None:
+    mesh_graph_path = tmp_path / "tetra_elasticity_bc_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "source_mesh": "hand-built-tetra-star-bc",
+                "node_count": 5,
+                "points": [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.25, 0.25, 0.25],
+                ],
+                "edges": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [0, 4], [1, 4], [2, 4], [3, 4]],
+                "boundary_nodes": [0, 1, 2, 3],
+                "boundary_node_sets": {"x_min": [0, 2, 3], "x_max": [1]},
+                "cell_blocks": [
+                    {"type": "tetra", "cells": [[0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4]]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:tetra-elasticity-bc-mesh-graph",
+        source=GeometrySource(kind="generated"),
+        dimension=3,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = PhysicsProblem(
+        id="problem:mesh-tetra-elasticity-bc-3d",
+        user_intent={"raw_request": "solve 3D elasticity with nonzero displacement on x_max"},
+        domain="solid",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="vector")],
+        operators=[OperatorSpec(id="operator:elasticity", name="Linear elasticity", domain="solid", equation_class="linear_elasticity", form="weak", fields_out=["u"])],
+        materials=[MaterialSpec(id="material:bc-solid", name="bc solid", phase="solid", properties=[MaterialProperty(name="young_modulus", value=8.0), MaterialProperty(name="poisson_ratio", value=0.25)])],
+        boundary_conditions=[
+            BoundaryConditionSpec(id="bc:xmin", region_id="x_min", boundary_role="x_min", field="u", kind="dirichlet", value=[0.0, 0.0, 0.0]),
+            BoundaryConditionSpec(id="bc:xmax", region_id="x_max", boundary_role="x_max", field="u", kind="dirichlet", value=[0.1, 0.0, 0.0]),
+        ],
+        targets=[{"name": "displacement", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    numerical_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem, numerical_plan=numerical_plan)).result
+
+    assert result.status == "success"
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_displacement_field")
+    solution_payload = json.loads(Path(solution_artifact.uri).read_text(encoding="utf-8"))
+    assert solution_payload["values"][0] == pytest.approx([0.0, 0.0, 0.0])
+    assert solution_payload["values"][2] == pytest.approx([0.0, 0.0, 0.0])
+    assert solution_payload["values"][3] == pytest.approx([0.0, 0.0, 0.0])
+    assert solution_payload["values"][1] == pytest.approx([0.1, 0.0, 0.0])
+    assert solution_payload["boundary_values_applied"]["1"] == pytest.approx([0.1, 0.0, 0.0])
 
 
 def test_mesh_graph_taps_solves_p2_linear_elasticity() -> None:

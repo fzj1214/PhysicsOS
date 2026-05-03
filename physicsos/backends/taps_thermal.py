@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 from physicsos.config import project_root
-from physicsos.backends.taps_generic import weak_form_transient_diffusion_blocks
+from physicsos.backends.taps_generic import _boundary_position_from_role, _boundary_position, weak_form_transient_diffusion_blocks
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.taps import NumericalSolvePlanOutput, TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
 
@@ -64,6 +64,19 @@ def _plan_solver_number(plan: NumericalSolvePlanOutput | None, name: str, defaul
                 except ValueError:
                     return default
     return default
+
+
+def _dirichlet_values_1d(plan: NumericalSolvePlanOutput | None, field: str) -> dict[str, float]:
+    values = {"left": 0.0, "right": 0.0}
+    if plan is None:
+        return values
+    for binding in plan.boundary_condition_bindings:
+        if binding.kind.lower() != "dirichlet" or binding.field != field:
+            continue
+        position = _boundary_position_from_role(binding.boundary_role) or _boundary_position(binding.region_id)
+        if position in values and isinstance(binding.value, (float, int)):
+            values[position] = float(binding.value)
+    return values
 
 
 def solve_transient_heat_1d(
@@ -136,18 +149,15 @@ def solve_transient_heat_1d(
             "time_modes": time_modes,
         },
     }
+    field = numerical_plan.field_bindings.get("primary", "T") if numerical_plan is not None else "T"
     metadata_payload = {
         "equation": "dT/dt = alpha d2T/dx2",
         "weak_form_blocks": weak_form_blocks,
-        "field": numerical_plan.field_bindings.get("primary", "T") if numerical_plan is not None else "T",
+        "field": field,
         "initial_condition": "sin(pi x / L)",
         "boundary_condition": "T(0,t)=T(L,t)=0",
         "initial_condition_bindings": numerical_plan.initial_condition_bindings if numerical_plan is not None else [],
-        "boundary_values_applied": {
-            binding.region_id: binding.value
-            for binding in (numerical_plan.boundary_condition_bindings if numerical_plan is not None else [])
-            if binding.kind.lower() == "dirichlet"
-        },
+        "boundary_values_applied": _dirichlet_values_1d(numerical_plan, field),
         "coefficient_values_applied": {
             binding.name: binding.value
             for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])

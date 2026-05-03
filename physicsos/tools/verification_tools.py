@@ -156,6 +156,19 @@ class ValidateSelectedSlicesOutput(StrictBaseModel):
     artifact: ArtifactRef
 
 
+class CheckBoundaryConditionApplicationInput(StrictBaseModel):
+    problem: PhysicsProblem
+    result: SolverResult
+
+
+class CheckBoundaryConditionApplicationOutput(StrictBaseModel):
+    checked_boundaries: list[str] = Field(default_factory=list)
+    errors: dict[str, float] = Field(default_factory=dict)
+    missing_boundaries: list[str] = Field(default_factory=list)
+    passes: bool
+    artifact: ArtifactRef
+
+
 def _load_json_artifact(uri: str) -> dict | None:
     try:
         return json.loads(Path(uri).read_text(encoding="utf-8"))
@@ -174,6 +187,120 @@ def _solution_payload(result: SolverResult) -> dict | None:
         if payload is not None:
             return payload
     return None
+
+
+def _boundary_role_from_id(region_id: str) -> str | None:
+    lowered = region_id.lower().replace(" ", "").replace("-", "_")
+    pieces = [piece for piece in lowered.replace(":", "_").split("_") if piece]
+    if (
+        lowered in {"x=0", "x_min", "xmin", "x0", "left", "boundary:x_min", "boundary:left"}
+        or lowered.endswith(":x_min")
+        or "left" in pieces
+        or "x0" in pieces
+        or ("x" in pieces and "0" in pieces)
+    ):
+        return "x_min"
+    if (
+        lowered in {"x=l", "x=1", "x_max", "xmax", "x1", "right", "boundary:x_max", "boundary:right"}
+        or lowered.endswith(":x_max")
+        or "right" in pieces
+        or "x1" in pieces
+        or ("x" in pieces and "1" in pieces)
+    ):
+        return "x_max"
+    return None
+
+
+def _canonical_role(problem: PhysicsProblem, region_id: str, explicit_role: str | None = None) -> str | None:
+    if explicit_role is not None:
+        return explicit_role
+    for boundary in problem.geometry.boundaries:
+        if boundary.id == region_id and boundary.role is not None:
+            return boundary.role
+    return _boundary_role_from_id(region_id)
+
+
+def _boundary_artifact_key(role: str) -> str | None:
+    return {
+        "x_min": "left",
+        "x_max": "right",
+        "y_min": "bottom",
+        "y_max": "top",
+        "z_min": "front",
+        "z_max": "back",
+    }.get(role)
+
+
+def _boundary_artifact_keys(boundary_id: str, region_id: str, role: str | None) -> list[str]:
+    keys = [boundary_id, region_id]
+    if role:
+        keys.append(role)
+        legacy = _boundary_artifact_key(role)
+        if legacy:
+            keys.append(legacy)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in keys:
+        if key and key not in seen:
+            ordered.append(key)
+            seen.add(key)
+    return ordered
+
+
+def _numeric_error(actual: object, expected: object) -> float | None:
+    expected_values = _flatten_numbers(expected)
+    actual_values = _flatten_numbers(actual)
+    if not expected_values or len(expected_values) != len(actual_values):
+        return None
+    return max(abs(actual_value - expected_value) for actual_value, expected_value in zip(actual_values, expected_values))
+
+
+def check_boundary_condition_application(input: CheckBoundaryConditionApplicationInput) -> CheckBoundaryConditionApplicationOutput:
+    """Compare applied solver boundary values against the locked PhysicsProblem."""
+    payload = _solution_payload(input.result) or {}
+    applied = payload.get("boundary_values_applied")
+    checked: list[str] = []
+    errors: dict[str, float] = {}
+    missing: list[str] = []
+    if not isinstance(applied, dict):
+        missing = [boundary.id for boundary in input.problem.boundary_conditions if boundary.kind == "dirichlet"]
+    else:
+        for boundary in input.problem.boundary_conditions:
+            if boundary.kind != "dirichlet":
+                continue
+            role = _canonical_role(input.problem, boundary.region_id, boundary.boundary_role)
+            key = next((candidate for candidate in _boundary_artifact_keys(boundary.id, boundary.region_id, role) if candidate in applied), None)
+            if key is None:
+                missing.append(boundary.id)
+                continue
+            error = _numeric_error(applied.get(key), boundary.value)
+            if error is None:
+                missing.append(boundary.id)
+                continue
+            checked.append(boundary.id)
+            if error > 1e-9:
+                errors[boundary.id] = error
+    passes = not errors and not missing and bool(checked)
+    artifact = _write_verification_artifact(
+        input.problem.id,
+        "boundary_condition_application",
+        {
+            "result_id": input.result.id,
+            "backend": input.result.backend,
+            "applied_boundary_values": applied if isinstance(applied, dict) else None,
+            "checked_boundaries": checked,
+            "errors": errors,
+            "missing_boundaries": missing,
+            "passes": passes,
+        },
+    )
+    return CheckBoundaryConditionApplicationOutput(
+        checked_boundaries=checked,
+        errors=errors,
+        missing_boundaries=missing,
+        passes=passes,
+        artifact=artifact,
+    )
 
 
 def _flatten_numbers(value: object) -> list[float]:
@@ -334,6 +461,7 @@ for _tool, _input, _output in [
     (compute_physics_residuals, ComputePhysicsResidualsInput, ComputePhysicsResidualsOutput),
     (check_conservation_laws, CheckConservationLawsInput, CheckConservationLawsOutput),
     (validate_selected_slices, ValidateSelectedSlicesInput, ValidateSelectedSlicesOutput),
+    (check_boundary_condition_application, CheckBoundaryConditionApplicationInput, CheckBoundaryConditionApplicationOutput),
     (estimate_uncertainty, EstimateUncertaintyInput, EstimateUncertaintyOutput),
     (detect_ood_case, DetectOODCaseInput, DetectOODCaseOutput),
 ]:

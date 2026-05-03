@@ -25,11 +25,16 @@ from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
 from physicsos.config import load_config, runtime_paths
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
+from physicsos.schemas.common import ArtifactRef
+from physicsos.schemas.geometry import GeometrySpec
+from physicsos.schemas.problem import PhysicsProblem
+from physicsos.tools.geometry_tools import ApplyBoundaryLabelingArtifactInput, apply_boundary_labeling_artifact
+from physicsos.workflows.universal import run_physicsos_workflow
 
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "legacy-repl"}
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "workflow", "legacy-repl"}
 
 SUBAGENT_PROMPTS = {
     "geometry-mesh-agent": (
@@ -677,6 +682,24 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("paths")
     sub.add_parser("legacy-repl")
 
+    geometry = sub.add_parser("geometry")
+    geometry_sub = geometry.add_subparsers(dest="geometry_command", required=True)
+    apply_labels = geometry_sub.add_parser("apply-boundary-labels")
+    apply_labels.add_argument("geometry_json")
+    apply_labels.add_argument("labeling_artifact_json")
+    apply_labels.add_argument("--output")
+    apply_labels.add_argument("--replace-existing", action="store_true")
+
+    workflow = sub.add_parser("workflow")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+    resume_geometry = workflow_sub.add_parser("resume-confirmed-geometry")
+    resume_geometry.add_argument("problem_json")
+    resume_geometry.add_argument("geometry_json")
+    resume_geometry.add_argument("--output")
+    resume_geometry.add_argument("--use-knowledge", action="store_true")
+    resume_geometry.add_argument("--taps-rank", type=int, default=8)
+    resume_geometry.add_argument("--taps-max-wall-time-seconds", type=float, default=120.0)
+
     runner = sub.add_parser("runner")
     runner_sub = runner.add_subparsers(dest="runner_command", required=True)
     submit = runner_sub.add_parser("submit")
@@ -713,6 +736,61 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "paths":
         _print_json(_paths_payload())
         return 0
+
+    if args.command == "geometry":
+        if args.geometry_command == "apply-boundary-labels":
+            geometry_path = Path(args.geometry_json)
+            labeling_path = Path(args.labeling_artifact_json)
+            geometry_payload = json.loads(geometry_path.read_text(encoding="utf-8"))
+            geometry_spec = GeometrySpec.model_validate(geometry_payload)
+            result = apply_boundary_labeling_artifact(
+                ApplyBoundaryLabelingArtifactInput(
+                    geometry=geometry_spec,
+                    labeling_artifact=ArtifactRef(uri=str(labeling_path), kind="boundary_labeling_artifact", format="json"),
+                    replace_existing=args.replace_existing,
+                )
+            )
+            output_path = Path(args.output) if args.output else geometry_path.with_name(f"{geometry_path.stem}.confirmed{geometry_path.suffix}")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.geometry.model_dump_json(indent=2), encoding="utf-8")
+            _print_json(
+                {
+                    "geometry": str(output_path),
+                    "applied": result.applied,
+                    "warnings": result.warnings,
+                    "boundary_count": len(result.geometry.boundaries),
+                }
+            )
+            return 0
+
+    if args.command == "workflow":
+        if args.workflow_command == "resume-confirmed-geometry":
+            problem_path = Path(args.problem_json)
+            geometry_path = Path(args.geometry_json)
+            problem = PhysicsProblem.model_validate_json(problem_path.read_text(encoding="utf-8"))
+            geometry = GeometrySpec.model_validate_json(geometry_path.read_text(encoding="utf-8"))
+            resumed_problem = problem.model_copy(update={"geometry": geometry})
+            result = run_physicsos_workflow(
+                problem=resumed_problem,
+                use_knowledge=args.use_knowledge,
+                taps_rank=args.taps_rank,
+                taps_max_wall_time_seconds=args.taps_max_wall_time_seconds,
+            )
+            output_path = Path(args.output) if args.output else problem_path.with_name(f"{problem_path.stem}.workflow_result.json")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            _print_json(
+                {
+                    "workflow_result": str(output_path),
+                    "run_id": result.run_id,
+                    "problem_id": result.problem.id,
+                    "geometry_id": result.problem.geometry.id,
+                    "trace": [step.model_dump(mode="json") for step in result.trace],
+                    "verification_status": result.verification.status if result.verification is not None else None,
+                    "recommended_next_action": result.verification.recommended_next_action if result.verification is not None else None,
+                }
+            )
+            return 0
 
     if args.command == "runner":
         client = FoamVMClient.from_config()

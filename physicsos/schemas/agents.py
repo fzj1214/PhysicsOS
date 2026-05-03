@@ -12,7 +12,7 @@ from physicsos.schemas.mesh import MeshQualityReport, MeshSpec
 from physicsos.schemas.postprocess import PostprocessResult
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverDecision, SolverResult
-from physicsos.schemas.taps import TAPSCompilationPlan, TAPSProblem, TAPSResidualReport, TAPSSupportScore
+from physicsos.schemas.taps import NumericalSolvePlanOutput, TAPSCompilationPlan, TAPSProblem, TAPSResidualReport, TAPSSupportScore
 from physicsos.schemas.verification import VerificationReport
 from physicsos.tools.memory_tools import CaseMemoryContext, StoreCaseResultOutput
 
@@ -94,6 +94,7 @@ class TAPSAgentOutput(StrictBaseModel):
     support: TAPSSupportScore
     compilation_plan: TAPSCompilationPlan | None = None
     taps_problem: TAPSProblem | None = None
+    numerical_plan: NumericalSolvePlanOutput | None = None
     contract_review: ContractReviewReport | None = None
     result: SolverResult | None = None
     residual: TAPSResidualReport | None = None

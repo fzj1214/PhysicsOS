@@ -15,6 +15,7 @@ from physicsos.backends.taps_generic import SUPPORTED_FAMILIES as GENERIC_TAPS_F
 from physicsos.backends.taps_generic import solve_coupled_reaction_diffusion_2d
 from physicsos.backends.taps_generic import solve_graph_poisson
 from physicsos.backends.taps_generic import solve_mesh_fem_em_curl_curl
+from physicsos.backends.taps_generic import solve_mesh_fem_hdiv_div
 from physicsos.backends.taps_generic import solve_mesh_fem_linear_elasticity
 from physicsos.backends.taps_generic import solve_mesh_fem_poisson
 from physicsos.backends.taps_generic import solve_navier_stokes_channel_2d
@@ -22,10 +23,12 @@ from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_1
 from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_2d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_1d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_2d
+from physicsos.backends.taps_generic import solve_scalar_elliptic_3d
 from physicsos.backends.taps_generic import solve_oseen_channel_2d
 from physicsos.backends.taps_generic import solve_stokes_channel_2d
 from physicsos.backends.taps_generic import supports_coupled_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_hcurl_curl_curl_weak_form
+from physicsos.backends.taps_generic import supports_hdiv_div_weak_form
 from physicsos.backends.taps_generic import supports_mesh_navier_stokes_bridge
 from physicsos.backends.taps_generic import supports_nonlinear_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_navier_stokes_weak_form
@@ -435,7 +438,7 @@ def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: Knowledg
                         expression="int_Omega epsilon(v)^T C(E, nu) epsilon(u) dOmega",
                         fields=operator.fields_out or fields,
                         coefficients=["E", "nu", "constitutive_model"],
-                        assumptions=["Small-strain 2D linear elasticity; default executable kernel uses plane stress."],
+                        assumptions=["Small-strain linear elasticity; triangle meshes use plane stress/strain and tetrahedral meshes use 3D isotropic elasticity."],
                     ),
                     TAPSEquationTerm(
                         id=f"{operator.id}:body_force",
@@ -470,6 +473,35 @@ def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: Knowledg
                         expression="- int_Omega v dot J dOmega",
                         fields=operator.fields_out or fields,
                         coefficients=["current_source", "J"],
+                    ),
+                ]
+            )
+        elif operator_family in {"hdiv", "div", "darcy", "mixed_poisson"}:
+            flux_field = (operator.fields_out or fields or ["q"])[0]
+            test_field = f"v_{flux_field}"
+            terms.extend(
+                [
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:rt_mass",
+                        role="mass",
+                        expression=f"int_Omega K^-1 {test_field} dot {flux_field} dOmega",
+                        fields=operator.fields_out or fields,
+                        coefficients=["permeability", "K"],
+                        assumptions=["Executable local kernel uses tetrahedral RT0 face-flux H(div) scaffold DOFs."],
+                    ),
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:divergence",
+                        role="diffusion",
+                        expression=f"int_Omega div({test_field}) div({flux_field}) dOmega",
+                        fields=operator.fields_out or fields,
+                        coefficients=[],
+                    ),
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:source",
+                        role="source",
+                        expression=f"- int_Omega source div({test_field}) dOmega",
+                        fields=operator.fields_out or fields,
+                        coefficients=["source"],
                     ),
                 ]
             )
@@ -686,6 +718,7 @@ def _compile_taps_boundary_conditions(problem: PhysicsProblem) -> list[TAPSBound
         TAPSBoundaryConditionSpec(
             id=boundary.id,
             region_id=boundary.region_id,
+            boundary_role=boundary.boundary_role or _canonical_boundary_role(boundary.region_id),
             field=boundary.field,
             kind=boundary.kind,
             value=boundary.value,
@@ -694,6 +727,28 @@ def _compile_taps_boundary_conditions(problem: PhysicsProblem) -> list[TAPSBound
         )
         for boundary in problem.boundary_conditions
     ]
+
+
+def _canonical_boundary_role(region_id: str) -> str | None:
+    lowered = region_id.lower().replace(" ", "").replace("-", "_")
+    pieces = [piece for piece in lowered.replace(":", "_").split("_") if piece]
+    if (
+        lowered in {"x=0", "x_min", "xmin", "x0", "left", "boundary:x_min", "boundary:left"}
+        or lowered.endswith(":x_min")
+        or "left" in pieces
+        or "x0" in pieces
+        or ("x" in pieces and "0" in pieces)
+    ):
+        return "x_min"
+    if (
+        lowered in {"x=l", "x=1", "x_max", "xmax", "x1", "right", "boundary:x_max", "boundary:right"}
+        or lowered.endswith(":x_max")
+        or "right" in pieces
+        or "x1" in pieces
+        or ("x" in pieces and "1" in pieces)
+    ):
+        return "x_max"
+    return None
 
 
 def build_taps_problem(input: BuildTAPSProblemInput) -> BuildTAPSProblemOutput:
@@ -736,7 +791,7 @@ def build_taps_problem(input: BuildTAPSProblemInput) -> BuildTAPSProblemOutput:
         assumptions=[
             "TAPSProblem generated from PhysicsProblem.",
             "TAPS-agent must use knowledge-agent to fill missing weak forms before high-trust solve.",
-            "Current executable kernels support 1D transient heat, 1D/2D scalar elliptic weak forms, 1D/2D nonlinear reaction-diffusion, 2-field 2D coupled reaction-diffusion, mesh P1/P2/P3 2D linear elasticity, and mesh first-order Nedelec EM curl-curl.",
+            "Current executable kernels support 1D transient heat, 1D/2D/3D scalar elliptic weak forms, 1D/2D nonlinear reaction-diffusion, 2-field 2D coupled reaction-diffusion, mesh P1/P2 3D tetra scalar Poisson with Dirichlet lifting, mesh P1/P2/P3 2D triangle linear elasticity, mesh P1/P2 3D tetra linear elasticity with Dirichlet lifting, and mesh first-order Nedelec EM curl-curl.",
             "Geometry encodings are carried into TAPSProblem and executable kernels consume occupancy masks when available.",
             *plan.assumptions,
         ],
@@ -861,16 +916,19 @@ def plan_numerical_solve(input: NumericalSolvePlanInput) -> NumericalSolvePlanOu
     is_coupled_reaction = "coupled_reaction_diffusion" in operator_classes or supports_coupled_reaction_diffusion_weak_form(taps_problem)
     is_vector_elasticity = bool(operator_classes.intersection({"elasticity", "linear_elasticity"})) or supports_vector_elasticity_weak_form(taps_problem)
     is_hcurl_curl_curl = bool(operator_classes.intersection({"maxwell", "curl_curl", "electromagnetic"})) or supports_hcurl_curl_curl_weak_form(taps_problem)
+    is_hdiv_div = bool(operator_classes.intersection({"hdiv", "div", "darcy", "mixed_poisson"})) or supports_hdiv_div_weak_form(taps_problem)
     is_oseen = supports_oseen_weak_form(taps_problem)
     is_navier_stokes = supports_navier_stokes_weak_form(taps_problem)
     is_stokes = supports_stokes_weak_form(taps_problem)
     is_nonlinear_reaction = "reaction_diffusion" in operator_classes or (
         supports_nonlinear_reaction_diffusion_weak_form(taps_problem)
     )
+    has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings)
     boundary_bindings = [
         NumericalBoundaryConditionBinding(
             id=boundary.id,
             region_id=boundary.region_id,
+            boundary_role=boundary.boundary_role or _canonical_boundary_role(boundary.region_id),
             field=boundary.field,
             kind=boundary.kind,
             value=boundary.value,
@@ -886,8 +944,12 @@ def plan_numerical_solve(input: NumericalSolvePlanInput) -> NumericalSolvePlanOu
         solver_family = "incompressible_stokes_channel_2d"
     elif is_hcurl_curl_curl:
         solver_family = "mesh_fem_em_curl_curl"
+    elif is_hdiv_div and has_mesh_graph:
+        solver_family = "mesh_fem_hdiv_div"
     elif is_vector_elasticity:
         solver_family = "mesh_fem_linear_elasticity"
+    elif has_mesh_graph and family in {"poisson", "diffusion", "thermal_diffusion"}:
+        solver_family = "mesh_fem_poisson"
     elif len(space_axes) == 1 and field and is_transient_diffusion:
         solver_family = "transient_diffusion_1d"
     elif len(space_axes) == 2 and len(problem.fields) >= 2 and is_coupled_reaction:
@@ -900,17 +962,22 @@ def plan_numerical_solve(input: NumericalSolvePlanInput) -> NumericalSolvePlanOu
         solver_family = "scalar_elliptic_1d"
     elif len(space_axes) == 2 and field:
         solver_family = "scalar_elliptic_2d"
+    elif len(space_axes) == 3 and field:
+        solver_family = "scalar_elliptic_3d"
     else:
         solver_family = family
     ready_families = {
         "scalar_elliptic_1d",
         "scalar_elliptic_2d",
+        "scalar_elliptic_3d",
         "nonlinear_reaction_diffusion_1d",
         "nonlinear_reaction_diffusion_2d",
         "coupled_reaction_diffusion_2d",
         "transient_diffusion_1d",
+        "mesh_fem_poisson",
         "mesh_fem_linear_elasticity",
         "mesh_fem_em_curl_curl",
+        "mesh_fem_hdiv_div",
         "incompressible_stokes_channel_2d",
         "incompressible_oseen_channel_2d",
         "incompressible_navier_stokes_channel_2d",
@@ -975,6 +1042,20 @@ def plan_numerical_solve(input: NumericalSolvePlanInput) -> NumericalSolvePlanOu
             ("relative_permittivity", {"eps_r", "epsilon_r", "relative_permittivity", "permittivity"}, 1.0),
             ("wave_number", {"k0", "k", "wave_number", "wavenumber"}, 0.5),
             ("source_amplitude", {"source", "current_source", "jz"}, 1.0),
+        ]:
+            value, source_name, units = _coefficient_raw_value(problem, names, default)
+            role = "source" if output_name == "source_amplitude" else "operator"
+            coefficient_bindings.append(NumericalCoefficientBinding(name=output_name, role=role, value=value, source_name=source_name, units=units))
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="max_iterations", role="solver", value=5000, source_name="deterministic_fallback"),
+                NumericalCoefficientBinding(name="tolerance", role="solver", value=1e-8, source_name="deterministic_fallback"),
+            ]
+        )
+    if solver_family == "mesh_fem_hdiv_div":
+        for output_name, names, default in [
+            ("permeability", {"permeability", "hydraulic_conductivity", "k"}, 1.0),
+            ("source_amplitude", {"source", "rhs", "forcing", "sink"}, 1.0),
         ]:
             value, source_name, units = _coefficient_raw_value(problem, names, default)
             role = "source" if output_name == "source_amplitude" else "operator"
@@ -1058,7 +1139,14 @@ def validate_numerical_solve_plan(input: ValidateNumericalSolvePlanInput) -> Val
     if plan.backend_target != "taps":
         errors.append(f"Unsupported backend_target={plan.backend_target!r} for run_taps_backend.")
     if plan.status != "ready":
-        errors.append(f"Numerical solve plan is not ready: status={plan.status}.")
+        if plan.status in {"fallback_required", "unsupported"}:
+            if not plan.unsupported_reasons:
+                errors.append(f"Numerical solve plan status={plan.status} must include unsupported_reasons.")
+            if plan.status == "fallback_required" and not plan.fallback_decision:
+                errors.append("fallback_required numerical solve plan must include fallback_decision.")
+        else:
+            errors.append(f"Numerical solve plan is not ready: status={plan.status}.")
+        return ValidateNumericalSolvePlanOutput(valid=not errors, errors=errors, warnings=warnings)
     fields = {field.name for field in problem.fields}
     if plan.solver_family.startswith("incompressible_"):
         primary_field = plan.field_bindings.get("velocity")
@@ -1076,17 +1164,29 @@ def validate_numerical_solve_plan(input: ValidateNumericalSolvePlanInput) -> Val
         elif fields and primary_field not in fields:
             errors.append(f"Numerical primary field {primary_field!r} is not in PhysicsProblem fields {sorted(fields)}.")
     bc_by_id = {boundary.id: boundary for boundary in problem.boundary_conditions}
+    geometry_boundary_roles = {boundary.id: boundary.role for boundary in problem.geometry.boundaries if boundary.role is not None}
     for binding in plan.boundary_condition_bindings:
         source = bc_by_id.get(binding.id)
         if source is None:
             errors.append(f"Numerical solve plan invented boundary condition {binding.id!r}.")
             continue
+        source_role = source.boundary_role or geometry_boundary_roles.get(source.region_id) or _canonical_boundary_role(source.region_id)
         if binding.field != source.field or binding.kind != source.kind or binding.region_id != source.region_id or binding.value != source.value:
             errors.append(f"Boundary binding {binding.id!r} does not preserve PhysicsProblem boundary condition.")
+        if binding.boundary_role != source_role:
+            errors.append(
+                f"Boundary binding {binding.id!r} role {binding.boundary_role!r} does not preserve canonical role {source_role!r}."
+            )
     if any(boundary.kind.lower() == "dirichlet" for boundary in problem.boundary_conditions):
         dirichlet_bindings = [binding for binding in plan.boundary_condition_bindings if binding.kind.lower() == "dirichlet"]
         if len(dirichlet_bindings) < 2 and plan.solver_family == "scalar_elliptic_1d":
             warnings.append("1D scalar elliptic plan has fewer than two Dirichlet bindings; defaults may be underconstrained.")
+        if plan.solver_family == "scalar_elliptic_1d":
+            roles = {binding.boundary_role for binding in dirichlet_bindings}
+            if not {"x_min", "x_max"}.issubset(roles):
+                errors.append("1D scalar elliptic plan requires canonical Dirichlet boundary_role values x_min and x_max.")
+            if len(dirichlet_bindings) != 2:
+                errors.append("1D scalar elliptic executable kernel currently requires exactly two Dirichlet endpoint bindings.")
     if not any(binding.role == "diffusion" for binding in plan.coefficient_bindings):
         errors.append("Numerical solve plan must bind a diffusion coefficient for scalar elliptic execution.")
     if plan.solver_family.startswith("nonlinear_reaction_diffusion"):
@@ -1126,12 +1226,23 @@ def validate_numerical_solve_plan(input: ValidateNumericalSolvePlanInput) -> Val
                 errors.append(f"Mesh FEM linear-elasticity numerical solve plan must bind {required}.")
         if not any(binding.name == "body_force" for binding in plan.coefficient_bindings):
             warnings.append("Mesh FEM linear-elasticity plan did not bind body_force; deterministic default may be used.")
+    if plan.solver_family == "mesh_fem_poisson":
+        if not any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings):
+            errors.append("Mesh FEM Poisson plan requires a mesh_graph geometry encoding.")
+        if not any(binding.role == "diffusion" for binding in plan.coefficient_bindings):
+            errors.append("Mesh FEM Poisson numerical solve plan must bind diffusion.")
     if plan.solver_family == "mesh_fem_em_curl_curl":
         if not any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings):
             errors.append("Mesh FEM EM curl-curl plan requires a mesh_graph geometry encoding.")
         for required in {"relative_permeability", "relative_permittivity", "wave_number", "source_amplitude"}:
             if not any(binding.name == required for binding in plan.coefficient_bindings):
                 errors.append(f"Mesh FEM EM curl-curl numerical solve plan must bind {required}.")
+    if plan.solver_family == "mesh_fem_hdiv_div":
+        if not any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings):
+            errors.append("Mesh FEM H(div) plan requires a mesh_graph geometry encoding.")
+        for required in {"permeability", "source_amplitude"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Mesh FEM H(div) numerical solve plan must bind {required}.")
     if plan.solver_family in {"incompressible_stokes_channel_2d", "incompressible_oseen_channel_2d", "incompressible_navier_stokes_channel_2d"}:
         for required in {"dynamic_viscosity", "pressure_drop"}:
             if not any(binding.name == required for binding in plan.coefficient_bindings):
@@ -1160,6 +1271,33 @@ def plan_numerical_solve_structured(
     config: CoreAgentLLMConfig | None = None,
 ) -> NumericalSolvePlanOutput:
     """LLM-backed numerical solve planning with strict Pydantic validation."""
+    def semantic_errors(plan: NumericalSolvePlanOutput) -> list[str]:
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(
+                problem=input.problem,
+                taps_problem=input.taps_problem,
+                plan=plan,
+                problem_contract=input.problem_contract,
+            )
+        )
+        return validation.errors
+
+    def retry_feedback(plan: NumericalSolvePlanOutput, errors: list[str]) -> list[str]:
+        context = {
+            "instruction": (
+                "Repair only the invalid NumericalSolvePlanOutput. Preserve the locked PhysicsProblemContract, "
+                "PhysicsProblem ids, fields, coefficients, boundary ids, boundary roles, values, units, and selected "
+                "solver_family unless an explicit fallback_required decision is necessary."
+            ),
+            "errors": errors,
+            "invalid_plan": plan.model_dump(mode="json"),
+            "problem_contract": input.problem_contract.model_dump(mode="json") if input.problem_contract is not None else None,
+            "physics_problem": input.problem.model_dump(mode="json"),
+            "taps_problem": input.taps_problem.model_dump(mode="json"),
+            "compilation_plan": input.compilation_plan.model_dump(mode="json") if input.compilation_plan is not None else None,
+        }
+        return [json.dumps(context, ensure_ascii=False)]
+
     result = call_structured_agent(
         agent_name="numerical-solve-planning-agent",
         input_model=input,
@@ -1167,9 +1305,31 @@ def plan_numerical_solve_structured(
         system_prompt=NUMERICAL_SOLVE_PLAN_SYSTEM_PROMPT,
         client=client,
         config=config,
+        semantic_validator=semantic_errors,
+        semantic_feedback_builder=retry_feedback,
     )
     if result.output is not None:
         return result.output
+    last_parsed_plan: NumericalSolvePlanOutput | None = None
+    for attempt in reversed(result.attempts):
+        if attempt.parsed is None:
+            continue
+        try:
+            last_parsed_plan = NumericalSolvePlanOutput.model_validate(attempt.parsed)
+            break
+        except Exception:
+            continue
+    if last_parsed_plan is not None:
+        validation_errors = result.attempts[-1].validation_errors if result.attempts else []
+        return last_parsed_plan.model_copy(
+            update={
+                "warnings": [
+                    *last_parsed_plan.warnings,
+                    "Structured LLM numerical solve planning exhausted semantic validation retries; plan was preserved for workflow validation instead of deterministic fallback.",
+                    *(validation_errors or [result.error or "Structured numerical solve planner returned no validated output."]),
+                ]
+            }
+        )
     fallback = plan_numerical_solve(input)
     return fallback.model_copy(
         update={
@@ -1735,26 +1895,43 @@ def plan_backend_preparation_structured(
     config: CoreAgentLLMConfig | None = None,
 ) -> BackendPreparationPlanOutput:
     """LLM-backed backend preparation planning with semantic validation and fallback."""
-    cfg = config or CoreAgentLLMConfig()
-    max_attempts = max(1, cfg.max_structured_attempts)
-    semantic_feedback: list[str] = []
-    attempts_remaining = max_attempts
-    while attempts_remaining > 0:
-        result = call_structured_agent(
-            agent_name="backend-preparation-planning-agent",
-            input_model=input,
-            output_model=BackendPreparationPlanOutput,
-            system_prompt=(
-                BACKEND_PREPARATION_PLAN_SYSTEM_PROMPT
-                + ("\nPrevious semantic validation errors:\n" + "\n".join(semantic_feedback) if semantic_feedback else "")
-            ),
-            client=client,
-            config=cfg.model_copy(update={"max_structured_attempts": 1}),
+    def semantic_errors(plan: BackendPreparationPlanOutput) -> list[str]:
+        validation = validate_backend_preparation_plan(
+            ValidateBackendPreparationPlanInput(
+                problem=input.problem,
+                taps_problem=input.taps_problem,
+                plan=plan,
+                mesh_export_manifest=input.mesh_export_manifest,
+            )
         )
-        attempts_remaining -= 1
-        if result.output is None:
-            semantic_feedback = [result.error or "Structured backend preparation planner returned no validated output."]
-            continue
+        return validation.errors
+
+    def retry_feedback(plan: BackendPreparationPlanOutput, errors: list[str]) -> list[str]:
+        context = {
+            "instruction": (
+                "Repair only the invalid BackendPreparationPlanOutput. Preserve no-execute approval gates, "
+                "PhysicsProblem boundary ids, TAPS coefficient names, mesh export manifest requirements, and target backend. "
+                "Do not enable external execution."
+            ),
+            "errors": errors,
+            "invalid_plan": plan.model_dump(mode="json"),
+            "physics_problem": input.problem.model_dump(mode="json"),
+            "taps_problem": input.taps_problem.model_dump(mode="json"),
+            "mesh_export_manifest": input.mesh_export_manifest,
+        }
+        return [json.dumps(context, ensure_ascii=False)]
+
+    result = call_structured_agent(
+        agent_name="backend-preparation-planning-agent",
+        input_model=input,
+        output_model=BackendPreparationPlanOutput,
+        system_prompt=BACKEND_PREPARATION_PLAN_SYSTEM_PROMPT,
+        client=client,
+        config=config,
+        semantic_validator=semantic_errors,
+        semantic_feedback_builder=retry_feedback,
+    )
+    if result.output is not None:
         validation = validate_backend_preparation_plan(
             ValidateBackendPreparationPlanInput(
                 problem=input.problem,
@@ -1763,18 +1940,16 @@ def plan_backend_preparation_structured(
                 mesh_export_manifest=input.mesh_export_manifest,
             )
         )
-        if validation.valid:
-            return result.output.model_copy(
-                update={"warnings": [*result.output.warnings, *validation.warnings]}
-            )
-        semantic_feedback = validation.errors
+        return result.output.model_copy(
+            update={"warnings": [*result.output.warnings, *validation.warnings]}
+        )
     fallback = plan_backend_preparation(input)
     return fallback.model_copy(
         update={
             "assumptions": [
                 *fallback.assumptions,
                 "Structured LLM backend preparation planning failed validation; deterministic fallback was used.",
-                *semantic_feedback,
+                result.error or "Structured backend preparation planner returned no validated output.",
             ]
         }
     )
@@ -2013,6 +2188,7 @@ def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in input.taps_problem.geometry_encodings)
     is_coupled_reaction_diffusion_ir = supports_coupled_reaction_diffusion_weak_form(input.taps_problem)
     is_hcurl_curl_curl_ir = supports_hcurl_curl_curl_weak_form(input.taps_problem)
+    is_hdiv_div_ir = supports_hdiv_div_weak_form(input.taps_problem)
     is_nonlinear_reaction_diffusion_ir = supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem)
     is_navier_stokes_ir = supports_navier_stokes_weak_form(input.taps_problem)
     is_oseen_ir = supports_oseen_weak_form(input.taps_problem)
@@ -2162,6 +2338,40 @@ def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
+    if (family in {"hdiv", "div", "darcy", "mixed_poisson"} or is_hdiv_div_ir) and has_mesh_graph:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for mesh FEM H(div): " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("mesh_fem_hdiv_div", lambda: solve_mesh_fem_hdiv_div(input.taps_problem, numerical_plan=numerical_plan))
+        artifact_refs = []
+        artifact_refs.extend(artifacts.factor_matrices)
+        if artifacts.reconstruction_metadata is not None:
+            artifact_refs.append(artifacts.reconstruction_metadata)
+        if artifacts.residual_history is not None:
+            artifact_refs.append(artifacts.residual_history)
+        result = SolverResult(
+            id=f"result:{input.taps_problem.id}",
+            problem_id=input.problem.id,
+            backend=f"taps:{'weak_ir' if family not in {'hdiv', 'div', 'darcy', 'mixed_poisson'} else 'mesh_fem'}_hdiv_div:{family}",
+            status="success" if residual_report.converged else "needs_review",
+            scalar_outputs={
+                "message": "Tetrahedral RT0 H(div) face-flux scaffold kernel executed from reusable divergence/mass/source blocks.",
+                "equation_family": family,
+                "weak_form_ir_blocks": is_hdiv_div_ir,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
+                **residual_report.residuals,
+            },
+            residuals=residual_report.residuals,
+            artifacts=artifact_refs,
+            provenance=Provenance(created_by="run_taps_backend", source="taps_mesh_fem_hdiv_div"),
+        )
+        return RunTAPSBackendOutput(result=result)
+
     if (family in {"elasticity", "linear_elasticity"} or is_vector_elasticity_ir) and has_mesh_graph:
         numerical_plan = input.numerical_plan or plan_numerical_solve(
             NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
@@ -2197,11 +2407,19 @@ def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if family in {"poisson", "diffusion", "thermal_diffusion"} and has_mesh_graph:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for mesh FEM Poisson: " + "; ".join(validation.errors))
         source = "taps_mesh_fem_poisson"
         backend = f"taps:mesh_fem_poisson:{family}"
-        message = "Triangle P1/P2 FEM-like TAPS Poisson kernel executed on mesh_graph geometry encoding."
+        message = "Mesh FEM TAPS Poisson kernel executed on mesh_graph geometry encoding."
         try:
-            artifacts, residual_report = call_with_budget("mesh_fem_poisson", lambda: solve_mesh_fem_poisson(input.taps_problem))
+            artifacts, residual_report = call_with_budget("mesh_fem_poisson", lambda: solve_mesh_fem_poisson(input.taps_problem, numerical_plan=numerical_plan))
         except ValueError:
             source = "taps_graph_poisson"
             backend = f"taps:graph_poisson:{family}"
@@ -2221,6 +2439,7 @@ def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
             scalar_outputs={
                 "message": message,
                 "equation_family": family,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -2420,6 +2639,44 @@ def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         )
         return RunTAPSBackendOutput(result=result)
 
+    if (family in GENERIC_TAPS_FAMILIES or is_scalar_elliptic_ir) and space_axis_count == 3:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        plan_validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not plan_validation.valid:
+            raise ValueError("Numerical solve plan validation failed: " + "; ".join(plan_validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "scalar_elliptic_3d",
+            lambda: solve_scalar_elliptic_3d(input.taps_problem, numerical_plan=numerical_plan),
+        )
+        artifact_refs = []
+        artifact_refs.extend(artifacts.factor_matrices)
+        if artifacts.reconstruction_metadata is not None:
+            artifact_refs.append(artifacts.reconstruction_metadata)
+        if artifacts.residual_history is not None:
+            artifact_refs.append(artifacts.residual_history)
+        result = SolverResult(
+            id=f"result:{input.taps_problem.id}",
+            problem_id=input.problem.id,
+            backend=f"taps:{'weak_ir' if family not in GENERIC_TAPS_FAMILIES else 'generic'}_scalar_elliptic_3d:{family}",
+            status="success" if residual_report.converged else "needs_review",
+            scalar_outputs={
+                "message": "TAPS scalar 3D structured-grid weak-form kernel executed from reusable diffusion/reaction/source blocks.",
+                "equation_family": family,
+                "weak_form_ir_blocks": is_scalar_elliptic_ir,
+                "tensor_rank": residual_report.rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
+                **residual_report.residuals,
+            },
+            residuals=residual_report.residuals,
+            artifacts=artifact_refs,
+            provenance=Provenance(created_by="run_taps_backend", source="taps_generic_scalar_elliptic_3d"),
+        )
+        return RunTAPSBackendOutput(result=result)
+
     result = SolverResult(
         id=f"result:{input.taps_problem.id}",
         problem_id=input.problem.id,
@@ -2469,7 +2726,10 @@ def estimate_taps_residual(input: EstimateTAPSResidualInput) -> EstimateTAPSResi
             recommended_action = "accept" if converged else "refine_axes"
         elif "normalized_linear_residual" in input.result.residuals:
             normalized = input.result.residuals["normalized_linear_residual"]
-            tolerance = 1e-8 if input.result.residuals.get("masked_relaxation_iterations", 0.0) else 1e-10
+            tolerance = 1e-8 if (
+                input.result.residuals.get("masked_relaxation_iterations", 0.0)
+                or input.result.residuals.get("structured_grid_iterations", 0.0)
+            ) else 1e-10
             converged = normalized < tolerance
             recommended_action = "accept" if converged else "refine_axes"
         elif "normalized_graph_residual" in input.result.residuals:

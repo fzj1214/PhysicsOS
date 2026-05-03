@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field
 
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
+from physicsos.schemas.geometry import BoundaryRole
 
 
 class TAPSAxisSpec(StrictBaseModel):
@@ -64,6 +65,7 @@ class TAPSCoefficientSpec(StrictBaseModel):
 class TAPSBoundaryConditionSpec(StrictBaseModel):
     id: str
     region_id: str
+    boundary_role: BoundaryRole | None = None
     field: str
     kind: str
     value: float | int | str | list[float] | dict
@@ -192,6 +194,7 @@ class NumericalCoefficientBinding(StrictBaseModel):
 class NumericalBoundaryConditionBinding(StrictBaseModel):
     id: str
     region_id: str
+    boundary_role: BoundaryRole | None = None
     field: str
     kind: str
     value: float | int | str | list[float] | dict

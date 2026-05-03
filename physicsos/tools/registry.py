@@ -39,7 +39,7 @@ from physicsos.tools.postprocess_tools import (
     plan_postprocess_structured,
     write_simulation_report,
 )
-from physicsos.tools.problem_tools import build_physics_problem, validate_physics_problem
+from physicsos.tools.problem_tools import build_physics_problem, canonicalize_physics_problem, validate_physics_problem
 from physicsos.tools.solver_tools import estimate_solver_support, prepare_full_solver_case, prepare_openfoam_runner_manifest, route_solver_backend, run_full_solver, run_hybrid_solver, run_surrogate_solver, submit_full_solver_job
 from physicsos.tools.surrogate_tools import (
     estimate_surrogate_support,
@@ -48,7 +48,7 @@ from physicsos.tools.surrogate_tools import (
     run_surrogate_inference,
 )
 from physicsos.tools.taps_tools import author_taps_runtime_extension, build_taps_problem, estimate_taps_residual, estimate_taps_support, export_taps_backend_bridge, formulate_taps_equation, plan_backend_preparation, plan_backend_preparation_structured, plan_numerical_solve, plan_numerical_solve_structured, plan_taps_adaptive_fallback, prepare_taps_backend_case_bundle, run_taps_backend, validate_backend_preparation_plan, validate_numerical_solve_plan, validate_taps_ir
-from physicsos.tools.verification_tools import check_conservation_laws, compute_physics_residuals, detect_ood_case, estimate_uncertainty, validate_selected_slices
+from physicsos.tools.verification_tools import check_boundary_condition_application, check_conservation_laws, compute_physics_residuals, detect_ood_case, estimate_uncertainty, validate_selected_slices
 from physicsos.tools.workflow_tools import run_typed_physicsos_workflow
 
 
@@ -64,6 +64,7 @@ class ToolSpec:
 
 MAIN_AGENT_TOOLS = [
     build_physics_problem,
+    canonicalize_physics_problem,
     validate_physics_problem,
     run_typed_physicsos_workflow,
     list_operator_templates,
@@ -93,6 +94,7 @@ GEOMETRY_MESH_TOOLS = [
 
 TAPS_TOOLS = [
     validate_physics_problem,
+    canonicalize_physics_problem,
     estimate_solver_support,
     estimate_taps_support,
     build_knowledge_context,
@@ -132,6 +134,7 @@ SOLVER_TOOLS = [
 
 VERIFICATION_TOOLS = [
     compute_physics_residuals,
+    check_boundary_condition_application,
     check_conservation_laws,
     validate_selected_slices,
     estimate_uncertainty,

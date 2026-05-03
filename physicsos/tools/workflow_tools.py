@@ -8,9 +8,12 @@ from physicsos.schemas.common import StrictBaseModel
 from physicsos.tools.problem_tools import (
     BuildPhysicsProblemInput,
     BuildPhysicsProblemOutput,
+    CanonicalPhysicsProblemOutput,
     ValidatePhysicsProblemOutput,
     build_physics_problem,
+    canonicalize_physics_problem,
     validate_physics_problem,
+    CanonicalPhysicsProblemInput,
     ValidatePhysicsProblemInput,
 )
 from physicsos.workflows.universal import PhysicsOSWorkflowResult, run_physicsos_workflow
@@ -29,6 +32,7 @@ class RunTypedPhysicsOSWorkflowInput(StrictBaseModel):
 
 class RunTypedPhysicsOSWorkflowOutput(StrictBaseModel):
     build: BuildPhysicsProblemOutput
+    canonicalization: CanonicalPhysicsProblemOutput | None = None
     initial_validation: ValidatePhysicsProblemOutput | None = None
     workflow: PhysicsOSWorkflowResult | None = None
     missing_inputs: list[str] = Field(default_factory=list)
@@ -114,9 +118,18 @@ def run_typed_physicsos_workflow(
     if built.problem is None:
         return RunTypedPhysicsOSWorkflowOutput(build=built, missing_inputs=built.missing_inputs)
 
-    initial_validation = validate_physics_problem(ValidatePhysicsProblemInput(problem=built.problem))
+    canonicalization = canonicalize_physics_problem(CanonicalPhysicsProblemInput(problem=built.problem))
+    if canonicalization.status != "ready":
+        return RunTypedPhysicsOSWorkflowOutput(
+            build=built,
+            canonicalization=canonicalization,
+            missing_inputs=[*built.missing_inputs, *canonicalization.missing_boundary_roles],
+        )
+
+    built = built.model_copy(update={"problem": canonicalization.problem})
+    initial_validation = validate_physics_problem(ValidatePhysicsProblemInput(problem=canonicalization.problem))
     workflow = run_physicsos_workflow(
-        problem=built.problem,
+        problem=canonicalization.problem,
         run_id=run_id,
         use_knowledge=input.use_knowledge,
         arxiv_max_results=input.arxiv_max_results,
@@ -129,6 +142,7 @@ def run_typed_physicsos_workflow(
     )
     return RunTypedPhysicsOSWorkflowOutput(
         build=built,
+        canonicalization=canonicalization,
         initial_validation=initial_validation,
         workflow=workflow,
         missing_inputs=built.missing_inputs,

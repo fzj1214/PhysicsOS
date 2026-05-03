@@ -247,6 +247,8 @@ def call_structured_agent(
     system_prompt: str,
     client: StructuredLLMClient,
     config: CoreAgentLLMConfig | None = None,
+    semantic_validator: Callable[[OutputT], list[str]] | None = None,
+    semantic_feedback_builder: Callable[[OutputT, list[str]], list[str]] | None = None,
 ) -> StructuredAgentResult[OutputT]:
     """Call an LLM-like client and only return validated Pydantic output."""
     cfg = config or CoreAgentLLMConfig()
@@ -324,6 +326,31 @@ def call_structured_agent(
                 artifact=artifact,
             )
             validation_feedback = errors
+            continue
+        semantic_errors = semantic_validator(output) if semantic_validator is not None else []
+        if semantic_errors:
+            attempt = StructuredAgentAttempt(
+                attempt=attempt_index,
+                raw_response=raw_text,
+                parsed=output.model_dump(mode="json"),
+                validation_errors=semantic_errors,
+            )
+            attempts.append(attempt)
+            status = "retrying" if attempt_index < max_attempts else "retry_exhausted"
+            artifact = _structured_attempt_artifact(call_id=call_id, request=request, attempt=attempt, status=status)
+            _emit_structured_attempt_event(
+                request=request,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                status=status,
+                event_type="validation.retry",
+                artifact=artifact,
+            )
+            validation_feedback = (
+                semantic_feedback_builder(output, semantic_errors)
+                if semantic_feedback_builder is not None
+                else semantic_errors
+            )
             continue
         attempt = StructuredAgentAttempt(
             attempt=attempt_index,

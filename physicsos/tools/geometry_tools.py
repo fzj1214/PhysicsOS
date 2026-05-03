@@ -14,7 +14,7 @@ from physicsos.backends.geometry_mesh import generate_mesh_backend, import_geome
 from physicsos.config import project_root
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
 from physicsos.schemas.contracts import PhysicsProblemContract
-from physicsos.schemas.geometry import BoundaryRegionSpec, GeometryEncoding, GeometryEntity, GeometryQualityReport, GeometrySource, GeometrySpec, GeometryTransform, RegionSpec
+from physicsos.schemas.geometry import BoundaryRegionSpec, BoundaryRole, GeometryEncoding, GeometryEntity, GeometryQualityReport, GeometrySource, GeometrySpec, GeometryTransform, RegionSpec
 from physicsos.schemas.knowledge import KnowledgeContext
 from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
 from physicsos.schemas.operators import PhysicsDomain, PhysicsSpec
@@ -232,6 +232,7 @@ class BoundaryLabelAssignment(StrictBaseModel):
     boundary_id: str
     label: str
     kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    role: BoundaryRole | None = None
     confidence: float = 1.0
 
 
@@ -267,6 +268,7 @@ def apply_boundary_labels(input: ApplyBoundaryLabelsInput) -> ApplyBoundaryLabel
             label=assignment.label,
             kind=assignment.kind,
             entity_ids=[entity_id for entity_id in assignment.entity_ids if entity_id in existing_entity_ids],
+            role=assignment.role,
             confidence=confidence,
         )
         if boundary.id in by_id:
@@ -290,6 +292,7 @@ class BoundaryLabelCandidate(StrictBaseModel):
     boundary_id: str
     label: str
     kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    role: BoundaryRole | None = None
     confidence: float = 0.0
     reason: str | None = None
     requires_confirmation: bool = True
@@ -300,6 +303,7 @@ class ConfirmedBoundaryLabel(StrictBaseModel):
     boundary_id: str
     label: str
     kind: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "interface", "farfield", "surface", "custom"] = "custom"
+    role: BoundaryRole | None = None
     confidence: float = 1.0
     confirmed_by: str = "user"
 
@@ -378,6 +382,7 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
                         boundary_id=f"boundary:{name}",
                         label=name,
                         kind=kind,  # type: ignore[arg-type]
+                        role=None,
                         confidence=confidence,
                         reason=reason,
                         requires_confirmation=True,
@@ -405,6 +410,7 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
                     boundary_id=boundary.id,
                     label=boundary.label,
                     kind=boundary.kind,
+                    role=boundary.role,
                     confidence=boundary.confidence,
                     reason="GeometrySpec contains a non-confirmed boundary label.",
                     requires_confirmation=True,
@@ -498,6 +504,7 @@ def apply_boundary_labeling_artifact(input: ApplyBoundaryLabelingArtifactInput) 
                 boundary_id=confirmed.boundary_id,
                 label=confirmed.label,
                 kind=confirmed.kind,
+                role=confirmed.role,
                 confidence=max(0.0, min(1.0, confirmed.confidence)),
             )
         )

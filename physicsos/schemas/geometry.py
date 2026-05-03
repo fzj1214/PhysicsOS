@@ -6,6 +6,24 @@ from pydantic import Field
 
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
 
+BoundaryRole = Literal[
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "z_min",
+    "z_max",
+    "side_wall",
+    "inlet",
+    "outlet",
+    "wall",
+    "symmetry",
+    "farfield",
+    "interface",
+    "periodic",
+    "custom",
+]
+
 
 class CoordinateSystem(StrictBaseModel):
     kind: Literal["cartesian", "cylindrical", "spherical", "crystal", "custom"] = "cartesian"
@@ -59,6 +77,7 @@ class BoundaryRegionSpec(StrictBaseModel):
         "custom",
     ]
     entity_ids: list[str] = Field(default_factory=list)
+    role: BoundaryRole | None = None
     confidence: float = 1.0
 
 
@@ -105,4 +124,3 @@ class GeometrySpec(StrictBaseModel):
     transforms: list[GeometryTransform] = Field(default_factory=list)
     encodings: list[GeometryEncoding] = Field(default_factory=list)
     quality: GeometryQualityReport | None = None
-
