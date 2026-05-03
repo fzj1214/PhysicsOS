@@ -42,6 +42,7 @@ from physicsos.schemas.verification import VerificationReport
 from physicsos.tools.registry import MAIN_AGENT_TOOLS, SUBAGENT_TOOL_GROUPS, TOOL_REGISTRY
 from physicsos.tools.workflow_tools import (
     RunTypedPhysicsOSWorkflowInput,
+    _run_typed_physicsos_workflow_impl,
     build_physics_problem_structured,
     run_typed_physicsos_workflow,
 )
@@ -1085,7 +1086,7 @@ def test_call_structured_agent_semantic_validator_retries_in_single_attempt_stre
 
 def test_llm_build_physics_problem_falls_back_without_client(monkeypatch) -> None:
     monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(user_request="simulate one-dimensional steady heat conduction", use_knowledge=False)
     )
     assert output.workflow is not None
@@ -1101,7 +1102,7 @@ def test_llm_build_physics_problem_falls_back_after_structured_failures(monkeypa
         calls.append(request)
         return {"problem": {"not": "a PhysicsProblem"}, "missing_inputs": [], "assumptions": []}
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -1132,7 +1133,7 @@ def test_llm_build_physics_problem_uses_structured_client(monkeypatch) -> None:
     assert built.problem.id == problem.id
     assert built.assumptions == ["llm extracted typed problem"]
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate a rod with fixed end temperatures",
             use_knowledge=False,
@@ -1282,7 +1283,7 @@ def test_llm_taps_formulation_uses_structured_client_for_custom_smooth_pde(monke
             }
         }
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate a smooth steady Cahn-Hilliard phase-field on a square",
             use_knowledge=False,
@@ -1418,7 +1419,7 @@ def test_llm_numerical_plan_drives_tetra_elasticity_workflow(monkeypatch, tmp_pa
             return _postprocess_plan_payload()
         raise AssertionError(request["agent_name"])
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="solve 3D linear elasticity on a tetrahedral mesh",
             use_knowledge=False,
@@ -1531,7 +1532,7 @@ def test_llm_numerical_plan_drives_tetra10_poisson_workflow(monkeypatch, tmp_pat
             return _postprocess_plan_payload()
         raise AssertionError(request["agent_name"])
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="solve 3D Poisson on a second-order tetrahedral mesh",
             use_knowledge=False,
@@ -1592,7 +1593,7 @@ def test_llm_invalid_numerical_plan_stops_before_taps_execution(monkeypatch) -> 
             }
         raise AssertionError(request["agent_name"])
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -1729,7 +1730,7 @@ def test_llm_taps_contract_review_rejects_formulation_drift(monkeypatch) -> None
             }
         }
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -1766,7 +1767,7 @@ def test_workflow_sets_solver_envelope_for_llm_taps_result_even_when_support_sco
             return _postprocess_plan_payload()
         return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -1804,7 +1805,7 @@ def test_workflow_events_include_structured_taps_attempt(monkeypatch, tmp_path) 
             return _postprocess_plan_payload()
         return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -1835,7 +1836,7 @@ def test_natural_language_entry_logs_build_and_taps_structured_attempts_to_same_
             return _postprocess_plan_payload()
         return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -2061,7 +2062,7 @@ def test_workflow_events_include_structured_geometry_attempt(monkeypatch, tmp_pa
             return _postprocess_plan_payload()
         return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -2088,7 +2089,7 @@ def test_workflow_events_include_structured_postprocess_attempt(monkeypatch, tmp
             return _postprocess_plan_payload()
         return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -2159,7 +2160,7 @@ def test_core_workflow_retries_taps_wall_time_budget(monkeypatch) -> None:
 
 
 def test_run_taps_backend_wall_time_budget_uses_subprocess(monkeypatch) -> None:
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate one-dimensional steady heat conduction",
             use_knowledge=False,
@@ -2765,7 +2766,7 @@ def test_workflow_stops_imported_geometry_with_missing_solver_critical_boundary_
         assert request["agent_name"] == "build-physics-problem-agent"
         return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["opaque imported groups"]}
 
-    output = run_typed_physicsos_workflow(
+    output = _run_typed_physicsos_workflow_impl(
         RunTypedPhysicsOSWorkflowInput(
             user_request="simulate heat on imported mesh",
             use_knowledge=False,
@@ -6278,3 +6279,4 @@ def test_taps_agent_can_author_reviewed_runtime_extension() -> None:
     )
     assert output.extension.safety_status == "requires_review"
     assert output.extension.artifact.kind == "taps_runtime_extension"
+

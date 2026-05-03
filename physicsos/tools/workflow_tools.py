@@ -3,7 +3,14 @@ from __future__ import annotations
 from pydantic import Field
 from uuid import uuid4
 
-from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent, load_core_agent_config, structured_agent_event_context
+from physicsos.agents.structured import (
+    CoreAgentLLMConfig,
+    StructuredLLMClient,
+    call_structured_agent,
+    create_openai_structured_client,
+    load_core_agent_config,
+    structured_agent_event_context,
+)
 from physicsos.schemas.common import StrictBaseModel
 from physicsos.tools.problem_tools import (
     BuildPhysicsProblemInput,
@@ -97,12 +104,11 @@ def _build_problem_with_llm_first_fallback(
     )
 
 
-def run_typed_physicsos_workflow(
+def _run_typed_physicsos_workflow_impl(
     input: RunTypedPhysicsOSWorkflowInput,
     *,
     structured_client: StructuredLLMClient | None = None,
 ) -> RunTypedPhysicsOSWorkflowOutput:
-    """Natural-language entry point for the typed PhysicsOS workflow."""
     run_id = f"workflow:{uuid4().hex}"
     core_config = load_core_agent_config()
     if input.core_agents_mode is not None:
@@ -147,6 +153,20 @@ def run_typed_physicsos_workflow(
         workflow=workflow,
         missing_inputs=built.missing_inputs,
     )
+
+
+def run_typed_physicsos_workflow(input: RunTypedPhysicsOSWorkflowInput) -> RunTypedPhysicsOSWorkflowOutput:
+    """Natural-language entry point for the typed PhysicsOS workflow."""
+    core_config = load_core_agent_config()
+    if input.core_agents_mode is not None:
+        core_config = core_config.model_copy(update={"mode": input.core_agents_mode})
+    structured_client: StructuredLLMClient | None = None
+    if core_config.mode in {"llm", "hybrid"}:
+        try:
+            structured_client = create_openai_structured_client()
+        except (ImportError, RuntimeError):
+            structured_client = None
+    return _run_typed_physicsos_workflow_impl(input, structured_client=structured_client)
 
 
 run_typed_physicsos_workflow.input_model = RunTypedPhysicsOSWorkflowInput
