@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import Field
 
 from physicsos.config import runtime_paths
+from physicsos.paths import to_agent_path
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
 
 
@@ -109,6 +110,19 @@ def emit_physicsos_event(event: PhysicsOSEvent, path: str | Path | None = None) 
 ToolT = TypeVar("ToolT", bound=Callable[..., Any])
 
 
+def _agent_visible_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        converted = {key: _agent_visible_value(item) for key, item in value.items()}
+        uri = converted.get("uri")
+        if isinstance(uri, str):
+            converted["uri"] = to_agent_path(uri, workspace=runtime_paths().workspace)
+            converted["native_uri"] = uri
+        return converted
+    if isinstance(value, list):
+        return [_agent_visible_value(item) for item in value]
+    return value
+
+
 def wrap_tool_for_events(tool: ToolT, *, run_id: str | None = None) -> ToolT:
     if getattr(tool, "_physicsos_event_wrapped", False):
         return tool
@@ -141,7 +155,7 @@ def wrap_tool_for_events(tool: ToolT, *, run_id: str | None = None) -> ToolT:
             raise
         payload: dict[str, Any] = {}
         if hasattr(result, "model_dump"):
-            payload = {"output": result.model_dump(mode="json")}
+            payload = {"output": _agent_visible_value(result.model_dump(mode="json"))}
         emit_physicsos_event(
             PhysicsOSEvent(
                 run_id=effective_run_id,

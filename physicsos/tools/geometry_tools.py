@@ -9,12 +9,17 @@ from urllib import request
 
 from pydantic import Field
 
+from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent
 from physicsos.backends.geometry_mesh import generate_mesh_backend, import_geometry_backend
 from physicsos.config import project_root
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
+from physicsos.schemas.contracts import PhysicsProblemContract
 from physicsos.schemas.geometry import BoundaryRegionSpec, GeometryEncoding, GeometryEntity, GeometryQualityReport, GeometrySource, GeometrySpec, GeometryTransform, RegionSpec
+from physicsos.schemas.knowledge import KnowledgeContext
 from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
 from physicsos.schemas.operators import PhysicsDomain, PhysicsSpec
+from physicsos.schemas.problem import PhysicsProblem
+from physicsos.tools.memory_tools import CaseMemoryContext
 
 
 class ImportGeometryInput(StrictBaseModel):
@@ -60,6 +65,91 @@ class LabelRegionsOutput(StrictBaseModel):
     geometry: GeometrySpec
     confidence_by_region: dict[str, float] = Field(default_factory=dict)
     unresolved_regions: list[str] = Field(default_factory=list)
+
+
+class GeometryMeshPlanInput(StrictBaseModel):
+    problem: PhysicsProblem
+    problem_contract: PhysicsProblemContract | None = None
+    requested_encodings: list[str] = Field(default_factory=list)
+    target_backends: list[str] = Field(default_factory=list)
+    knowledge_context: KnowledgeContext | None = None
+    case_memory_context: CaseMemoryContext | None = None
+
+
+class GeometryMeshPlanOutput(StrictBaseModel):
+    mesh_policy: MeshPolicy = Field(default_factory=MeshPolicy)
+    requested_encodings: list[str] = Field(default_factory=list)
+    target_backends: list[str] = Field(default_factory=list)
+    require_boundary_confirmation: bool = False
+    boundary_confidence_threshold: float = 0.7
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+GEOMETRY_MESH_PLAN_SYSTEM_PROMPT = """You are the PhysicsOS geometry-mesh planning agent.
+Return only a JSON object matching GeometryMeshPlanOutput.
+
+Task:
+- Preserve the locked PhysicsProblemContract when provided.
+- Infer region and boundary semantics, mesh policy, backend targets, and required encodings.
+- Do not claim that a mesh exists or directly write mesh files.
+- Mark require_boundary_confirmation=true for imported/CAD/mesh geometries with ambiguous or low-confidence solver-critical boundary labels.
+- Prefer mesh_graph encodings for 2D/3D TAPS/FEM workflows.
+"""
+
+
+def plan_geometry_mesh(input: GeometryMeshPlanInput) -> GeometryMeshPlanOutput:
+    """Deterministic geometry/mesh planning fallback."""
+    geometry = input.problem.geometry
+    encodings = list(input.requested_encodings)
+    if geometry.dimension > 1 and "mesh_graph" not in encodings:
+        encodings.append("mesh_graph")
+    boundary_confidence = min((boundary.confidence for boundary in geometry.boundaries), default=1.0)
+    imported_geometry = geometry.source.kind in {"cad_step", "cad_iges", "stl", "mesh_file"}
+    require_confirmation = imported_geometry and (not geometry.boundaries or boundary_confidence < 0.7)
+    mesh_policy = MeshPolicy(
+        strategy="unstructured" if geometry.dimension > 1 else "structured",
+        target_element_size=0.2 if geometry.dimension > 1 else None,
+        element_order=1,
+        boundary_layer=input.problem.domain == "fluid",
+    )
+    return GeometryMeshPlanOutput(
+        mesh_policy=mesh_policy,
+        requested_encodings=encodings,
+        target_backends=input.target_backends,
+        require_boundary_confirmation=require_confirmation,
+        assumptions=["Deterministic geometry-mesh fallback selected conservative mesh and encoding defaults."],
+        warnings=["Imported geometry needs confirmed boundary labels before solver export."] if require_confirmation else [],
+    )
+
+
+def plan_geometry_mesh_structured(
+    input: GeometryMeshPlanInput,
+    *,
+    client: StructuredLLMClient,
+    config: CoreAgentLLMConfig | None = None,
+) -> GeometryMeshPlanOutput:
+    """LLM-backed geometry/mesh planning with strict Pydantic validation."""
+    result = call_structured_agent(
+        agent_name="geometry-mesh-planning-agent",
+        input_model=input,
+        output_model=GeometryMeshPlanOutput,
+        system_prompt=GEOMETRY_MESH_PLAN_SYSTEM_PROMPT,
+        client=client,
+        config=config,
+    )
+    if result.output is not None:
+        return result.output
+    fallback = plan_geometry_mesh(input)
+    return fallback.model_copy(
+        update={
+            "assumptions": [
+                *fallback.assumptions,
+                "Structured LLM geometry-mesh planning failed validation; deterministic fallback was used.",
+                result.error or "Structured geometry-mesh planner returned no validated output.",
+            ]
+        }
+    )
 
 
 def _default_boundary_kind(label: str, physics_domain: PhysicsDomain) -> str:
@@ -1406,6 +1496,8 @@ for _tool, _input, _output in [
     (import_geometry, ImportGeometryInput, ImportGeometryOutput),
     (repair_geometry, RepairGeometryInput, RepairGeometryOutput),
     (label_regions, LabelRegionsInput, LabelRegionsOutput),
+    (plan_geometry_mesh, GeometryMeshPlanInput, GeometryMeshPlanOutput),
+    (plan_geometry_mesh_structured, GeometryMeshPlanInput, GeometryMeshPlanOutput),
     (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
     (create_boundary_labeling_artifact, CreateBoundaryLabelingArtifactInput, CreateBoundaryLabelingArtifactOutput),
     (apply_boundary_labeling_artifact, ApplyBoundaryLabelingArtifactInput, ApplyBoundaryLabelingArtifactOutput),

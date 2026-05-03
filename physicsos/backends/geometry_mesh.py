@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
 from typing import Any
 
 from physicsos.config import project_root
@@ -31,6 +36,81 @@ def _import_optional(module_name: str) -> Any | None:
         return __import__(module_name)
     except ImportError:
         return None
+
+
+def _gmsh_requires_subprocess() -> bool:
+    """Gmsh may install signal handlers; isolate it outside Textual worker threads."""
+    return threading.current_thread() is not threading.main_thread()
+
+
+def _run_backend_subprocess(payload: dict[str, Any], timeout_seconds: float = 120.0) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+        input_path = Path(handle.name)
+        json.dump(payload, handle)
+    output_path = input_path.with_suffix(".out.json")
+    script = (
+        "import json, traceback\n"
+        "from pathlib import Path\n"
+        "from physicsos.backends.geometry_mesh import _run_backend_payload\n"
+        f"input_path = Path({str(input_path)!r})\n"
+        f"output_path = Path({str(output_path)!r})\n"
+        "payload = json.loads(input_path.read_text(encoding='utf-8'))\n"
+        "try:\n"
+        "    result = _run_backend_payload(payload)\n"
+        "except Exception as exc:\n"
+        "    result = {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'traceback': traceback.format_exc()}\n"
+        "output_path.write_text(json.dumps(result), encoding='utf-8')\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(project_root()),
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0 and not output_path.exists():
+            stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            return {"ok": False, "error": f"geometry subprocess failed: {stderr}"}
+        if not output_path.exists():
+            return {"ok": False, "error": "geometry subprocess did not write an output payload."}
+        result = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "geometry subprocess returned a non-object payload."}
+        return result
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"geometry subprocess exceeded {timeout_seconds:.0f}s timeout."}
+    finally:
+        input_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+
+
+def _run_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    action = payload.get("action")
+    if action == "import_geometry":
+        geometry, artifacts = _import_geometry_backend_main(
+            GeometrySource.model_validate(payload["source"]),
+            target_units=str(payload.get("target_units") or "SI"),
+        )
+        return {
+            "ok": True,
+            "geometry": geometry.model_dump(mode="json"),
+            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        }
+    if action == "generate_mesh":
+        mesh, artifacts = _generate_mesh_backend_main(
+            GeometrySpec.model_validate(payload["geometry"]),
+            target_backends=list(payload.get("target_backends") or []),
+            target_element_size=payload.get("target_element_size"),
+            element_order=int(payload.get("element_order") or 1),
+        )
+        return {
+            "ok": True,
+            "mesh": mesh.model_dump(mode="json"),
+            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        }
+    return {"ok": False, "error": f"unknown geometry backend action: {action!r}"}
 
 
 def _source_path(source: GeometrySource) -> Path | None:
@@ -147,6 +227,30 @@ def _gmsh_entities(gmsh: Any) -> tuple[list[GeometryEntity], list[RegionSpec], l
 
 
 def import_geometry_backend(source: GeometrySource, target_units: str = "SI") -> tuple[GeometrySpec, list[ArtifactRef]]:
+    if source.kind != "generated" and _gmsh_requires_subprocess():
+        result = _run_backend_subprocess(
+            {
+                "action": "import_geometry",
+                "source": source.model_dump(mode="json"),
+                "target_units": target_units,
+            }
+        )
+        if result.get("ok"):
+            return (
+                GeometrySpec.model_validate(result["geometry"]),
+                [ArtifactRef.model_validate(artifact) for artifact in result.get("artifacts", [])],
+            )
+        geometry = GeometrySpec(
+            id=f"geometry:{_safe(source.kind)}",
+            source=source,
+            dimension=3,
+            quality=GeometryQualityReport(passes=False, issues=[str(result.get("error") or "geometry subprocess failed")]),
+        )
+        return geometry, []
+    return _import_geometry_backend_main(source, target_units=target_units)
+
+
+def _import_geometry_backend_main(source: GeometrySource, target_units: str = "SI") -> tuple[GeometrySpec, list[ArtifactRef]]:
     """Import geometry through gmsh when available, otherwise return explicit capability status."""
     geometry_id = f"geometry:{_safe(source.kind)}"
     artifacts: list[ArtifactRef] = []
@@ -284,6 +388,45 @@ def _convert_with_meshio(msh_path: Path) -> ArtifactRef | None:
 
 
 def generate_mesh_backend(
+    geometry: GeometrySpec,
+    target_backends: list[str],
+    target_element_size: float | None,
+    element_order: int = 1,
+) -> tuple[MeshSpec, list[ArtifactRef]]:
+    if _gmsh_requires_subprocess():
+        result = _run_backend_subprocess(
+            {
+                "action": "generate_mesh",
+                "geometry": geometry.model_dump(mode="json"),
+                "target_backends": target_backends,
+                "target_element_size": target_element_size,
+                "element_order": element_order,
+            }
+        )
+        if result.get("ok"):
+            return (
+                MeshSpec.model_validate(result["mesh"]),
+                [ArtifactRef.model_validate(artifact) for artifact in result.get("artifacts", [])],
+            )
+        mesh = MeshSpec(
+            id=f"mesh:{geometry.id}",
+            kind="unstructured",
+            dimension=geometry.dimension,
+            regions=geometry.regions,
+            boundaries=geometry.boundaries,
+            quality=MeshQualityReport(passes=False, issues=[str(result.get("error") or "geometry subprocess failed")]),
+            solver_compatibility=target_backends,
+        )
+        return mesh, []
+    return _generate_mesh_backend_main(
+        geometry,
+        target_backends=target_backends,
+        target_element_size=target_element_size,
+        element_order=element_order,
+    )
+
+
+def _generate_mesh_backend_main(
     geometry: GeometrySpec,
     target_backends: list[str],
     target_element_size: float | None,

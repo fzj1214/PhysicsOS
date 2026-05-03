@@ -7,7 +7,7 @@ from pathlib import Path
 from physicsos.config import project_root
 from physicsos.backends.taps_generic import weak_form_transient_diffusion_blocks
 from physicsos.schemas.common import ArtifactRef
-from physicsos.schemas.taps import TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
+from physicsos.schemas.taps import NumericalSolvePlanOutput, TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
 
 
 def _safe(value: str) -> str:
@@ -49,7 +49,27 @@ def _series_dt(alpha_value: float, time_value: float, k: float, rank: int) -> fl
     return total
 
 
-def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def _plan_solver_number(plan: NumericalSolvePlanOutput | None, name: str, default: float) -> float:
+    if plan is None:
+        return default
+    normalized = name.lower()
+    for binding in plan.coefficient_bindings:
+        if binding.role == "solver" and binding.name.lower() == normalized:
+            value = binding.value
+            if isinstance(value, (float, int)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    return default
+    return default
+
+
+def solve_transient_heat_1d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Equation-driven low-rank S-P-T surrogate for 1D transient heat equation.
 
     Model problem:
@@ -70,7 +90,8 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
     x = _axis(taps_problem, "x", 0.0, 1.0, 128)
     alpha = _axis(taps_problem, "alpha", 0.01, 0.1, 48)
     time = _axis(taps_problem, "t", 0.0, 1.0, 64)
-    rank = max(1, min(taps_problem.basis.tensor_rank, len(alpha), len(time)))
+    planned_rank = int(_plan_solver_number(numerical_plan, "rank", float(taps_problem.basis.tensor_rank)))
+    rank = max(1, min(planned_rank, len(alpha), len(time)))
 
     length = float(x[-1] - x[0]) if len(x) > 1 else 1.0
     k = math.pi / length
@@ -101,6 +122,7 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
     factor_payload = {
         "type": "low_rank_heat_1d_spt",
         "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "rank": rank,
         "axes": {
             "x": x,
@@ -117,14 +139,26 @@ def solve_transient_heat_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifa
     metadata_payload = {
         "equation": "dT/dt = alpha d2T/dx2",
         "weak_form_blocks": weak_form_blocks,
+        "field": numerical_plan.field_bindings.get("primary", "T") if numerical_plan is not None else "T",
         "initial_condition": "sin(pi x / L)",
         "boundary_condition": "T(0,t)=T(L,t)=0",
+        "initial_condition_bindings": numerical_plan.initial_condition_bindings if numerical_plan is not None else [],
+        "boundary_values_applied": {
+            binding.region_id: binding.value
+            for binding in (numerical_plan.boundary_condition_bindings if numerical_plan is not None else [])
+            if binding.kind.lower() == "dirichlet"
+        },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
         "rank": rank,
         "weak_form_blocks": weak_form_blocks,
         "relative_l2_reconstruction_error": relative_l2,
         "normalized_pde_residual": normalized_residual,
     }
     residual_payload = {
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "rank": rank,
         "relative_l2_reconstruction_error": relative_l2,
         "normalized_pde_residual": normalized_residual,

@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
+from physicsos.schemas.contracts import ContractReviewReport, PhysicsProblemContract
 from physicsos.schemas.geometry import GeometryEncoding, GeometrySpec
 from physicsos.schemas.knowledge import KnowledgeContext
 from physicsos.schemas.mesh import MeshQualityReport, MeshSpec
@@ -81,9 +82,11 @@ class KnowledgeAgentOutput(StrictBaseModel):
 
 class TAPSAgentInput(StrictBaseModel):
     problem: PhysicsProblem
+    problem_contract: PhysicsProblemContract | None = None
     knowledge_context: KnowledgeContext | None = None
     case_memory_context: CaseMemoryContext | None = None
     tensor_rank: int = 8
+    max_wall_time_seconds: float = 120.0
 
 
 class TAPSAgentOutput(StrictBaseModel):
@@ -91,6 +94,7 @@ class TAPSAgentOutput(StrictBaseModel):
     support: TAPSSupportScore
     compilation_plan: TAPSCompilationPlan | None = None
     taps_problem: TAPSProblem | None = None
+    contract_review: ContractReviewReport | None = None
     result: SolverResult | None = None
     residual: TAPSResidualReport | None = None
 
@@ -149,6 +153,7 @@ class CaseMemoryAgentOutput(StrictBaseModel):
 class PhysicsOSWorkflowState(StrictBaseModel):
     problem: PhysicsProblem
     run_id: str | None = None
+    problem_contract: PhysicsProblemContract | None = None
     case_memory_context: CaseMemoryContext | None = None
     geometry: GeometryMeshAgentOutput | None = None
     knowledge: KnowledgeAgentOutput | None = None

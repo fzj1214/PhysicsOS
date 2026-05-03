@@ -118,6 +118,61 @@ def _patch_deepagents_allow_blocking() -> None:
     cli_server._build_server_cmd = build_server_cmd
 
 
+def _patch_deepagents_workspace_paths() -> None:
+    """Use /workspace virtual paths for local DeepAgents filesystem tools."""
+    try:
+        import deepagents_cli.agent as cli_agent
+    except ImportError:
+        return
+
+    original_get_system_prompt = cli_agent.get_system_prompt
+    if not getattr(original_get_system_prompt, "_physicsos_workspace_paths", False):
+
+        def get_system_prompt_with_workspace_paths(*args: object, **kwargs: object) -> str:
+            try:
+                prompt = original_get_system_prompt(*args, **kwargs)
+            except UnicodeDecodeError:
+                prompt = "## Additional Guidelines\n\nFollow the active PhysicsOS system instructions."
+            replacement = (
+                "### Current Working Directory\n\n"
+                "The filesystem backend is mapped to the virtual workspace path `/workspace`.\n\n"
+                "### File System and Paths\n\n"
+                "**IMPORTANT - Path Handling:**\n"
+                "- Always use virtual POSIX paths under `/workspace`, for example `/workspace/scratch/result.png`\n"
+                "- Never use Windows drive paths such as `D:\\...`, `C:\\...`, or mixed `\\` separators in filesystem tools\n"
+                "- Never use host absolute paths such as `/Users/...` or `/home/...` in filesystem tools\n"
+                "- Shell commands execute from the real project root, but filesystem tools require `/workspace/...` paths\n\n"
+            )
+            start = prompt.find("### Current Working Directory")
+            end = prompt.find("## Additional Guidelines", start)
+            if start != -1 and end != -1:
+                return prompt[:start] + replacement + prompt[end:]
+            return prompt + "\n\n" + replacement
+
+        get_system_prompt_with_workspace_paths._physicsos_workspace_paths = True  # type: ignore[attr-defined]
+        cli_agent.get_system_prompt = get_system_prompt_with_workspace_paths
+
+    original_create_cli_agent = cli_agent.create_cli_agent
+    if getattr(original_create_cli_agent, "_physicsos_workspace_paths", False):
+        return
+
+    def create_cli_agent_with_workspace_paths(*args: object, **kwargs: object):
+        result = original_create_cli_agent(*args, **kwargs)
+        agent, backend = result
+        try:
+            default_backend = backend.default
+            default_backend.virtual_mode = True
+            if "/workspace/" not in backend.routes:
+                backend.routes = {"/workspace/": default_backend, **backend.routes}
+                backend.sorted_routes = sorted(backend.routes.items(), key=lambda item: len(item[0]), reverse=True)
+        except Exception:
+            return result
+        return agent, backend
+
+    create_cli_agent_with_workspace_paths._physicsos_workspace_paths = True  # type: ignore[attr-defined]
+    cli_agent.create_cli_agent = create_cli_agent_with_workspace_paths
+
+
 def _patch_deepagents_physicsos_tools() -> None:
     """Inject scoped PhysicsOS tools into the DeepAgents CLI server graph."""
     try:
@@ -133,6 +188,19 @@ def _patch_deepagents_physicsos_tools() -> None:
         original(work_dir)
         server_graph = work_dir / "server_graph.py"
         source = server_graph.read_text(encoding="utf-8")
+        path_patch_marker = "from deepagents_cli.project_utils import ProjectContext, get_server_project_context\n"
+        path_patch = (
+            "from deepagents_cli.project_utils import ProjectContext, get_server_project_context\n"
+            "\n"
+            "try:\n"
+            "    from physicsos.cli import _patch_deepagents_workspace_paths\n"
+            "    _patch_deepagents_workspace_paths()\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+        if path_patch_marker in source and "_patch_deepagents_workspace_paths" not in source:
+            source = source.replace(path_patch_marker, path_patch, 1)
+
         old = (
             "    from deepagents_cli.config import settings\n"
             "    from deepagents_cli.tools import fetch_url, web_search\n\n"
@@ -293,10 +361,13 @@ def _physicsos_agent_prompt() -> str:
         + "\n\n"
         "You are running inside the official DeepAgents CLI/TUI as the PhysicsOS agent.\n"
         "Use the built-in DeepAgents todo, filesystem, shell, subagent, MCP, and skills capabilities.\n"
+        "For end-to-end natural-language simulation requests, call `run_typed_physicsos_workflow` first.\n"
+        "Do not call DeepAgents `task` for taps-agent, geometry-mesh-agent, solver-agent, verification-agent, or postprocess-agent on the core simulation path; the typed workflow owns those stages and emits CLI-visible events.\n"
+        "Use direct subagent delegation only for ad hoc repair, review, explanation, or follow-up after the typed workflow returns retry/failure context.\n"
         "For local PhysicsOS package state, use `physicsos paths`.\n"
         "For PhysicsOS Cloud device login, use `physicsos auth login`.\n"
         "For cloud runner jobs, use `physicsos runner ...` commands.\n"
-        "Prefer TAPS-first reasoning and delegate to the registered PhysicsOS subagents when useful.\n"
+        "Prefer TAPS-first reasoning through the typed workflow, with solver fallback only after TAPS support, compilation, execution, or verification requires it.\n"
         "Do not claim a high-trust physics solve unless residual, conservation, and verification evidence is available.\n"
     )
 
@@ -358,6 +429,7 @@ def _launch_deepagents_cli(argv: list[str]) -> int:
     _prepare_deepagents_env()
     _patch_deepagents_banner()
     _patch_deepagents_allow_blocking()
+    _patch_deepagents_workspace_paths()
     _patch_deepagents_physicsos_tools()
     _patch_deepagents_physicsos_tui_events()
     _patch_deepagents_physicsos_noninteractive_events()
@@ -616,6 +688,13 @@ def main(argv: list[str] | None = None) -> int:
     logs.add_argument("--after", type=int)
     artifacts = runner_sub.add_parser("artifacts")
     artifacts.add_argument("job_id")
+    download = runner_sub.add_parser("download")
+    download.add_argument("job_id")
+    download.add_argument("artifact_id")
+    download.add_argument("--output-dir", default=".")
+    download_all = runner_sub.add_parser("download-all")
+    download_all.add_argument("job_id")
+    download_all.add_argument("--output-dir", default=".")
 
     args = parser.parse_args(argv)
 
@@ -649,6 +728,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.runner_command == "artifacts":
             _print_json(client.job_artifacts(args.job_id))
+            return 0
+        if args.runner_command == "download":
+            _print_json(client.download_artifact(args.job_id, args.artifact_id, output_dir=args.output_dir))
+            return 0
+        if args.runner_command == "download-all":
+            _print_json(client.download_all_artifacts(args.job_id, output_dir=args.output_dir))
             return 0
 
     parser.error("Unsupported command")

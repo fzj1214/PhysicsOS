@@ -1,6 +1,7 @@
 """Public schema exports for PhysicsOS."""
 
 from physicsos.schemas.common import ArtifactRef, ComputeBudget, Provenance, RuntimeStats
+from physicsos.schemas.contracts import ContractReviewReport, PhysicsProblemContract
 from physicsos.schemas.geometry import GeometryEncoding, GeometrySource, GeometrySpec
 from physicsos.schemas.knowledge import ArxivPaper, DeepSearchReport, KnowledgeChunk, KnowledgeContext, KnowledgeSource
 from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
@@ -15,6 +16,7 @@ __all__ = [
     "ArtifactRef",
     "ArxivPaper",
     "ComputeBudget",
+    "ContractReviewReport",
     "GeometryEncoding",
     "GeometrySource",
     "GeometrySpec",
@@ -28,6 +30,7 @@ __all__ = [
     "OperatorSpec",
     "PhysicsDomain",
     "PhysicsProblem",
+    "PhysicsProblemContract",
     "PhysicsSpec",
     "Provenance",
     "RuntimeStats",

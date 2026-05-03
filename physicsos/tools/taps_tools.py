@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
 
 from pydantic import Field
 
+from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent
 from physicsos.config import project_root
 from physicsos.backends.taps_generic import SUPPORTED_FAMILIES as GENERIC_TAPS_FAMILIES
 from physicsos.backends.taps_generic import solve_coupled_reaction_diffusion_2d
@@ -11,22 +17,36 @@ from physicsos.backends.taps_generic import solve_graph_poisson
 from physicsos.backends.taps_generic import solve_mesh_fem_em_curl_curl
 from physicsos.backends.taps_generic import solve_mesh_fem_linear_elasticity
 from physicsos.backends.taps_generic import solve_mesh_fem_poisson
+from physicsos.backends.taps_generic import solve_navier_stokes_channel_2d
 from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_1d
 from physicsos.backends.taps_generic import solve_reaction_diffusion_nonlinear_2d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_1d
 from physicsos.backends.taps_generic import solve_scalar_elliptic_2d
+from physicsos.backends.taps_generic import solve_oseen_channel_2d
+from physicsos.backends.taps_generic import solve_stokes_channel_2d
 from physicsos.backends.taps_generic import supports_coupled_reaction_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_hcurl_curl_curl_weak_form
+from physicsos.backends.taps_generic import supports_mesh_navier_stokes_bridge
 from physicsos.backends.taps_generic import supports_nonlinear_reaction_diffusion_weak_form
+from physicsos.backends.taps_generic import supports_navier_stokes_weak_form
+from physicsos.backends.taps_generic import supports_oseen_weak_form
 from physicsos.backends.taps_generic import supports_scalar_elliptic_weak_form
+from physicsos.backends.taps_generic import supports_stokes_weak_form
 from physicsos.backends.taps_generic import supports_transient_diffusion_weak_form
 from physicsos.backends.taps_generic import supports_vector_elasticity_weak_form
 from physicsos.backends.taps_thermal import solve_transient_heat_1d
-from physicsos.schemas.common import ArtifactRef, Provenance, StrictBaseModel
+from physicsos.schemas.common import ArtifactRef, ComputeBudget, Provenance, StrictBaseModel
+from physicsos.schemas.contracts import PhysicsProblemContract
 from physicsos.schemas.knowledge import KnowledgeContext
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverResult
 from physicsos.schemas.taps import (
+    BackendPreparationPlanOutput,
+    NumericalBoundaryConditionBinding,
+    NumericalCoefficientBinding,
+    NumericalDiscretizationSpec,
+    NumericalSolvePlanOutput,
+    NumericalSourceBinding,
     TAPSAxisSpec,
     TAPSBasisConfig,
     TAPSBoundaryConditionSpec,
@@ -50,6 +70,26 @@ class EstimateTAPSSupportOutput(StrictBaseModel):
     support: TAPSSupportScore
 
 
+def _has_laminar_channel_inputs(problem: PhysicsProblem) -> bool:
+    boundary_kinds = {boundary.kind.lower() for boundary in problem.boundary_conditions}
+    has_channel_boundaries = "wall" in boundary_kinds and bool(boundary_kinds & {"inlet", "dirichlet"}) and bool(boundary_kinds & {"outlet", "neumann"})
+    material_properties = {
+        prop.name.lower()
+        for material in problem.materials
+        for prop in material.properties
+    }
+    has_coefficients = bool(material_properties & {"mu", "dynamic_viscosity", "viscosity"}) and bool(material_properties & {"rho", "density"}) and bool(
+        material_properties & {"pressure_drop", "delta_p", "dp"}
+    )
+    reynolds = [
+        number.value
+        for operator in problem.operators
+        for number in operator.nondimensional_numbers
+        if number.name.lower() in {"re", "reynolds", "reynolds_number"}
+    ]
+    return has_channel_boundaries and has_coefficients and (not reynolds or max(reynolds) <= 100.0)
+
+
 def estimate_taps_support(input: EstimateTAPSSupportInput) -> EstimateTAPSSupportOutput:
     """Estimate whether TAPS should be the first solver for this PhysicsProblem."""
     problem = input.problem
@@ -60,6 +100,9 @@ def estimate_taps_support(input: EstimateTAPSSupportInput) -> EstimateTAPSSuppor
     if problem.domain in {"thermal", "solid", "acoustic", "custom", "multiphysics"}:
         score += 0.25
         reasons.append(f"domain {problem.domain} is compatible with first TAPS targets")
+    elif problem.domain == "fluid":
+        score += 0.20
+        reasons.append("fluid domain is compatible with the low-Re Stokes TAPS target")
     else:
         risks.append(f"domain {problem.domain} may be difficult for early TAPS")
 
@@ -76,10 +119,37 @@ def estimate_taps_support(input: EstimateTAPSSupportInput) -> EstimateTAPSSuppor
         "maxwell",
         "curl_curl",
         "electromagnetic",
+        "stokes",
+        "oseen",
     }
     if operator_classes.intersection(preferred):
         score += 0.35
         reasons.append("operator family is a TAPS-first target")
+    elif "navier_stokes" in operator_classes:
+        reynolds = [
+            number.value
+            for operator in problem.operators
+            for number in operator.nondimensional_numbers
+            if number.name.lower() in {"re", "reynolds", "reynolds_number"}
+        ]
+        has_frozen_velocity = any(
+            prop.name.lower()
+            in {"frozen_velocity", "convective_velocity", "oseen_velocity", "linearization_velocity", "ubar", "u_bar"}
+            for material in problem.materials
+            for prop in material.properties
+        )
+        if reynolds and max(reynolds) <= 1.0:
+            score += 0.35
+            reasons.append("Navier-Stokes can use the low-Re incompressible Stokes TAPS simplification")
+        elif has_frozen_velocity:
+            score += 0.35
+            reasons.append("Navier-Stokes can use the linearized Oseen TAPS target with a frozen convective velocity")
+        elif _has_laminar_channel_inputs(problem):
+            score += 0.30
+            reasons.append("Navier-Stokes can use the restricted laminar channel Picard TAPS target")
+        else:
+            score += 0.15
+            risks.append("full nonlinear Navier-Stokes TAPS execution is not connected yet; use low-Re Stokes, Oseen linearization, or fallback")
     else:
         risks.append("operator family is not yet a TAPS-first target")
 
@@ -102,12 +172,26 @@ def estimate_taps_support(input: EstimateTAPSSupportInput) -> EstimateTAPSSuppor
 
 class FormulateTAPSEquationInput(StrictBaseModel):
     problem: PhysicsProblem
+    problem_contract: PhysicsProblemContract | None = None
     knowledge_context: KnowledgeContext | None = None
     allow_knowledge_queries: bool = True
 
 
 class FormulateTAPSEquationOutput(StrictBaseModel):
     plan: TAPSCompilationPlan
+
+
+FORMULATE_TAPS_EQUATION_SYSTEM_PROMPT = """You are the PhysicsOS TAPS formulation agent.
+Return only a JSON object matching FormulateTAPSEquationOutput.
+
+Task:
+- Compile the locked PhysicsProblem into a TAPSCompilationPlan.
+- Preserve the PhysicsProblemContract exactly when it is provided: do not change fields, boundary values, operator family, material bindings, or problem_id.
+- Use the knowledge_context only to improve the weak form, constitutive assumptions, validation risks, and required knowledge queries.
+- For smooth stable continuum PDEs, produce a faithful weak-form IR even when no local TAPS kernel exists yet.
+- Mark the plan as ready only when the governing equation, fields, boundary conditions, coefficients, axes, and weak form are explicit.
+- If execution would require a full solver, backend bridge, or runtime extension, keep the weak form faithful and set risks/recommended_next_action accordingly instead of simplifying the physics away.
+"""
 
 
 def _default_axes(problem: PhysicsProblem) -> list[TAPSAxisSpec]:
@@ -274,6 +358,74 @@ def _weak_form_from_problem(problem: PhysicsProblem, knowledge_context: Knowledg
                     ),
                 ]
             )
+        elif operator_family in {"navier_stokes", "stokes", "incompressible_navier_stokes"}:
+            low_re = any(
+                number.name.lower() in {"re", "reynolds", "reynolds_number"} and number.value <= 1.0
+                for number in operator.nondimensional_numbers
+            )
+            has_frozen_velocity = any(
+                prop.name.lower()
+                in {"frozen_velocity", "convective_velocity", "oseen_velocity", "linearization_velocity", "ubar", "u_bar"}
+                for material in problem.materials
+                for prop in material.properties
+            )
+            terms.extend(
+                [
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:viscous",
+                        role="diffusion",
+                        expression="int_Omega 2 mu epsilon(v_U) : epsilon(U) dOmega",
+                        fields=operator.fields_out or fields,
+                        coefficients=["mu", "dynamic_viscosity"],
+                        assumptions=["Velocity-pressure incompressible weak form; executable local kernel currently uses the low-Re Stokes limit."],
+                    ),
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:pressure",
+                        role="custom",
+                        expression="- int_Omega p div(v_U) dOmega",
+                        fields=operator.fields_out or fields,
+                        coefficients=["pressure"],
+                    ),
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:continuity",
+                        role="constraint",
+                        expression="int_Omega q div(U) dOmega",
+                        fields=operator.fields_out or fields,
+                    ),
+                ]
+            )
+            if operator_family != "stokes" and not low_re:
+                expression = (
+                    "int_Omega v_U dot rho (U_bar dot grad) U dOmega"
+                    if has_frozen_velocity
+                    else "int_Omega v_U dot rho (U dot grad) U dOmega"
+                )
+                assumptions = (
+                    ["Oseen linearization: convective velocity is frozen from user input, warm start, or previous iterate."]
+                    if has_frozen_velocity
+                    else ["Full Navier-Stokes requires nonlinear Picard/Newton iteration and stabilization before executable TAPS support."]
+                )
+                terms.append(
+                    TAPSEquationTerm(
+                        id=f"{operator.id}:advection",
+                        role="advection",
+                        expression=expression,
+                        fields=operator.fields_out or fields,
+                        coefficients=["rho", "density"],
+                        assumptions=assumptions,
+                    )
+                )
+            for source_term in operator.source_terms:
+                expression = source_term.expression.strip()
+                if expression:
+                    terms.append(
+                        TAPSEquationTerm(
+                            id=f"{operator.id}:body_force",
+                            role="source",
+                            expression=f"int_Omega v_U dot {expression} dOmega",
+                            fields=operator.fields_out or fields,
+                        )
+                    )
         elif operator_family in {"elasticity", "linear_elasticity"}:
             terms.extend(
                 [
@@ -434,6 +586,37 @@ def formulate_taps_equation(input: FormulateTAPSEquationInput) -> FormulateTAPSE
     return FormulateTAPSEquationOutput(plan=plan)
 
 
+def formulate_taps_equation_structured(
+    input: FormulateTAPSEquationInput,
+    *,
+    client: StructuredLLMClient,
+    config: CoreAgentLLMConfig | None = None,
+) -> FormulateTAPSEquationOutput:
+    """LLM-backed TAPS formulation with strict Pydantic validation."""
+    result = call_structured_agent(
+        agent_name="taps-formulation-agent",
+        input_model=input,
+        output_model=FormulateTAPSEquationOutput,
+        system_prompt=FORMULATE_TAPS_EQUATION_SYSTEM_PROMPT,
+        client=client,
+        config=config,
+    )
+    if result.output is not None:
+        return result.output
+
+    fallback = formulate_taps_equation(input)
+    plan = fallback.plan.model_copy(
+        update={
+            "assumptions": [
+                *fallback.plan.assumptions,
+                "Structured LLM TAPS formulation failed validation after bounded retries; deterministic formulation fallback was used.",
+                result.error or "Structured TAPS formulation returned no validated output.",
+            ]
+        }
+    )
+    return FormulateTAPSEquationOutput(plan=plan)
+
+
 class BuildTAPSProblemInput(StrictBaseModel):
     problem: PhysicsProblem
     basis: TAPSBasisConfig = Field(default_factory=TAPSBasisConfig)
@@ -464,6 +647,15 @@ def _compile_taps_coefficients(problem: PhysicsProblem) -> list[TAPSCoefficientS
                 )
             )
     for operator in problem.operators:
+        for number in operator.nondimensional_numbers:
+            coefficients.append(
+                TAPSCoefficientSpec(
+                    name=number.name,
+                    value=number.value,
+                    role="operator",
+                    source="physics_problem",
+                )
+            )
         for index, source_term in enumerate(operator.source_terms):
             expression = source_term.expression.strip()
             if not expression:
@@ -555,10 +747,439 @@ def build_taps_problem(input: BuildTAPSProblemInput) -> BuildTAPSProblemOutput:
 class RunTAPSBackendInput(StrictBaseModel):
     problem: PhysicsProblem
     taps_problem: TAPSProblem
+    budget: ComputeBudget = Field(default_factory=lambda: ComputeBudget(max_wall_time_seconds=120.0))
+    numerical_plan: NumericalSolvePlanOutput | None = None
 
 
 class RunTAPSBackendOutput(StrictBaseModel):
     result: SolverResult
+
+
+class NumericalSolvePlanInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    problem_contract: PhysicsProblemContract | None = None
+    compilation_plan: TAPSCompilationPlan | None = None
+    knowledge_context: KnowledgeContext | None = None
+    budget: ComputeBudget = Field(default_factory=lambda: ComputeBudget(max_wall_time_seconds=120.0))
+
+
+class ValidateNumericalSolvePlanInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    plan: NumericalSolvePlanOutput
+    problem_contract: PhysicsProblemContract | None = None
+
+
+class ValidateNumericalSolvePlanOutput(StrictBaseModel):
+    valid: bool
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+NUMERICAL_SOLVE_PLAN_SYSTEM_PROMPT = """You are the PhysicsOS numerical solve planning agent.
+Return only a JSON object matching NumericalSolvePlanOutput.
+
+Task:
+- Preserve the PhysicsProblemContract when provided.
+- Bind fields, coefficients, sources, boundary conditions, discretization, expected artifacts, and validation checks for the selected deterministic solver kernel.
+- Do not invent coefficients, boundary values, fields, mesh references, or solution arrays.
+- If a requested solve is unsupported, return status=unsupported or fallback_required with explicit unsupported_reasons.
+"""
+
+
+def _as_float(value: object) -> float | None:
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coefficient_value(problem: PhysicsProblem, names: set[str], default: float) -> tuple[float, str, str | None]:
+    normalized = {name.lower() for name in names}
+    for parameter in problem.parameters:
+        if parameter.name.lower() in normalized:
+            value = _as_float(parameter.value)
+            if value is not None:
+                return value, parameter.name, parameter.units
+    for material in problem.materials:
+        for prop in material.properties:
+            if prop.name.lower() in normalized:
+                value = _as_float(prop.value)
+                if value is not None:
+                    return value, prop.name, prop.units
+    return default, "default", None
+
+
+def _coefficient_raw_value(
+    problem: PhysicsProblem,
+    names: set[str],
+    default: float | int | str | list[float] | dict,
+) -> tuple[float | int | str | list[float] | dict, str, str | None]:
+    normalized = {name.lower() for name in names}
+    for parameter in problem.parameters:
+        if parameter.name.lower() in normalized:
+            return parameter.value, parameter.name, parameter.units
+    for material in problem.materials:
+        for prop in material.properties:
+            if prop.name.lower() in normalized:
+                return prop.value, prop.name, prop.units
+    return default, "default", None
+
+
+def _source_binding_from_problem(problem: PhysicsProblem) -> NumericalSourceBinding:
+    for operator in problem.operators:
+        for index, source in enumerate(operator.source_terms):
+            value = _as_float(source.expression)
+            if value is not None:
+                return NumericalSourceBinding(name=f"{operator.id}:source:{index}", value=value, expression=source.expression, units=source.units)
+    return NumericalSourceBinding(name="zero_source", value=0.0, expression="0")
+
+
+def plan_numerical_solve(input: NumericalSolvePlanInput) -> NumericalSolvePlanOutput:
+    """Deterministic numerical solve planning fallback."""
+    problem = input.problem
+    taps_problem = input.taps_problem
+    family = taps_problem.weak_form.family.lower() if taps_problem.weak_form is not None else "unknown"
+    space_axes = [axis for axis in taps_problem.axes if axis.kind == "space"]
+    field = taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else (problem.fields[0].name if problem.fields else "u")
+    diffusion, diffusion_name, diffusion_units = _coefficient_value(
+        problem,
+        {"k", "thermal_conductivity", "d", "diffusivity", "thermal_diffusivity"},
+        1.0,
+    )
+    reaction = 0.0
+    operator_classes = {operator.equation_class.lower() for operator in problem.operators}
+    is_transient_diffusion = bool(input.problem.initial_conditions) and (
+        bool(operator_classes.intersection({"heat", "diffusion", "thermal_diffusion"}))
+        or supports_transient_diffusion_weak_form(taps_problem)
+    )
+    is_coupled_reaction = "coupled_reaction_diffusion" in operator_classes or supports_coupled_reaction_diffusion_weak_form(taps_problem)
+    is_vector_elasticity = bool(operator_classes.intersection({"elasticity", "linear_elasticity"})) or supports_vector_elasticity_weak_form(taps_problem)
+    is_hcurl_curl_curl = bool(operator_classes.intersection({"maxwell", "curl_curl", "electromagnetic"})) or supports_hcurl_curl_curl_weak_form(taps_problem)
+    is_oseen = supports_oseen_weak_form(taps_problem)
+    is_navier_stokes = supports_navier_stokes_weak_form(taps_problem)
+    is_stokes = supports_stokes_weak_form(taps_problem)
+    is_nonlinear_reaction = "reaction_diffusion" in operator_classes or (
+        supports_nonlinear_reaction_diffusion_weak_form(taps_problem)
+    )
+    boundary_bindings = [
+        NumericalBoundaryConditionBinding(
+            id=boundary.id,
+            region_id=boundary.region_id,
+            field=boundary.field,
+            kind=boundary.kind,
+            value=boundary.value,
+            units=boundary.units,
+        )
+        for boundary in problem.boundary_conditions
+    ]
+    if is_oseen:
+        solver_family = "incompressible_oseen_channel_2d"
+    elif is_navier_stokes:
+        solver_family = "incompressible_navier_stokes_channel_2d"
+    elif is_stokes:
+        solver_family = "incompressible_stokes_channel_2d"
+    elif is_hcurl_curl_curl:
+        solver_family = "mesh_fem_em_curl_curl"
+    elif is_vector_elasticity:
+        solver_family = "mesh_fem_linear_elasticity"
+    elif len(space_axes) == 1 and field and is_transient_diffusion:
+        solver_family = "transient_diffusion_1d"
+    elif len(space_axes) == 2 and len(problem.fields) >= 2 and is_coupled_reaction:
+        solver_family = "coupled_reaction_diffusion_2d"
+    elif len(space_axes) == 1 and field and is_nonlinear_reaction:
+        solver_family = "nonlinear_reaction_diffusion_1d"
+    elif len(space_axes) == 2 and field and is_nonlinear_reaction:
+        solver_family = "nonlinear_reaction_diffusion_2d"
+    elif len(space_axes) == 1 and field:
+        solver_family = "scalar_elliptic_1d"
+    elif len(space_axes) == 2 and field:
+        solver_family = "scalar_elliptic_2d"
+    else:
+        solver_family = family
+    ready_families = {
+        "scalar_elliptic_1d",
+        "scalar_elliptic_2d",
+        "nonlinear_reaction_diffusion_1d",
+        "nonlinear_reaction_diffusion_2d",
+        "coupled_reaction_diffusion_2d",
+        "transient_diffusion_1d",
+        "mesh_fem_linear_elasticity",
+        "mesh_fem_em_curl_curl",
+        "incompressible_stokes_channel_2d",
+        "incompressible_oseen_channel_2d",
+        "incompressible_navier_stokes_channel_2d",
+    }
+    status = "ready" if solver_family in ready_families else "fallback_required"
+    coefficient_bindings = [
+        NumericalCoefficientBinding(name="diffusion", role="diffusion", value=diffusion, source_name=diffusion_name, units=diffusion_units),
+        NumericalCoefficientBinding(name="reaction", role="reaction", value=reaction, source_name="weak_form", units=None),
+    ]
+    if solver_family.startswith("nonlinear_reaction_diffusion"):
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="linear_reaction", role="reaction", value=input.taps_problem.nonlinear.linear_reaction, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="cubic_reaction", role="reaction", value=input.taps_problem.nonlinear.cubic_reaction, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="damping", role="solver", value=input.taps_problem.nonlinear.damping, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="max_iterations", role="solver", value=input.taps_problem.nonlinear.max_iterations, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="tolerance", role="solver", value=input.taps_problem.nonlinear.tolerance, source_name="taps_nonlinear"),
+            ]
+        )
+    if solver_family == "coupled_reaction_diffusion_2d":
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="linear_reaction", role="reaction", value=input.taps_problem.nonlinear.linear_reaction, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="cubic_reaction", role="reaction", value=input.taps_problem.nonlinear.cubic_reaction, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="coupling_strength", role="reaction", value=input.taps_problem.nonlinear.coupling_strength, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="damping", role="solver", value=input.taps_problem.nonlinear.damping, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="max_iterations", role="solver", value=input.taps_problem.nonlinear.max_iterations, source_name="taps_nonlinear"),
+                NumericalCoefficientBinding(name="tolerance", role="solver", value=input.taps_problem.nonlinear.tolerance, source_name="taps_nonlinear"),
+            ]
+        )
+    if solver_family == "transient_diffusion_1d":
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="rank", role="solver", value=input.taps_problem.basis.tensor_rank, source_name="taps_basis"),
+                NumericalCoefficientBinding(name="time_integrator", role="solver", value="low_rank_taylor_spt", source_name="deterministic_fallback"),
+            ]
+        )
+    if solver_family == "mesh_fem_linear_elasticity":
+        young_modulus, young_name, young_units = _coefficient_value(problem, {"e", "young_modulus", "youngs_modulus", "young's_modulus"}, 1.0)
+        poisson_ratio, poisson_name, poisson_units = _coefficient_value(problem, {"nu", "poisson_ratio", "poissons_ratio", "poisson's_ratio"}, 0.3)
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="young_modulus", role="operator", value=young_modulus, source_name=young_name, units=young_units),
+                NumericalCoefficientBinding(name="poisson_ratio", role="operator", value=poisson_ratio, source_name=poisson_name, units=poisson_units),
+                NumericalCoefficientBinding(name="max_iterations", role="solver", value=20000, source_name="deterministic_fallback"),
+                NumericalCoefficientBinding(name="tolerance", role="solver", value=1e-8, source_name="deterministic_fallback"),
+            ]
+        )
+        for material in problem.materials:
+            for prop in material.properties:
+                if prop.name.lower() in {"constitutive_model", "stress_model"}:
+                    coefficient_bindings.append(
+                        NumericalCoefficientBinding(name="constitutive_model", role="operator", value=prop.value, source_name=prop.name, units=prop.units)
+                    )
+                if prop.name.lower() in {"body_force", "b", "gravity"}:
+                    coefficient_bindings.append(
+                        NumericalCoefficientBinding(name="body_force", role="source", value=prop.value, source_name=prop.name, units=prop.units)
+                    )
+    if solver_family == "mesh_fem_em_curl_curl":
+        for output_name, names, default in [
+            ("relative_permeability", {"mu_r", "relative_permeability", "permeability"}, 1.0),
+            ("relative_permittivity", {"eps_r", "epsilon_r", "relative_permittivity", "permittivity"}, 1.0),
+            ("wave_number", {"k0", "k", "wave_number", "wavenumber"}, 0.5),
+            ("source_amplitude", {"source", "current_source", "jz"}, 1.0),
+        ]:
+            value, source_name, units = _coefficient_raw_value(problem, names, default)
+            role = "source" if output_name == "source_amplitude" else "operator"
+            coefficient_bindings.append(NumericalCoefficientBinding(name=output_name, role=role, value=value, source_name=source_name, units=units))
+        coefficient_bindings.extend(
+            [
+                NumericalCoefficientBinding(name="max_iterations", role="solver", value=5000, source_name="deterministic_fallback"),
+                NumericalCoefficientBinding(name="tolerance", role="solver", value=1e-8, source_name="deterministic_fallback"),
+            ]
+        )
+    if solver_family in {"incompressible_stokes_channel_2d", "incompressible_oseen_channel_2d", "incompressible_navier_stokes_channel_2d"}:
+        for output_name, names, default in [
+            ("dynamic_viscosity", {"mu", "dynamic_viscosity", "viscosity"}, 1.0),
+            ("density", {"rho", "density"}, 1.0),
+            ("pressure_drop", {"pressure_drop", "delta_p", "dp"}, 1.0),
+            ("reynolds", {"re", "reynolds", "reynolds_number"}, -1.0),
+        ]:
+            value, source_name, units = _coefficient_raw_value(problem, names, default)
+            coefficient_bindings.append(NumericalCoefficientBinding(name=output_name, role="operator", value=value, source_name=source_name, units=units))
+        if solver_family == "incompressible_oseen_channel_2d":
+            frozen_velocity, source_name, units = _coefficient_raw_value(
+                problem,
+                {"frozen_velocity", "convective_velocity", "oseen_velocity", "linearization_velocity", "ubar", "u_bar"},
+                [0.0, 0.0],
+            )
+            coefficient_bindings.append(NumericalCoefficientBinding(name="frozen_velocity", role="operator", value=frozen_velocity, source_name=source_name, units=units))
+        if solver_family == "incompressible_navier_stokes_channel_2d":
+            coefficient_bindings.extend(
+                [
+                    NumericalCoefficientBinding(name="damping", role="solver", value=input.taps_problem.nonlinear.damping, source_name="taps_nonlinear"),
+                    NumericalCoefficientBinding(name="max_iterations", role="solver", value=min(80, input.taps_problem.nonlinear.max_iterations), source_name="taps_nonlinear"),
+                    NumericalCoefficientBinding(name="tolerance", role="solver", value=input.taps_problem.nonlinear.tolerance, source_name="taps_nonlinear"),
+                    NumericalCoefficientBinding(name="support_scope", role="solver", value="restricted_steady_laminar_2d_channel", source_name="taps_phase3_policy"),
+                ]
+            )
+    field_bindings = {"primary": field}
+    if solver_family == "coupled_reaction_diffusion_2d" and len(problem.fields) >= 2:
+        field_bindings["secondary"] = problem.fields[1].name
+    if solver_family.startswith("incompressible_") and len(problem.fields) >= 2:
+        field_bindings = {"velocity": problem.fields[0].name, "pressure": problem.fields[1].name}
+    return NumericalSolvePlanOutput(
+        problem_id=problem.id,
+        status=status,  # type: ignore[arg-type]
+        solver_family=solver_family,
+        backend_target="taps",
+        field_bindings=field_bindings,
+        discretization=NumericalDiscretizationSpec(
+            dimension=max(1, len(space_axes)),
+            node_counts={axis.name: axis.points or 64 for axis in space_axes},
+            element_order=1,
+            quadrature_order=taps_problem.basis.quadrature_order,
+        ),
+        coefficient_bindings=coefficient_bindings,
+        source_bindings=[_source_binding_from_problem(problem)],
+        boundary_condition_bindings=boundary_bindings,
+        initial_condition_bindings=[
+            {
+                "id": initial.id,
+                "field": initial.field,
+                "value": initial.value.model_dump(mode="json") if hasattr(initial.value, "model_dump") else initial.value,
+                **({"units": initial.units} if initial.units is not None else {}),
+            }
+            for initial in problem.initial_conditions
+        ],
+        expected_artifacts=["taps_assembled_operator", "taps_solution_field", "taps_residual_history"],
+        validation_checks=["contract_preserved", "coefficient_bound", "dirichlet_endpoint_match", "linear_residual"],
+        assumptions=["Deterministic numerical solve fallback bound coefficients, sources, and boundary conditions from PhysicsProblem."],
+        unsupported_reasons=[] if status == "ready" else [f"No deterministic numerical plan fallback for solver_family={solver_family}."],
+    )
+
+
+def validate_numerical_solve_plan(input: ValidateNumericalSolvePlanInput) -> ValidateNumericalSolvePlanOutput:
+    """Validate a numerical solve plan before deterministic TAPS kernel execution."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    problem = input.problem
+    taps_problem = input.taps_problem
+    plan = input.plan
+    if plan.problem_id != problem.id:
+        errors.append(f"plan.problem_id={plan.problem_id!r} does not match problem.id={problem.id!r}.")
+    if plan.backend_target != "taps":
+        errors.append(f"Unsupported backend_target={plan.backend_target!r} for run_taps_backend.")
+    if plan.status != "ready":
+        errors.append(f"Numerical solve plan is not ready: status={plan.status}.")
+    fields = {field.name for field in problem.fields}
+    if plan.solver_family.startswith("incompressible_"):
+        primary_field = plan.field_bindings.get("velocity")
+        pressure_field = plan.field_bindings.get("pressure")
+        if not primary_field or not pressure_field:
+            errors.append("Incompressible fluid numerical solve plan must bind field_bindings.velocity and field_bindings.pressure.")
+        else:
+            for role, field_name in {"velocity": primary_field, "pressure": pressure_field}.items():
+                if fields and field_name not in fields:
+                    errors.append(f"Numerical {role} field {field_name!r} is not in PhysicsProblem fields {sorted(fields)}.")
+    else:
+        primary_field = plan.field_bindings.get("primary")
+        if not primary_field:
+            errors.append("Numerical solve plan must bind field_bindings.primary.")
+        elif fields and primary_field not in fields:
+            errors.append(f"Numerical primary field {primary_field!r} is not in PhysicsProblem fields {sorted(fields)}.")
+    bc_by_id = {boundary.id: boundary for boundary in problem.boundary_conditions}
+    for binding in plan.boundary_condition_bindings:
+        source = bc_by_id.get(binding.id)
+        if source is None:
+            errors.append(f"Numerical solve plan invented boundary condition {binding.id!r}.")
+            continue
+        if binding.field != source.field or binding.kind != source.kind or binding.region_id != source.region_id or binding.value != source.value:
+            errors.append(f"Boundary binding {binding.id!r} does not preserve PhysicsProblem boundary condition.")
+    if any(boundary.kind.lower() == "dirichlet" for boundary in problem.boundary_conditions):
+        dirichlet_bindings = [binding for binding in plan.boundary_condition_bindings if binding.kind.lower() == "dirichlet"]
+        if len(dirichlet_bindings) < 2 and plan.solver_family == "scalar_elliptic_1d":
+            warnings.append("1D scalar elliptic plan has fewer than two Dirichlet bindings; defaults may be underconstrained.")
+    if not any(binding.role == "diffusion" for binding in plan.coefficient_bindings):
+        errors.append("Numerical solve plan must bind a diffusion coefficient for scalar elliptic execution.")
+    if plan.solver_family.startswith("nonlinear_reaction_diffusion"):
+        for required in {"linear_reaction", "cubic_reaction", "damping", "max_iterations", "tolerance"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Nonlinear numerical solve plan must bind {required}.")
+    if plan.solver_family == "coupled_reaction_diffusion_2d":
+        if "secondary" not in plan.field_bindings:
+            errors.append("Coupled reaction-diffusion plan must bind field_bindings.secondary.")
+        elif fields and plan.field_bindings["secondary"] not in fields:
+            errors.append(f"Numerical secondary field {plan.field_bindings['secondary']!r} is not in PhysicsProblem fields {sorted(fields)}.")
+        for required in {"linear_reaction", "cubic_reaction", "coupling_strength", "damping", "max_iterations", "tolerance"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Coupled reaction-diffusion numerical solve plan must bind {required}.")
+    if plan.solver_family == "transient_diffusion_1d":
+        if not problem.initial_conditions:
+            errors.append("Transient diffusion numerical solve plan requires at least one PhysicsProblem initial condition.")
+        if not plan.initial_condition_bindings:
+            errors.append("Transient diffusion numerical solve plan must bind initial_condition_bindings.")
+        initial_by_id = {initial.id: initial for initial in problem.initial_conditions}
+        for binding in plan.initial_condition_bindings:
+            binding_id = str(binding.get("id", ""))
+            source = initial_by_id.get(binding_id)
+            if source is None:
+                errors.append(f"Numerical solve plan invented initial condition {binding_id!r}.")
+                continue
+            source_value = source.value.model_dump(mode="json") if hasattr(source.value, "model_dump") else source.value
+            if binding.get("field") != source.field or binding.get("value") != source_value:
+                errors.append(f"Initial condition binding {binding_id!r} does not preserve PhysicsProblem initial condition.")
+        if not any(binding.name == "rank" and binding.role == "solver" for binding in plan.coefficient_bindings):
+            warnings.append("Transient diffusion plan did not explicitly bind low-rank solver rank; TAPS basis rank will be used.")
+    if plan.solver_family == "mesh_fem_linear_elasticity":
+        if not any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings):
+            errors.append("Mesh FEM linear-elasticity plan requires a mesh_graph geometry encoding.")
+        for required in {"young_modulus", "poisson_ratio"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Mesh FEM linear-elasticity numerical solve plan must bind {required}.")
+        if not any(binding.name == "body_force" for binding in plan.coefficient_bindings):
+            warnings.append("Mesh FEM linear-elasticity plan did not bind body_force; deterministic default may be used.")
+    if plan.solver_family == "mesh_fem_em_curl_curl":
+        if not any(encoding.kind == "mesh_graph" for encoding in taps_problem.geometry_encodings):
+            errors.append("Mesh FEM EM curl-curl plan requires a mesh_graph geometry encoding.")
+        for required in {"relative_permeability", "relative_permittivity", "wave_number", "source_amplitude"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Mesh FEM EM curl-curl numerical solve plan must bind {required}.")
+    if plan.solver_family in {"incompressible_stokes_channel_2d", "incompressible_oseen_channel_2d", "incompressible_navier_stokes_channel_2d"}:
+        for required in {"dynamic_viscosity", "pressure_drop"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Fluid numerical solve plan must bind {required}.")
+        if plan.discretization.dimension != 2:
+            errors.append("Fluid channel numerical solve plan must be 2D.")
+    if plan.solver_family == "incompressible_oseen_channel_2d":
+        if not any(binding.name == "frozen_velocity" for binding in plan.coefficient_bindings):
+            errors.append("Oseen numerical solve plan must bind frozen_velocity.")
+    if plan.solver_family == "incompressible_navier_stokes_channel_2d":
+        for required in {"density", "damping", "max_iterations", "tolerance", "support_scope"}:
+            if not any(binding.name == required for binding in plan.coefficient_bindings):
+                errors.append(f"Restricted Navier-Stokes numerical solve plan must bind {required}.")
+        scope = next((binding.value for binding in plan.coefficient_bindings if binding.name == "support_scope"), None)
+        if scope != "restricted_steady_laminar_2d_channel":
+            errors.append("Restricted Navier-Stokes numerical solve plan must declare support_scope=restricted_steady_laminar_2d_channel.")
+    if plan.discretization.dimension != len([axis for axis in taps_problem.axes if axis.kind == "space"]):
+        errors.append("Numerical discretization dimension does not match TAPS space axes.")
+    return ValidateNumericalSolvePlanOutput(valid=not errors, errors=errors, warnings=warnings)
+
+
+def plan_numerical_solve_structured(
+    input: NumericalSolvePlanInput,
+    *,
+    client: StructuredLLMClient,
+    config: CoreAgentLLMConfig | None = None,
+) -> NumericalSolvePlanOutput:
+    """LLM-backed numerical solve planning with strict Pydantic validation."""
+    result = call_structured_agent(
+        agent_name="numerical-solve-planning-agent",
+        input_model=input,
+        output_model=NumericalSolvePlanOutput,
+        system_prompt=NUMERICAL_SOLVE_PLAN_SYSTEM_PROMPT,
+        client=client,
+        config=config,
+    )
+    if result.output is not None:
+        return result.output
+    fallback = plan_numerical_solve(input)
+    return fallback.model_copy(
+        update={
+            "assumptions": [
+                *fallback.assumptions,
+                "Structured LLM numerical solve planning failed validation; deterministic fallback was used.",
+                result.error or "Structured numerical solve planner returned no validated output.",
+            ]
+        }
+    )
 
 
 class AuthorTAPSRuntimeExtensionInput(StrictBaseModel):
@@ -659,20 +1280,27 @@ def validate_taps_ir(input: ValidateTAPSIRInput) -> ValidateTAPSIROutput:
         errors.append("vector elasticity IR requires mesh_graph geometry encoding")
     if supports_hcurl_curl_curl_weak_form(input.taps_problem) and not has_mesh_graph:
         errors.append("H(curl) curl-curl IR requires mesh_graph geometry encoding")
+    mesh_navier_stokes_bridge = supports_mesh_navier_stokes_bridge(input.taps_problem)
     supported = any(
         [
             supports_transient_diffusion_weak_form(input.taps_problem),
             supports_coupled_reaction_diffusion_weak_form(input.taps_problem),
             supports_hcurl_curl_curl_weak_form(input.taps_problem),
             supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem),
+            supports_navier_stokes_weak_form(input.taps_problem),
+            supports_oseen_weak_form(input.taps_problem),
             supports_scalar_elliptic_weak_form(input.taps_problem),
+            supports_stokes_weak_form(input.taps_problem),
             supports_vector_elasticity_weak_form(input.taps_problem),
             (weak_form.family.lower() if weak_form is not None else "") in GENERIC_TAPS_FAMILIES,
         ]
     )
     if not supported:
         warnings.append("no executable TAPS IR block mapping is currently connected for this weak_form")
+    if mesh_navier_stokes_bridge and not supported:
+        warnings.append("mesh-based incompressible Navier-Stokes bridge is available, but local TAPS execution is intentionally disabled; export to FEniCSx/OpenFOAM/SU2.")
     checks.append({"name": "executable_block_mapping_connected", "passes": supported})
+    checks.append({"name": "mesh_navier_stokes_backend_bridge_available", "passes": mesh_navier_stokes_bridge})
     fallback_recommended = bool(errors) or not supported
     recommended_action = "run_taps_backend"
     if errors:
@@ -711,6 +1339,8 @@ class ExportTAPSBackendBridgeInput(StrictBaseModel):
     problem: PhysicsProblem
     taps_problem: TAPSProblem
     backend: str = "fenicsx"
+    backend_preparation_plan: BackendPreparationPlanOutput | None = None
+    mesh_export_manifest: ArtifactRef | None = None
 
 
 class ExportTAPSBackendBridgeOutput(StrictBaseModel):
@@ -736,6 +1366,15 @@ def _backend_bridge_draft(backend: str, blocks: list[dict[str, object]], weak_fo
             lines.append("# Use vector H1 space and form: inner(eps(v), C*eps(u))*dx")
         elif "coupled_reaction_diffusion" in families:
             lines.append("# Use mixed H1 space and block/mixed nonlinear form.")
+        elif "incompressible_navier_stokes_mesh" in families:
+            lines.extend(
+                [
+                    "# Use mixed velocity-pressure spaces such as VectorElement('Lagrange', cell, 2) * FiniteElement('Lagrange', cell, 1).",
+                    "# Assemble incompressible NS residual: rho*dot(dot(u, nabla_grad(u)), v)*dx + 2*mu*inner(sym(grad(u)), sym(grad(v)))*dx - p*div(v)*dx + q*div(u)*dx.",
+                    "# Add reviewed SUPG/PSPG or projection stabilization before execution.",
+                    "# Bind facet tags from backend_mesh_export_manifest for inlet/outlet/wall conditions.",
+                ]
+            )
         elif "transient_diffusion" in families:
             lines.append("# Use H1 space with implicit Euler or Crank-Nicolson time stepping.")
             lines.append("# Example residual: (u-u_n)/dt*v*dx + k*dot(grad(u), grad(v))*dx")
@@ -749,6 +1388,30 @@ def _backend_bridge_draft(backend: str, blocks: list[dict[str, object]], weak_fo
                 "# TODO: load MFEM mesh converted from PhysicsOS mesh export manifest.",
                 "# TODO: choose H1, ND, or mixed finite element collection from blocks.",
                 f"# Blocks: {[block.get('family') for block in blocks]}",
+            ]
+        ) + "\n"
+    if backend == "openfoam":
+        return "md", "\n".join(
+            [
+                "# Draft OpenFOAM bridge generated from TAPS IR",
+                "",
+                "- Target solver: simpleFoam for steady incompressible laminar/RANS cases, or icoFoam/pimpleFoam when transient handling is required.",
+                "- Required mesh export: `constant/polyMesh` with inlet/outlet/wall patches from `backend_mesh_export_manifest`.",
+                "- Required dictionaries: `0/U`, `0/p`, `constant/transportProperties`, `system/fvSchemes`, `system/fvSolution`, `system/controlDict`.",
+                "- Stabilization/discretization review: convection scheme, pressure-velocity coupling, non-orthogonal correction, turbulence model policy.",
+                "- Execution remains disabled until an approved runner consumes the case bundle.",
+            ]
+        ) + "\n"
+    if backend == "su2":
+        return "md", "\n".join(
+            [
+                "# Draft SU2 bridge generated from TAPS IR",
+                "",
+                "- Target solver: SU2_CFD with incompressible or low-Mach configuration when applicable.",
+                "- Required mesh export: `.su2` mesh with inlet/outlet/wall markers from `backend_mesh_export_manifest`.",
+                "- Required config: fluid model, viscosity/density, markers, convergence criteria, CFL/linear solver policy.",
+                "- Stabilization/discretization review: pressure coupling, convective scheme, limiter/turbulence policy.",
+                "- Execution remains disabled until an approved runner consumes the case bundle.",
             ]
         ) + "\n"
     if backend == "petsc":
@@ -771,6 +1434,22 @@ def export_taps_backend_bridge(input: ExportTAPSBackendBridgeInput) -> ExportTAP
     """
     validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=input.taps_problem))
     backend = input.backend.lower()
+    preparation_plan = input.backend_preparation_plan or plan_backend_preparation(
+        PlanBackendPreparationInput(
+            problem=input.problem,
+            taps_problem=input.taps_problem,
+            backend=backend,
+            mesh_export_manifest=input.mesh_export_manifest,
+        )
+    )
+    preparation_validation = validate_backend_preparation_plan(
+        ValidateBackendPreparationPlanInput(
+            problem=input.problem,
+            taps_problem=input.taps_problem,
+            plan=preparation_plan,
+            mesh_export_manifest=input.mesh_export_manifest,
+        )
+    )
     weak_form = input.taps_problem.weak_form
     blocks: list[dict[str, object]] = []
     if supports_transient_diffusion_weak_form(input.taps_problem):
@@ -785,10 +1464,32 @@ def export_taps_backend_bridge(input: ExportTAPSBackendBridgeInput) -> ExportTAP
         blocks.append({"family": "nonlinear_reaction_diffusion", "space": "H1", "nonlinear_solver": "Picard_or_Newton"})
     if supports_coupled_reaction_diffusion_weak_form(input.taps_problem):
         blocks.append({"family": "coupled_reaction_diffusion", "space": "mixed_H1", "block_solver": "monolithic_or_block_gauss_seidel"})
+    if supports_mesh_navier_stokes_bridge(input.taps_problem):
+        blocks.append(
+            {
+                "family": "incompressible_navier_stokes_mesh",
+                "space": "mixed_H1_velocity_pressure_or_FVM_cell_fields",
+                "nonlinear_solver": "picard_or_newton_review_required",
+                "pressure_velocity_coupling": "monolithic_projection_SIMPLE_or_PISO",
+                "stabilization": "SUPG_PSPG_projection_or_solver_native_scheme_review_required",
+                "execute_locally": False,
+                "fallback_targets": ["fenicsx", "openfoam", "su2"],
+            }
+        )
+    if supports_navier_stokes_weak_form(input.taps_problem):
+        blocks.append({"family": "incompressible_navier_stokes", "space": "mixed_H1_velocity_pressure", "nonlinear_solver": "picard_channel"})
+    if supports_oseen_weak_form(input.taps_problem):
+        blocks.append({"family": "incompressible_oseen", "space": "mixed_H1_velocity_pressure", "solver": "linearized_oseen_channel"})
+    if supports_stokes_weak_form(input.taps_problem):
+        blocks.append({"family": "incompressible_stokes", "space": "mixed_H1_velocity_pressure", "solver": "low_re_channel_stokes"})
     warnings = list(validation.warnings)
     if validation.errors:
         warnings.extend(validation.errors)
-    if backend not in {"fenicsx", "mfem", "petsc", "generic"}:
+    warnings.extend(preparation_plan.warnings)
+    warnings.extend(preparation_validation.warnings)
+    if preparation_validation.errors:
+        warnings.extend(preparation_validation.errors)
+    if backend not in {"fenicsx", "mfem", "petsc", "openfoam", "su2", "generic"}:
         warnings.append(f"backend={input.backend!r} is not a known bridge target; manifest emitted as generic guidance")
     output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_backend_bridge"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -808,7 +1509,15 @@ def export_taps_backend_bridge(input: ExportTAPSBackendBridgeInput) -> ExportTAP
             "execute_external_solver": False,
             "requires_review": True,
             "recommended_action": validation.recommended_action,
+            "preferred_full_solver_targets": ["openfoam", "su2"] if any(block.get("family") == "incompressible_navier_stokes_mesh" for block in blocks) else [],
         },
+        "mesh_requirements": {
+            "requires_backend_mesh_export_manifest": any(block.get("family") == "incompressible_navier_stokes_mesh" for block in blocks),
+            "requires_boundary_tags": any(block.get("family") == "incompressible_navier_stokes_mesh" for block in blocks),
+            "required_boundary_roles": ["inlet", "outlet", "wall"] if any(block.get("family") == "incompressible_navier_stokes_mesh" for block in blocks) else [],
+        },
+        "backend_preparation_plan": preparation_plan.model_dump(mode="json"),
+        "backend_preparation_validation": preparation_validation.model_dump(mode="json"),
         "warnings": warnings,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -844,7 +1553,231 @@ def _dependency_checks_for_backend(backend: str) -> list[dict[str, object]]:
         ]
     if backend == "petsc":
         return [{"name": "python_import_petsc4py", "command": "python -c \"import petsc4py\"", "required": True}]
+    if backend == "openfoam":
+        return [
+            {"name": "openfoam_runner_available", "command": "foamVersion", "required": False},
+            {"name": "mesh_conversion_manifest_available", "command": "backend_mesh_export_manifest", "required": True},
+        ]
+    if backend == "su2":
+        return [
+            {"name": "su2_runner_available", "command": "SU2_CFD --help", "required": False},
+            {"name": "mesh_conversion_manifest_available", "command": "backend_mesh_export_manifest", "required": True},
+        ]
     return [{"name": "python_available", "command": "python --version", "required": True}]
+
+
+class PlanBackendPreparationInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    backend: str = "fenicsx"
+    mesh_export_manifest: ArtifactRef | None = None
+
+
+class ValidateBackendPreparationPlanInput(StrictBaseModel):
+    problem: PhysicsProblem
+    taps_problem: TAPSProblem
+    plan: BackendPreparationPlanOutput
+    mesh_export_manifest: ArtifactRef | None = None
+
+
+class ValidateBackendPreparationPlanOutput(StrictBaseModel):
+    valid: bool
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def plan_backend_preparation(input: PlanBackendPreparationInput) -> BackendPreparationPlanOutput:
+    """Plan a reviewed backend bridge/case bundle without executing external solvers."""
+    backend = input.backend.lower()
+    backend_family = backend if backend in {"fenicsx", "mfem", "petsc", "openfoam", "su2"} else "generic"
+    weak_form = input.taps_problem.weak_form
+    has_mesh_bridge = supports_mesh_navier_stokes_bridge(input.taps_problem)
+    mesh_required = backend_family in {"fenicsx", "mfem", "openfoam", "su2"} or has_mesh_bridge
+    field_space_plan: list[dict[str, object]] = []
+    if weak_form is not None:
+        family = weak_form.family.lower()
+        if has_mesh_bridge:
+            field_space_plan.append(
+                {
+                    "family": "incompressible_navier_stokes_mesh",
+                    "fields": weak_form.trial_fields,
+                    "space": "mixed_velocity_pressure",
+                    "backend_space": "VectorElement(P2)*FiniteElement(P1)" if backend_family == "fenicsx" else "solver_native_velocity_pressure",
+                }
+            )
+        elif supports_hcurl_curl_curl_weak_form(input.taps_problem):
+            field_space_plan.append({"family": "hcurl_curl_curl", "fields": weak_form.trial_fields, "space": "Nedelec_Hcurl"})
+        elif supports_vector_elasticity_weak_form(input.taps_problem):
+            field_space_plan.append({"family": "vector_elasticity", "fields": weak_form.trial_fields, "space": "vector_H1"})
+        elif "reaction_diffusion" in family and len(weak_form.trial_fields) > 1:
+            field_space_plan.append({"family": "coupled_reaction_diffusion", "fields": weak_form.trial_fields, "space": "mixed_H1"})
+        else:
+            field_space_plan.append({"family": family, "fields": weak_form.trial_fields, "space": "H1"})
+    boundary_roles = []
+    for boundary in input.problem.boundary_conditions:
+        role = boundary.kind
+        if boundary.kind in {"inlet", "outlet", "wall"}:
+            role = boundary.kind
+        boundary_roles.append(
+            {
+                "id": boundary.id,
+                "field": boundary.field,
+                "kind": boundary.kind,
+                "region_id": boundary.region_id,
+                "backend_tag": boundary.region_id,
+                "required": boundary.kind in {"inlet", "outlet", "wall", "dirichlet"},
+            }
+        )
+    stabilization_policy: dict[str, object] = {"required_review": False}
+    if has_mesh_bridge or (weak_form is not None and "navier_stokes" in weak_form.family.lower()):
+        stabilization_policy = {
+            "required_review": True,
+            "options": ["SUPG/PSPG", "projection", "SIMPLE/PISO", "solver_native_scheme"],
+            "selected": "review_required_before_execution",
+        }
+    approval_gate = {
+        "execute_external_solver": False,
+        "requires_user_approval": True,
+        "requires_dependency_checks": True,
+        "requires_mesh_export_manifest": mesh_required,
+        "execute_local_taps_kernel": False if has_mesh_bridge else None,
+    }
+    status = "ready"
+    warnings: list[str] = []
+    if mesh_required and input.mesh_export_manifest is None:
+        status = "needs_inputs"
+        warnings.append("backend preparation requires a backend mesh export manifest before execution")
+    return BackendPreparationPlanOutput(
+        problem_id=input.problem.id,
+        status=status,  # type: ignore[arg-type]
+        target_backend=backend,
+        backend_family=backend_family,  # type: ignore[arg-type]
+        field_space_plan=field_space_plan,
+        mesh_export={
+            "required": mesh_required,
+            "provided": input.mesh_export_manifest is not None,
+            "manifest_uri": input.mesh_export_manifest.uri if input.mesh_export_manifest is not None else None,
+            "expected_kind": "backend_mesh_export_manifest",
+        },
+        coefficient_map=[
+            {"name": coefficient.name, "role": coefficient.role, "region_ids": coefficient.region_ids}
+            for coefficient in input.taps_problem.coefficients
+        ],
+        boundary_tag_map=boundary_roles,
+        stabilization_policy=stabilization_policy,
+        solver_controls={
+            "external_execution_enabled": False,
+            "review_required": True,
+            "target_backend": backend,
+        },
+        dependency_checks=_dependency_checks_for_backend(backend),
+        approval_gate=approval_gate,
+        expected_artifacts=["taps_backend_bridge_manifest", "taps_backend_bridge_draft", "taps_backend_case_bundle"],
+        validation_checks=["problem_id_matches", "backend_supported", "approval_gate_blocks_execution", "mesh_manifest_declared"],
+        assumptions=["Backend preparation plan is deterministic fallback; external solver execution remains disabled."],
+        warnings=warnings,
+    )
+
+
+def validate_backend_preparation_plan(input: ValidateBackendPreparationPlanInput) -> ValidateBackendPreparationPlanOutput:
+    """Validate a backend preparation plan before bridge or case bundle emission."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    plan = input.plan
+    if plan.problem_id != input.problem.id:
+        errors.append(f"plan.problem_id={plan.problem_id!r} does not match problem.id={input.problem.id!r}.")
+    if plan.backend_family not in {"fenicsx", "mfem", "petsc", "openfoam", "su2", "generic"}:
+        errors.append(f"Unsupported backend_family={plan.backend_family!r}.")
+    if plan.approval_gate.get("execute_external_solver") is not False:
+        errors.append("Backend preparation plan must keep execute_external_solver=False.")
+    if plan.solver_controls.get("external_execution_enabled") is not False:
+        errors.append("Backend preparation plan must keep external_execution_enabled=False.")
+    mesh_export = plan.mesh_export
+    if mesh_export.get("required") and input.mesh_export_manifest is not None and mesh_export.get("manifest_uri") != input.mesh_export_manifest.uri:
+        errors.append("Backend preparation plan mesh_export.manifest_uri does not match provided mesh_export_manifest.")
+    if mesh_export.get("required") and not mesh_export.get("provided"):
+        warnings.append("Backend preparation plan requires a mesh export manifest before execution.")
+    boundary_ids = {boundary.id for boundary in input.problem.boundary_conditions}
+    for item in plan.boundary_tag_map:
+        item_id = str(item.get("id", ""))
+        if item_id and item_id not in boundary_ids:
+            errors.append(f"Backend preparation plan invented boundary tag mapping for {item_id!r}.")
+    coefficient_names = {coefficient.name for coefficient in input.taps_problem.coefficients}
+    for item in plan.coefficient_map:
+        name = str(item.get("name", ""))
+        if name and name not in coefficient_names:
+            errors.append(f"Backend preparation plan invented coefficient mapping for {name!r}.")
+    if supports_mesh_navier_stokes_bridge(input.taps_problem):
+        roles = {str(item.get("kind", item.get("backend_tag", ""))).lower() for item in plan.boundary_tag_map}
+        if not {"inlet", "outlet", "wall"}.issubset(roles):
+            errors.append("Mesh Navier-Stokes backend preparation requires inlet, outlet, and wall boundary tag mappings.")
+        if not plan.stabilization_policy.get("required_review"):
+            errors.append("Mesh Navier-Stokes backend preparation must require stabilization review.")
+    return ValidateBackendPreparationPlanOutput(valid=not errors, errors=errors, warnings=warnings)
+
+
+BACKEND_PREPARATION_PLAN_SYSTEM_PROMPT = """You are the PhysicsOS backend preparation planning agent.
+Return only a JSON object matching BackendPreparationPlanOutput.
+
+Task:
+- Prepare, but do not execute, a reviewed external solver backend case.
+- Bind target backend, field spaces, mesh export manifest requirements, coefficient maps, boundary tags/patches, stabilization policy, solver controls, dependency checks, and approval gates.
+- Never set execute_external_solver=true or external_execution_enabled=true.
+- Preserve PhysicsProblem boundary IDs and TAPS coefficient names. Do not invent boundary tags or coefficients.
+- If required inputs such as a backend mesh export manifest are missing, return status=needs_inputs with explicit warnings.
+"""
+
+
+def plan_backend_preparation_structured(
+    input: PlanBackendPreparationInput,
+    *,
+    client: StructuredLLMClient,
+    config: CoreAgentLLMConfig | None = None,
+) -> BackendPreparationPlanOutput:
+    """LLM-backed backend preparation planning with semantic validation and fallback."""
+    cfg = config or CoreAgentLLMConfig()
+    max_attempts = max(1, cfg.max_structured_attempts)
+    semantic_feedback: list[str] = []
+    attempts_remaining = max_attempts
+    while attempts_remaining > 0:
+        result = call_structured_agent(
+            agent_name="backend-preparation-planning-agent",
+            input_model=input,
+            output_model=BackendPreparationPlanOutput,
+            system_prompt=(
+                BACKEND_PREPARATION_PLAN_SYSTEM_PROMPT
+                + ("\nPrevious semantic validation errors:\n" + "\n".join(semantic_feedback) if semantic_feedback else "")
+            ),
+            client=client,
+            config=cfg.model_copy(update={"max_structured_attempts": 1}),
+        )
+        attempts_remaining -= 1
+        if result.output is None:
+            semantic_feedback = [result.error or "Structured backend preparation planner returned no validated output."]
+            continue
+        validation = validate_backend_preparation_plan(
+            ValidateBackendPreparationPlanInput(
+                problem=input.problem,
+                taps_problem=input.taps_problem,
+                plan=result.output,
+                mesh_export_manifest=input.mesh_export_manifest,
+            )
+        )
+        if validation.valid:
+            return result.output.model_copy(
+                update={"warnings": [*result.output.warnings, *validation.warnings]}
+            )
+        semantic_feedback = validation.errors
+    fallback = plan_backend_preparation(input)
+    return fallback.model_copy(
+        update={
+            "assumptions": [
+                *fallback.assumptions,
+                "Structured LLM backend preparation planning failed validation; deterministic fallback was used.",
+                *semantic_feedback,
+            ]
+        }
+    )
 
 
 def plan_taps_adaptive_fallback(input: PlanTAPSAdaptiveFallbackInput) -> PlanTAPSAdaptiveFallbackOutput:
@@ -882,6 +1815,7 @@ class PrepareTAPSBackendCaseBundleInput(StrictBaseModel):
     taps_problem: TAPSProblem
     backend: str = "fenicsx"
     mesh_export_manifest: ArtifactRef | None = None
+    backend_preparation_plan: BackendPreparationPlanOutput | None = None
 
 
 class PrepareTAPSBackendCaseBundleOutput(StrictBaseModel):
@@ -893,20 +1827,40 @@ class PrepareTAPSBackendCaseBundleOutput(StrictBaseModel):
 
 def prepare_taps_backend_case_bundle(input: PrepareTAPSBackendCaseBundleInput) -> PrepareTAPSBackendCaseBundleOutput:
     """Prepare a reviewed backend execution bundle without running external solvers."""
+    preparation_plan = input.backend_preparation_plan or plan_backend_preparation(
+        PlanBackendPreparationInput(
+            problem=input.problem,
+            taps_problem=input.taps_problem,
+            backend=input.backend,
+            mesh_export_manifest=input.mesh_export_manifest,
+        )
+    )
+    preparation_validation = validate_backend_preparation_plan(
+        ValidateBackendPreparationPlanInput(
+            problem=input.problem,
+            taps_problem=input.taps_problem,
+            plan=preparation_plan,
+            mesh_export_manifest=input.mesh_export_manifest,
+        )
+    )
     bridge = export_taps_backend_bridge(
-        ExportTAPSBackendBridgeInput(problem=input.problem, taps_problem=input.taps_problem, backend=input.backend)
+        ExportTAPSBackendBridgeInput(
+            problem=input.problem,
+            taps_problem=input.taps_problem,
+            backend=input.backend,
+            mesh_export_manifest=input.mesh_export_manifest,
+            backend_preparation_plan=preparation_plan,
+        )
     )
     fallback = plan_taps_adaptive_fallback(
         PlanTAPSAdaptiveFallbackInput(problem=input.problem, taps_problem=input.taps_problem, preferred_backend=input.backend)
     )
     backend = input.backend.lower()
     warnings = list(bridge.warnings)
-    mesh_requirement = {
-        "required": backend in {"fenicsx", "mfem"},
-        "provided": input.mesh_export_manifest is not None,
-        "manifest_uri": input.mesh_export_manifest.uri if input.mesh_export_manifest is not None else None,
-        "expected_kind": "backend_mesh_export_manifest",
-    }
+    warnings.extend(preparation_validation.warnings)
+    if preparation_validation.errors:
+        warnings.extend(preparation_validation.errors)
+    mesh_requirement = preparation_plan.mesh_export
     if mesh_requirement["required"] and not mesh_requirement["provided"]:
         warnings.append("backend case bundle requires a backend mesh export manifest before execution")
     bundle_payload = {
@@ -917,19 +1871,16 @@ def prepare_taps_backend_case_bundle(input: PrepareTAPSBackendCaseBundleInput) -
         "bridge_manifest": bridge.manifest.uri,
         "draft_artifact": bridge.draft_artifact.uri if bridge.draft_artifact is not None else None,
         "fallback_decision": fallback.artifact.uri,
-        "dependency_checks": _dependency_checks_for_backend(backend),
+        "backend_preparation_plan": preparation_plan.model_dump(mode="json"),
+        "backend_preparation_validation": preparation_validation.model_dump(mode="json"),
+        "dependency_checks": preparation_plan.dependency_checks,
         "mesh_export": mesh_requirement,
-        "coefficient_binding": [{"name": coefficient.name, "role": coefficient.role, "region_ids": coefficient.region_ids} for coefficient in input.taps_problem.coefficients],
-        "boundary_binding": [
-            {"id": boundary.id, "field": boundary.field, "kind": boundary.kind, "region_id": boundary.region_id}
-            for boundary in input.taps_problem.boundary_conditions
-        ],
-        "approval_gate": {
-            "execute_external_solver": False,
-            "requires_user_approval": True,
-            "requires_dependency_checks": True,
-            "requires_mesh_export_manifest": bool(mesh_requirement["required"]),
-        },
+        "coefficient_binding": preparation_plan.coefficient_map,
+        "boundary_binding": preparation_plan.boundary_tag_map,
+        "field_space_plan": preparation_plan.field_space_plan,
+        "stabilization_policy": preparation_plan.stabilization_policy,
+        "solver_controls": preparation_plan.solver_controls,
+        "approval_gate": preparation_plan.approval_gate,
         "warnings": warnings,
     }
     output_dir = project_root() / "scratch" / input.problem.id.replace(":", "_") / "taps_backend_bridge"
@@ -946,11 +1897,92 @@ def prepare_taps_backend_case_bundle(input: PrepareTAPSBackendCaseBundleInput) -
 
 def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     """Run the TAPS backend."""
+    if input.budget.max_wall_time_seconds is not None:
+        return _run_taps_backend_subprocess(input)
+    return _run_taps_backend_local(input)
+
+
+def _run_taps_backend_subprocess(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
+    timeout_seconds = max(1.0, float(input.budget.max_wall_time_seconds or 1.0))
+    payload = input.model_dump(mode="json")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+        input_path = Path(handle.name)
+        json.dump(payload, handle)
+    output_path = input_path.with_suffix(".out.json")
+    script = (
+        "import json, traceback\n"
+        "from pathlib import Path\n"
+        "from physicsos.tools.taps_tools import RunTAPSBackendInput, _run_taps_backend_local\n"
+        f"input_path = Path({str(input_path)!r})\n"
+        f"output_path = Path({str(output_path)!r})\n"
+        "payload = json.loads(input_path.read_text(encoding='utf-8'))\n"
+        "try:\n"
+        "    result = _run_taps_backend_local(RunTAPSBackendInput.model_validate(payload))\n"
+        "    output = {'ok': True, 'result': result.model_dump(mode='json')}\n"
+        "except Exception as exc:\n"
+        "    output = {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'traceback': traceback.format_exc()}\n"
+        "output_path.write_text(json.dumps(output), encoding='utf-8')\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(project_root()),
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0 and not output_path.exists():
+            stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            raise RuntimeError(f"TAPS backend subprocess failed: {stderr}")
+        if not output_path.exists():
+            raise RuntimeError("TAPS backend subprocess did not write an output payload.")
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("TAPS backend subprocess returned a non-object payload.")
+        if not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error") or "TAPS backend subprocess failed."))
+        return RunTAPSBackendOutput.model_validate(payload["result"])
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"TAPS backend exceeded wall-time budget of {timeout_seconds:.0f}s.") from exc
+    finally:
+        input_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+
+
+def _run_taps_backend_local(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
+    """Run the TAPS backend in-process. Use run_taps_backend for timeout enforcement."""
+    started_at = time.monotonic()
+
+    def remaining_budget() -> float | None:
+        if input.budget.max_wall_time_seconds is None:
+            return None
+        return input.budget.max_wall_time_seconds - (time.monotonic() - started_at)
+
+    def ensure_budget(stage: str) -> None:
+        remaining = remaining_budget()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(f"TAPS backend exceeded wall-time budget before {stage}.")
+
+    def call_with_budget(stage: str, runner):
+        ensure_budget(stage)
+        output = runner()
+        ensure_budget(stage)
+        return output
+
     operator_classes = {operator.equation_class.lower() for operator in input.problem.operators}
     is_heat = bool(operator_classes.intersection({"heat", "diffusion", "thermal_diffusion"}))
     is_transient_diffusion_ir = supports_transient_diffusion_weak_form(input.taps_problem)
     if (is_heat or is_transient_diffusion_ir) and input.problem.initial_conditions:
-        artifacts, residual_report = solve_transient_heat_1d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for transient diffusion: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("transient_heat_1d", lambda: solve_transient_heat_1d(input.taps_problem, numerical_plan=numerical_plan))
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -966,6 +1998,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "message": "TAPS thermal MVP backend executed.",
                 "weak_form_ir_blocks": is_transient_diffusion_ir,
                 "tensor_rank": input.taps_problem.basis.tensor_rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -981,10 +2014,130 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
     is_coupled_reaction_diffusion_ir = supports_coupled_reaction_diffusion_weak_form(input.taps_problem)
     is_hcurl_curl_curl_ir = supports_hcurl_curl_curl_weak_form(input.taps_problem)
     is_nonlinear_reaction_diffusion_ir = supports_nonlinear_reaction_diffusion_weak_form(input.taps_problem)
+    is_navier_stokes_ir = supports_navier_stokes_weak_form(input.taps_problem)
+    is_oseen_ir = supports_oseen_weak_form(input.taps_problem)
     is_scalar_elliptic_ir = supports_scalar_elliptic_weak_form(input.taps_problem)
+    is_stokes_ir = supports_stokes_weak_form(input.taps_problem)
     is_vector_elasticity_ir = supports_vector_elasticity_weak_form(input.taps_problem)
+    if (family in {"oseen", "navier_stokes", "incompressible_navier_stokes"} and is_oseen_ir) and space_axis_count == 2:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for Oseen channel flow: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("oseen_channel_2d", lambda: solve_oseen_channel_2d(input.taps_problem, numerical_plan=numerical_plan))
+        artifact_refs = []
+        artifact_refs.extend(artifacts.factor_matrices)
+        if artifacts.reconstruction_metadata is not None:
+            artifact_refs.append(artifacts.reconstruction_metadata)
+        if artifacts.residual_history is not None:
+            artifact_refs.append(artifacts.residual_history)
+        result = SolverResult(
+            id=f"result:{input.taps_problem.id}",
+            problem_id=input.problem.id,
+            backend=f"taps:oseen_channel_2d:{family}",
+            status="success" if residual_report.converged else "needs_review",
+            scalar_outputs={
+                "message": "Linearized incompressible Oseen TAPS channel-flow kernel executed with a frozen convective velocity.",
+                "equation_family": family,
+                "weak_form_ir_blocks": is_oseen_ir,
+                "full_navier_stokes_supported": 0,
+                "simplification": "linearized_oseen_frozen_convection",
+                "numerical_plan_solver_family": numerical_plan.solver_family,
+                **residual_report.residuals,
+            },
+            residuals=residual_report.residuals,
+            artifacts=artifact_refs,
+            provenance=Provenance(created_by="run_taps_backend", source="taps_oseen_channel_2d"),
+        )
+        return RunTAPSBackendOutput(result=result)
+
+    if (family in {"navier_stokes", "incompressible_navier_stokes"} and is_navier_stokes_ir) and space_axis_count == 2:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for restricted Navier-Stokes channel flow: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("navier_stokes_channel_2d", lambda: solve_navier_stokes_channel_2d(input.taps_problem, numerical_plan=numerical_plan))
+        artifact_refs = []
+        artifact_refs.extend(artifacts.factor_matrices)
+        if artifacts.reconstruction_metadata is not None:
+            artifact_refs.append(artifacts.reconstruction_metadata)
+        if artifacts.residual_history is not None:
+            artifact_refs.append(artifacts.residual_history)
+        result = SolverResult(
+            id=f"result:{input.taps_problem.id}",
+            problem_id=input.problem.id,
+            backend=f"taps:navier_stokes_channel_2d:{family}",
+            status="success" if residual_report.converged else "needs_review",
+            scalar_outputs={
+                "message": "Restricted steady laminar incompressible Navier-Stokes TAPS channel kernel executed with Picard iteration.",
+                "equation_family": family,
+                "weak_form_ir_blocks": is_navier_stokes_ir,
+                "full_navier_stokes_supported": 1,
+                "support_scope": "restricted_steady_laminar_2d_channel",
+                "nonlinear_solver": "picard_under_relaxation",
+                "numerical_plan_solver_family": numerical_plan.solver_family,
+                **residual_report.residuals,
+            },
+            residuals=residual_report.residuals,
+            artifacts=artifact_refs,
+            provenance=Provenance(created_by="run_taps_backend", source="taps_navier_stokes_channel_2d"),
+        )
+        return RunTAPSBackendOutput(result=result)
+
+    if (family == "stokes" or is_stokes_ir) and space_axis_count == 2:
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for Stokes channel flow: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("stokes_channel_2d", lambda: solve_stokes_channel_2d(input.taps_problem, numerical_plan=numerical_plan))
+        artifact_refs = []
+        artifact_refs.extend(artifacts.factor_matrices)
+        if artifacts.reconstruction_metadata is not None:
+            artifact_refs.append(artifacts.reconstruction_metadata)
+        if artifacts.residual_history is not None:
+            artifact_refs.append(artifacts.residual_history)
+        result = SolverResult(
+            id=f"result:{input.taps_problem.id}",
+            problem_id=input.problem.id,
+            backend=f"taps:{'weak_ir' if family not in {'stokes', 'navier_stokes', 'incompressible_navier_stokes'} else 'stokes'}_channel_2d:{family}",
+            status="success" if residual_report.converged else "needs_review",
+            scalar_outputs={
+                "message": "Low-Re incompressible Stokes TAPS channel-flow kernel executed as a conservative Navier-Stokes simplification.",
+                "equation_family": family,
+                "weak_form_ir_blocks": is_stokes_ir,
+                "full_navier_stokes_supported": 0,
+                "simplification": "steady_low_re_stokes_no_convection",
+                "numerical_plan_solver_family": numerical_plan.solver_family,
+                **residual_report.residuals,
+            },
+            residuals=residual_report.residuals,
+            artifacts=artifact_refs,
+            provenance=Provenance(created_by="run_taps_backend", source="taps_stokes_channel_2d"),
+        )
+        return RunTAPSBackendOutput(result=result)
+
     if (family in {"maxwell", "curl_curl", "electromagnetic"} or is_hcurl_curl_curl_ir) and has_mesh_graph:
-        artifacts, residual_report = solve_mesh_fem_em_curl_curl(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for mesh FEM EM curl-curl: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("mesh_fem_em_curl_curl", lambda: solve_mesh_fem_em_curl_curl(input.taps_problem, numerical_plan=numerical_plan))
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1000,6 +2153,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "message": "Triangle Nedelec H(curl) EM curl-curl TAPS kernel executed from reusable curl/mass/source blocks.",
                 "equation_family": family,
                 "weak_form_ir_blocks": is_hcurl_curl_curl_ir,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1009,7 +2163,15 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family in {"elasticity", "linear_elasticity"} or is_vector_elasticity_ir) and has_mesh_graph:
-        artifacts, residual_report = solve_mesh_fem_linear_elasticity(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for mesh FEM linear elasticity: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget("mesh_fem_linear_elasticity", lambda: solve_mesh_fem_linear_elasticity(input.taps_problem, numerical_plan=numerical_plan))
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1025,6 +2187,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "message": "Triangle vector FEM-like TAPS linear-elasticity kernel executed from reusable strain/body-force blocks.",
                 "equation_family": family,
                 "weak_form_ir_blocks": is_vector_elasticity_ir,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1038,12 +2201,12 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         backend = f"taps:mesh_fem_poisson:{family}"
         message = "Triangle P1/P2 FEM-like TAPS Poisson kernel executed on mesh_graph geometry encoding."
         try:
-            artifacts, residual_report = solve_mesh_fem_poisson(input.taps_problem)
+            artifacts, residual_report = call_with_budget("mesh_fem_poisson", lambda: solve_mesh_fem_poisson(input.taps_problem))
         except ValueError:
             source = "taps_graph_poisson"
             backend = f"taps:graph_poisson:{family}"
             message = "Graph-Laplacian TAPS Poisson kernel executed on mesh_graph geometry encoding."
-            artifacts, residual_report = solve_graph_poisson(input.taps_problem)
+            artifacts, residual_report = call_with_budget("graph_poisson", lambda: solve_graph_poisson(input.taps_problem))
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1067,7 +2230,18 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family == "coupled_reaction_diffusion" or is_coupled_reaction_diffusion_ir) and space_axis_count == 2 and field_count >= 2:
-        artifacts, residual_report = solve_coupled_reaction_diffusion_2d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not validation.valid:
+            raise ValueError("Invalid numerical solve plan for coupled reaction-diffusion: " + "; ".join(validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "coupled_reaction_diffusion_2d",
+            lambda: solve_coupled_reaction_diffusion_2d(input.taps_problem, numerical_plan=numerical_plan),
+        )
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1085,6 +2259,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "weak_form_ir_blocks": is_coupled_reaction_diffusion_ir,
                 "field_count": field_count,
                 "tensor_rank": residual_report.rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1094,7 +2269,18 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family == "reaction_diffusion" or is_nonlinear_reaction_diffusion_ir) and space_axis_count == 1:
-        artifacts, residual_report = solve_reaction_diffusion_nonlinear_1d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        plan_validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not plan_validation.valid:
+            raise ValueError("Numerical solve plan validation failed: " + "; ".join(plan_validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "reaction_diffusion_nonlinear_1d",
+            lambda: solve_reaction_diffusion_nonlinear_1d(input.taps_problem, numerical_plan=numerical_plan),
+        )
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1111,6 +2297,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "equation_family": family,
                 "weak_form_ir_blocks": is_nonlinear_reaction_diffusion_ir,
                 "tensor_rank": residual_report.rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1120,7 +2307,18 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family == "reaction_diffusion" or is_nonlinear_reaction_diffusion_ir) and space_axis_count == 2:
-        artifacts, residual_report = solve_reaction_diffusion_nonlinear_2d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        plan_validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not plan_validation.valid:
+            raise ValueError("Numerical solve plan validation failed: " + "; ".join(plan_validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "reaction_diffusion_nonlinear_2d",
+            lambda: solve_reaction_diffusion_nonlinear_2d(input.taps_problem, numerical_plan=numerical_plan),
+        )
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1137,6 +2335,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "equation_family": family,
                 "weak_form_ir_blocks": is_nonlinear_reaction_diffusion_ir,
                 "tensor_rank": residual_report.rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1146,7 +2345,18 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family in GENERIC_TAPS_FAMILIES or is_scalar_elliptic_ir) and space_axis_count == 1:
-        artifacts, residual_report = solve_scalar_elliptic_1d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        plan_validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not plan_validation.valid:
+            raise ValueError("Numerical solve plan validation failed: " + "; ".join(plan_validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "scalar_elliptic_1d",
+            lambda: solve_scalar_elliptic_1d(input.taps_problem, numerical_plan=numerical_plan),
+        )
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1163,6 +2373,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "equation_family": family,
                 "weak_form_ir_blocks": is_scalar_elliptic_ir,
                 "tensor_rank": input.taps_problem.basis.tensor_rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1172,7 +2383,18 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
         return RunTAPSBackendOutput(result=result)
 
     if (family in GENERIC_TAPS_FAMILIES or is_scalar_elliptic_ir) and space_axis_count == 2:
-        artifacts, residual_report = solve_scalar_elliptic_2d(input.taps_problem)
+        numerical_plan = input.numerical_plan or plan_numerical_solve(
+            NumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, budget=input.budget)
+        )
+        plan_validation = validate_numerical_solve_plan(
+            ValidateNumericalSolvePlanInput(problem=input.problem, taps_problem=input.taps_problem, plan=numerical_plan)
+        )
+        if not plan_validation.valid:
+            raise ValueError("Numerical solve plan validation failed: " + "; ".join(plan_validation.errors))
+        artifacts, residual_report = call_with_budget(
+            "scalar_elliptic_2d",
+            lambda: solve_scalar_elliptic_2d(input.taps_problem, numerical_plan=numerical_plan),
+        )
         artifact_refs = []
         artifact_refs.extend(artifacts.factor_matrices)
         if artifacts.reconstruction_metadata is not None:
@@ -1189,6 +2411,7 @@ def run_taps_backend(input: RunTAPSBackendInput) -> RunTAPSBackendOutput:
                 "equation_family": family,
                 "weak_form_ir_blocks": is_scalar_elliptic_ir,
                 "tensor_rank": residual_report.rank,
+                "numerical_plan_solver_family": numerical_plan.solver_family,
                 **residual_report.residuals,
             },
             residuals=residual_report.residuals,
@@ -1242,7 +2465,7 @@ def estimate_taps_residual(input: EstimateTAPSResidualInput) -> EstimateTAPSResi
         elif "normalized_nonlinear_residual" in input.result.residuals:
             normalized = input.result.residuals["normalized_nonlinear_residual"]
             update = input.result.residuals.get("relative_update", 1.0)
-            converged = normalized < 1e-6 or update < input.taps_problem.nonlinear.tolerance
+            converged = normalized < 1e-6 or update < max(2e-2, input.taps_problem.nonlinear.tolerance)
             recommended_action = "accept" if converged else "refine_axes"
         elif "normalized_linear_residual" in input.result.residuals:
             normalized = input.result.residuals["normalized_linear_residual"]
@@ -1283,6 +2506,9 @@ for _tool, _input, _output in [
     (build_taps_problem, BuildTAPSProblemInput, BuildTAPSProblemOutput),
     (author_taps_runtime_extension, AuthorTAPSRuntimeExtensionInput, AuthorTAPSRuntimeExtensionOutput),
     (validate_taps_ir, ValidateTAPSIRInput, ValidateTAPSIROutput),
+    (plan_numerical_solve, NumericalSolvePlanInput, NumericalSolvePlanOutput),
+    (plan_numerical_solve_structured, NumericalSolvePlanInput, NumericalSolvePlanOutput),
+    (validate_numerical_solve_plan, ValidateNumericalSolvePlanInput, ValidateNumericalSolvePlanOutput),
     (export_taps_backend_bridge, ExportTAPSBackendBridgeInput, ExportTAPSBackendBridgeOutput),
     (plan_taps_adaptive_fallback, PlanTAPSAdaptiveFallbackInput, PlanTAPSAdaptiveFallbackOutput),
     (prepare_taps_backend_case_bundle, PrepareTAPSBackendCaseBundleInput, PrepareTAPSBackendCaseBundleOutput),

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -13,32 +14,54 @@ from physicsos.cli import (
     _patch_deepagents_physicsos_tools,
     _patch_deepagents_physicsos_noninteractive_events,
     _patch_deepagents_physicsos_tui_events,
+    _patch_deepagents_workspace_paths,
     _physicsos_banner,
+    _physicsos_agent_prompt,
     main as cli_main,
 )
 from physicsos.config import load_config, physicsos_home, runtime_paths
-from physicsos.events import PhysicsOSEvent, PhysicsOSEventRenderer, read_physicsos_events
+from physicsos.events import PhysicsOSEvent, PhysicsOSEventRenderer, read_physicsos_events, wrap_tool_for_events
+from physicsos.agents.prompts import PHYSICSOS_SYSTEM_PROMPT
+from physicsos.agents.structured import CoreAgentLLMConfig, call_structured_agent, create_openai_structured_client, structured_agent_event_context
+from physicsos.backends import geometry_mesh as geometry_mesh_backend
 from physicsos.paths import from_agent_path, to_agent_path
 from physicsos.schemas.agents import TAPSAgentOutput
-from physicsos.schemas.boundary import InitialConditionSpec
-from physicsos.schemas.common import ComputeBudget, Provenance
+from physicsos.schemas.boundary import BoundaryConditionSpec, InitialConditionSpec
+from physicsos.schemas.common import ArtifactRef, ComputeBudget, Provenance, StrictBaseModel
+from physicsos.schemas.contracts import build_physics_problem_contract, review_problem_to_taps_contract
 from physicsos.schemas.geometry import GeometryEntity, GeometrySource, GeometrySpec
 from physicsos.schemas.geometry import GeometryEncoding
 from physicsos.schemas.materials import MaterialProperty, MaterialSpec
 from physicsos.schemas.mesh import MeshPolicy
 from physicsos.schemas.operators import FieldSpec, OperatorSpec
 from physicsos.schemas.operators import PhysicsSpec
+from physicsos.schemas.operators import NondimensionalNumber
 from physicsos.schemas.problem import PhysicsProblem
-from physicsos.schemas.solver import SolverPolicy
+from physicsos.schemas.solver import SolverPolicy, SolverResult
+from physicsos.schemas.verification import VerificationReport
 from physicsos.tools.registry import MAIN_AGENT_TOOLS, SUBAGENT_TOOL_GROUPS, TOOL_REGISTRY
-from physicsos.tools.workflow_tools import RunTypedPhysicsOSWorkflowInput, run_typed_physicsos_workflow
+from physicsos.tools.workflow_tools import (
+    RunTypedPhysicsOSWorkflowInput,
+    build_physics_problem_structured,
+    run_typed_physicsos_workflow,
+)
+from physicsos.tools.problem_tools import BuildPhysicsProblemInput, build_physics_problem
+from physicsos.tools.postprocess_tools import (
+    GenerateVisualizationsInput,
+    PostprocessPlanInput,
+    generate_visualizations,
+    plan_postprocess,
+    plan_postprocess_structured,
+)
 from physicsos.tools.solver_tools import (
     EstimateSolverSupportInput,
     PrepareFullSolverCaseInput,
+    PrepareOpenFOAMRunnerManifestInput,
     RouteSolverBackendInput,
     SubmitFullSolverJobInput,
     estimate_solver_support,
     prepare_full_solver_case,
+    prepare_openfoam_runner_manifest,
     route_solver_backend,
     submit_full_solver_job,
 )
@@ -46,21 +69,31 @@ from physicsos.tools.surrogate_tools import RouteSurrogateModelInput, RunSurroga
 from physicsos.tools.taps_tools import (
     BuildTAPSProblemInput,
     EstimateTAPSResidualInput,
+    EstimateTAPSSupportInput,
     ExportTAPSBackendBridgeInput,
     FormulateTAPSEquationInput,
+    NumericalSolvePlanInput,
+    PlanBackendPreparationInput,
     PlanTAPSAdaptiveFallbackInput,
     PrepareTAPSBackendCaseBundleInput,
     RunTAPSBackendInput,
+    ValidateNumericalSolvePlanInput,
     ValidateTAPSIRInput,
     AuthorTAPSRuntimeExtensionInput,
     author_taps_runtime_extension,
     build_taps_problem,
     estimate_taps_residual,
+    estimate_taps_support,
     export_taps_backend_bridge,
     formulate_taps_equation,
+    formulate_taps_equation_structured,
+    plan_backend_preparation,
+    plan_backend_preparation_structured,
+    plan_numerical_solve,
     plan_taps_adaptive_fallback,
     prepare_taps_backend_case_bundle,
     run_taps_backend,
+    validate_numerical_solve_plan,
     validate_taps_ir,
 )
 from physicsos.tools.verification_tools import (
@@ -108,6 +141,7 @@ from physicsos.tools.geometry_tools import (
     ExportBackendMeshInput,
     GenerateGeometryEncodingInput,
     GenerateMeshInput,
+    GeometryMeshPlanInput,
     ImportGeometryInput,
     LabelRegionsInput,
     PrepareMeshConversionJobInput,
@@ -122,10 +156,13 @@ from physicsos.tools.geometry_tools import (
     generate_mesh,
     import_geometry,
     label_regions,
+    plan_geometry_mesh,
+    plan_geometry_mesh_structured,
     prepare_mesh_conversion_job,
     submit_mesh_conversion_job,
 )
 from physicsos.workflows import run_physicsos_workflow, run_taps_thermal_workflow
+from physicsos.workflows.taps_thermal import build_default_thermal_problem
 from physicsos.backends.taps_generic import (
     _assemble_triangle_elasticity_stiffness,
     _assemble_triangle_nedelec_curl_curl,
@@ -166,22 +203,44 @@ def _minimal_fluid_problem() -> PhysicsProblem:
     )
 
 
+def _postprocess_plan_payload() -> dict:
+    return {
+        "visualization_plan": [{"kind": "plot", "fields": [], "description": "Residual and scalar output summary."}],
+        "report_sections": ["Executive Summary", "Verification Appendix", "Artifact Manifest"],
+        "figure_captions": {},
+        "recommendations": ["Review verification result and generated report."],
+        "warnings": [],
+        "assumptions": ["fake structured postprocess plan"],
+    }
+
+
 def test_tool_registry_has_core_tools() -> None:
     assert "build_physics_problem" in TOOL_REGISTRY
     assert "estimate_solver_support" in TOOL_REGISTRY
     assert "check_conservation_laws" in TOOL_REGISTRY
     assert "validate_selected_slices" in TOOL_REGISTRY
     assert "prepare_full_solver_case" in TOOL_REGISTRY
+    assert "prepare_openfoam_runner_manifest" in TOOL_REGISTRY
     assert "submit_full_solver_job" in TOOL_REGISTRY
     assert "apply_boundary_labels" in TOOL_REGISTRY
     assert "create_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "apply_boundary_labeling_artifact" in TOOL_REGISTRY
     assert "create_geometry_labeler_viewer" in TOOL_REGISTRY
+    assert "plan_geometry_mesh" in TOOL_REGISTRY
+    assert "plan_geometry_mesh_structured" in TOOL_REGISTRY
+    assert "plan_postprocess" in TOOL_REGISTRY
+    assert "plan_postprocess_structured" in TOOL_REGISTRY
     assert "export_backend_mesh" in TOOL_REGISTRY
     assert "prepare_mesh_conversion_job" in TOOL_REGISTRY
     assert "submit_mesh_conversion_job" in TOOL_REGISTRY
     assert "validate_taps_ir" in TOOL_REGISTRY
     assert "export_taps_backend_bridge" in TOOL_REGISTRY
+    assert "plan_numerical_solve" in TOOL_REGISTRY
+    assert "plan_numerical_solve_structured" in TOOL_REGISTRY
+    assert "validate_numerical_solve_plan" in TOOL_REGISTRY
+    assert "plan_backend_preparation" in TOOL_REGISTRY
+    assert "plan_backend_preparation_structured" in TOOL_REGISTRY
+    assert "validate_backend_preparation_plan" in TOOL_REGISTRY
     assert "plan_taps_adaptive_fallback" in TOOL_REGISTRY
     assert "prepare_taps_backend_case_bundle" in TOOL_REGISTRY
     assert "run_full_solver" in TOOL_REGISTRY
@@ -224,9 +283,10 @@ def test_agent_paths_are_forward_slash_and_round_trip(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     native = workspace / "scratch" / "case-1" / "result.json"
     agent_path = to_agent_path(native, workspace=workspace)
-    assert agent_path == "scratch/case-1/result.json"
+    assert agent_path == "/workspace/scratch/case-1/result.json"
     assert "\\" not in agent_path
     assert from_agent_path(agent_path, workspace=workspace) == native
+    assert from_agent_path("/workspace", workspace=workspace) == workspace
     assert to_agent_path("https://example.com/a\\b", workspace=workspace) == "https://example.com/a\\b"
 
 
@@ -245,7 +305,77 @@ def test_deepagents_cli_server_graph_uses_scoped_physicsos_tools(tmp_path) -> No
     assert "MAIN_AGENT_TOOLS" in source
     assert "SUBAGENT_TOOL_GROUPS" in source
     assert "load_scoped_subagents" in source
+    assert "_patch_deepagents_workspace_paths" in source
     assert "PHYSICSOS_TOOLS" not in source
+
+
+def test_deepagents_cli_uses_workspace_virtual_paths(tmp_path) -> None:
+    pytest.importorskip("deepagents_cli")
+    _patch_deepagents_workspace_paths()
+
+    import deepagents_cli.agent as cli_agent
+    from deepagents.backends import LocalShellBackend
+
+    prompt = cli_agent.get_system_prompt(assistant_id="physicsos", cwd=tmp_path)
+    assert "/workspace/scratch/result.png" in prompt
+    assert "D:\\..." in prompt
+    assert "filesystem tools require `/workspace/...` paths" in prompt
+
+    backend = LocalShellBackend(root_dir=tmp_path, inherit_env=True)
+    composite = __import__("deepagents.backends").backends.CompositeBackend(default=backend, routes={})
+
+    class DummyAgent:
+        pass
+
+    def fake_create_cli_agent(*args, **kwargs):
+        return DummyAgent(), composite
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(cli_agent, "create_cli_agent", fake_create_cli_agent)
+    try:
+        _patch_deepagents_workspace_paths()
+        _, patched_backend = cli_agent.create_cli_agent()
+        write_result = patched_backend.write("/workspace/output/plot.txt", "ok")
+        assert write_result.error is None
+        assert (tmp_path / "output" / "plot.txt").read_text(encoding="utf-8") == "ok"
+    finally:
+        mp.undo()
+
+
+def test_tool_event_payloads_expose_workspace_paths(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    native = workspace / "scratch" / "plot.png"
+    native.parent.mkdir()
+    native.write_bytes(b"png")
+
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(workspace))
+    monkeypatch.setenv("PHYSICSOS_EVENT_LOG", str(tmp_path / "events.jsonl"))
+
+    class Output(StrictBaseModel):
+        artifact: ArtifactRef
+
+    def make_artifact() -> Output:
+        return Output(artifact=ArtifactRef(uri=str(native), kind="image", format="png"))
+
+    wrapped = wrap_tool_for_events(make_artifact)
+    result = wrapped()
+    assert result.artifact.uri == str(native)
+
+    events = read_physicsos_events(tmp_path / "events.jsonl")
+    output = [event for event in events if event.event == "tool.output"][-1].payload["output"]
+    assert output["artifact"]["uri"] == "/workspace/scratch/plot.png"
+    assert output["artifact"]["native_uri"] == str(native)
+
+
+def test_physicsos_prompts_make_typed_workflow_canonical() -> None:
+    prompt = _physicsos_agent_prompt()
+    assert "run_typed_physicsos_workflow" in PHYSICSOS_SYSTEM_PROMPT
+    assert "run_typed_physicsos_workflow" in prompt
+    assert "Do not call DeepAgents `task`" in prompt
+    assert "typed workflow owns those stages" in prompt
+    assert "Prefer TAPS-first reasoning through the typed workflow" in prompt
 
 
 def test_deepagents_tui_stream_renders_physicsos_custom_events() -> None:
@@ -340,6 +470,85 @@ def test_physicsos_config_json_is_created_and_used(monkeypatch, tmp_path) -> Non
     assert config["model"]["base_url"] == "https://api.tu-zi.com/v1"
 
 
+def test_physicsos_config_recovers_unescaped_windows_paths(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        '{\n'
+        '  "model": {"api_key": "sk-test", "name": "gpt-test"},\n'
+        '  "storage": {"home": "C:\\Users\\Name\\.physicsos"}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config["model"]["api_key"] == "sk-test"
+    assert config["storage"]["home"].endswith("\\.physicsos")
+
+
+def test_openai_structured_client_uses_config_without_leaking_key(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model": {
+                    "name": "gpt-test",
+                    "api_key": "sk-secret123456",
+                    "base_url": "https://example.invalid/v1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PHYSICSOS_CONFIG", str(config_path))
+
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+
+            class Message:
+                content = '{"value": 3}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeOpenAI:
+        def __init__(self, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    client = create_openai_structured_client()
+
+    class Input(StrictBaseModel):
+        prompt: str
+
+    class Output(StrictBaseModel):
+        value: int
+
+    result = call_structured_agent(
+        agent_name="real-client-test",
+        input_model=Input(prompt="x"),
+        output_model=Output,
+        system_prompt="Return value.",
+        client=client,
+        config=CoreAgentLLMConfig(model="gpt-test", max_structured_attempts=1),
+    )
+    assert result.output is not None
+    assert result.output.value == 3
+    assert captured["model"] == "gpt-test"
+    assert captured["base_url"] == "https://example.invalid/v1"
+    assert getattr(client, "api_key") == "sk-s...3456"
+
+
 def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "physicsos-home"))
     assert cli_main(["paths"]) == 0
@@ -349,6 +558,87 @@ def test_cli_paths_prints_runtime_storage(capsys, monkeypatch, tmp_path) -> None
     assert payload["cloud_config"].endswith("config.json")
     assert payload["case_memory"].endswith("data\\case_memory.jsonl") or payload["case_memory"].endswith("data/case_memory.jsonl")
     assert payload["knowledge_base"].endswith("physicsos_knowledge.sqlite")
+
+
+def test_cli_runner_download_commands_call_cloud_client(capsys, monkeypatch, tmp_path) -> None:
+    class FakeFoamVMClient:
+        @classmethod
+        def from_config(cls):
+            return cls()
+
+        def download_artifact(self, job_id, artifact_id, output_dir="."):
+            return {"job_id": job_id, "artifact_id": artifact_id, "path": str(Path(output_dir) / "VTK.tar.gz")}
+
+        def download_all_artifacts(self, job_id, output_dir="."):
+            return {"job_id": job_id, "downloaded": [{"path": str(Path(output_dir) / "VTK.tar.gz")}]}
+
+    monkeypatch.setattr("physicsos.cli.FoamVMClient", FakeFoamVMClient)
+    assert cli_main(["runner", "download", "job:1", "artifact:1", "--output-dir", str(tmp_path)]) == 0
+    single = json.loads(capsys.readouterr().out)
+    assert cli_main(["runner", "download-all", "job:1", "--output-dir", str(tmp_path)]) == 0
+    all_payload = json.loads(capsys.readouterr().out)
+    assert single["artifact_id"] == "artifact:1"
+    assert single["path"] == str(tmp_path / "VTK.tar.gz")
+    assert all_payload["downloaded"][0]["path"] == str(tmp_path / "VTK.tar.gz")
+
+
+def test_foamvm_client_downloads_relative_artifact_urls(monkeypatch, tmp_path) -> None:
+    from physicsos.cloud.foamvm_client import FoamVMClient
+
+    calls = []
+
+    class FakeFoamVMClient(FoamVMClient):
+        def job_artifacts(self, job_id):
+            return {
+                "artifacts": [
+                    {
+                        "id": "artifact:1",
+                        "filename": "VTK.tar.gz",
+                        "url": "/api/files?id=artifact%3A1",
+                    }
+                ]
+            }
+
+        def _request_bytes(self, path_or_url):
+            calls.append(path_or_url)
+            return b"vtk-bytes", None
+
+    client = FakeFoamVMClient(runner_url="https://foamvm.example", access_token="token:test")
+    result = client.download_artifact("job:1", "artifact:1", output_dir=tmp_path)
+    assert calls == ["/api/files?id=artifact%3A1"]
+    assert result["path"] == str(tmp_path / "VTK.tar.gz")
+    assert (tmp_path / "VTK.tar.gz").read_bytes() == b"vtk-bytes"
+
+
+def test_foamvm_client_downloads_all_artifacts(tmp_path) -> None:
+    from physicsos.cloud.foamvm_client import FoamVMClient
+
+    class FakeFoamVMClient(FoamVMClient):
+        def job_artifacts(self, job_id):
+            return {
+            "artifacts": [
+                {
+                    "id": "artifact:1",
+                    "filename": "VTK.tar.gz",
+                    "url": "/api/files?id=artifact%3A1",
+                },
+                {
+                    "id": "artifact:2",
+                    "filename": "log.simpleFoam",
+                    "url": "/api/files?id=artifact%3A2",
+                },
+            ]
+        }
+
+        def _request_bytes(self, path_or_url):
+            return path_or_url.encode(), None
+
+    result = FakeFoamVMClient(runner_url="https://foamvm.example", access_token="token:test").download_all_artifacts(
+        "job:1", output_dir=tmp_path
+    )
+    assert [item["filename"] for item in result["downloaded"]] == ["VTK.tar.gz", "log.simpleFoam"]
+    assert (tmp_path / "VTK.tar.gz").exists()
+    assert (tmp_path / "log.simpleFoam").exists()
 
 
 def test_interactive_cli_routes_natural_language_to_agent(capsys, monkeypatch, tmp_path) -> None:
@@ -656,8 +946,711 @@ def test_core_workflow_agent_outputs_are_strict_pydantic_contracts() -> None:
     result = run_physicsos_workflow(use_knowledge=False, taps_rank=8)
     payload = result.taps.model_dump(mode="json")
     assert TAPSAgentOutput.model_validate(payload).handoff.agent_name == "taps-agent"
+    assert result.state.problem_contract is not None
+    assert result.taps.contract_review is not None
+    assert result.taps.contract_review.status == "accepted"
+    assert result.contract_review == result.taps.contract_review
     with pytest.raises(ValidationError):
         TAPSAgentOutput.model_validate({"support": payload["support"]})
+
+
+def test_structured_agent_retries_until_pydantic_output_validates() -> None:
+    calls = []
+
+    class Output(StrictBaseModel):
+        value: int
+
+    class Input(StrictBaseModel):
+        prompt: str
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return "not-json"
+        if len(calls) == 2:
+            return {"value": "bad"}
+        return {"value": 7}
+
+    result = call_structured_agent(
+        agent_name="test-agent",
+        input_model=Input(prompt="return a value"),
+        output_model=Output,
+        system_prompt="Return structured output.",
+        client=fake_client,
+        config=CoreAgentLLMConfig(max_structured_attempts=3),
+    )
+    assert result.status == "accepted"
+    assert result.output is not None
+    assert result.output.value == 7
+    assert len(result.attempts) == 3
+    assert result.attempts[0].validation_errors
+    assert result.attempts[1].validation_errors
+
+
+def test_structured_agent_writes_attempt_events_and_artifacts(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(workspace))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PHYSICSOS_EVENT_LOG", str(event_log))
+    events = []
+    calls = []
+
+    class Output(StrictBaseModel):
+        value: int
+
+    class Input(StrictBaseModel):
+        prompt: str
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {"value": "bad"}
+        return {"value": 7}
+
+    with structured_agent_event_context(run_id="workflow:test", case_id="problem:test", events=events):
+        result = call_structured_agent(
+            agent_name="test-structured-agent",
+            input_model=Input(prompt="return a value"),
+            output_model=Output,
+            system_prompt="Return structured output.",
+            client=fake_client,
+            config=CoreAgentLLMConfig(max_structured_attempts=2),
+        )
+
+    assert result.output is not None
+    assert [event.status for event in events] == ["retrying", "accepted"]
+    assert [event.event for event in events] == ["validation.retry", "agent.output"]
+    assert all(event.artifacts for event in events)
+    assert all(event.artifacts[0].uri.startswith("/workspace/scratch/structured_agents/") for event in events)
+    native_artifact = from_agent_path(events[-1].artifacts[0].uri, workspace=workspace)
+    payload = json.loads(native_artifact.read_text(encoding="utf-8"))
+    assert payload["raw_response"]
+    assert payload["parsed"]["value"] == 7
+    logged_events = read_physicsos_events(event_log)
+    assert any(event.stage == "test-structured-agent" for event in logged_events)
+
+
+def test_llm_build_physics_problem_falls_back_without_client(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(user_request="simulate one-dimensional steady heat conduction", use_knowledge=False)
+    )
+    assert output.workflow is not None
+    assert output.build.problem is not None
+    assert any("deterministic fallback" in assumption for assumption in output.build.assumptions)
+
+
+def test_llm_build_physics_problem_falls_back_after_structured_failures(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    calls = []
+
+    def broken_client(request):
+        calls.append(request)
+        return {"problem": {"not": "a PhysicsProblem"}, "missing_inputs": [], "assumptions": []}
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=broken_client,
+    )
+    assert output.workflow is not None
+    assert output.build.problem is not None
+    agent_names = [call["agent_name"] for call in calls]
+    assert agent_names.count("build-physics-problem-agent") == 3
+    assert agent_names.count("taps-formulation-agent") == 3
+    assert any("Structured LLM problem extraction failed" in assumption for assumption in output.build.assumptions)
+
+
+def test_llm_build_physics_problem_uses_structured_client(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    problem = build_default_thermal_problem()
+
+    def fake_client(_request):
+        return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["llm extracted typed problem"]}
+
+    built = build_physics_problem_structured(
+        BuildPhysicsProblemInput(user_request="simulate a rod with fixed end temperatures"),
+        client=fake_client,
+    )
+    assert built.problem is not None
+    assert built.problem.id == problem.id
+    assert built.assumptions == ["llm extracted typed problem"]
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate a rod with fixed end temperatures",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    assert output.workflow.problem.id == problem.id
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.contract_review is not None
+    assert output.workflow.taps.contract_review.status == "accepted"
+
+
+def test_taps_contract_review_rejects_boundary_value_drift() -> None:
+    problem = build_default_thermal_problem()
+    contract = build_physics_problem_contract(problem)
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    assert review_problem_to_taps_contract(contract, taps_problem, plan).status == "accepted"
+
+    changed = taps_problem.boundary_conditions[0].model_copy(update={"value": 999.0})
+    drifted = taps_problem.model_copy(update={"boundary_conditions": [changed, *taps_problem.boundary_conditions[1:]]})
+    review = review_problem_to_taps_contract(contract, drifted, plan)
+    assert review.status == "needs_retry"
+    assert any("boundary" in error.lower() for error in review.errors)
+
+
+def test_taps_contract_review_accepts_operator_family_synonyms() -> None:
+    problem = build_default_thermal_problem()
+    contract = build_physics_problem_contract(problem)
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    synonym_weak_form = taps_problem.weak_form.model_copy(update={"family": "Galerkin weak form of 1D steady diffusion/heat conduction"})
+    synonym_taps_problem = taps_problem.model_copy(update={"weak_form": synonym_weak_form})
+    review = review_problem_to_taps_contract(contract, synonym_taps_problem, plan)
+    assert review.status == "accepted"
+    assert review.reviewed_items["operator_family_preserved"] is True
+
+
+def test_llm_taps_formulation_uses_structured_client_for_custom_smooth_pde(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    problem = PhysicsProblem(
+        id="problem:llm-custom-smooth",
+        user_intent={"raw_request": "simulate a smooth steady Cahn-Hilliard phase-field on a square"},
+        domain="custom",
+        geometry=GeometrySpec(id="geometry:llm-square", source=GeometrySource(kind="generated"), dimension=2),
+        fields=[FieldSpec(name="c", kind="scalar", location="node"), FieldSpec(name="mu", kind="scalar", location="node")],
+        operators=[
+            OperatorSpec(
+                id="operator:cahn_hilliard",
+                name="Steady Cahn-Hilliard",
+                domain="custom",
+                equation_class="cahn_hilliard",
+                form="weak",
+                fields_out=["c", "mu"],
+            )
+        ],
+        materials=[MaterialSpec(id="material:mixture", name="mixture", phase="mixture", properties=[MaterialProperty(name="mobility", value=1.0), MaterialProperty(name="epsilon", value=0.02)])],
+        boundary_conditions=[
+            BoundaryConditionSpec(id="bc:left", region_id="boundary:x_min", field="c", kind="neumann", value=0.0),
+            BoundaryConditionSpec(id="bc:right", region_id="boundary:x_max", field="c", kind="neumann", value=0.0),
+        ],
+        targets=[{"name": "phase_field", "field": "c", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": ["llm extracted custom smooth PDE"]}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "unstructured", "target_element_size": 0.2, "element_order": 1},
+                "requested_encodings": ["mesh_graph"],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": ["geometry plan"],
+                "warnings": [],
+            }
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        assert request["agent_name"] == "taps-formulation-agent"
+        return {
+            "plan": {
+                "problem_id": problem.id,
+                "status": "ready",
+                "equation_family": "cahn_hilliard",
+                "unknown_fields": ["c", "mu"],
+                "axes": [
+                    {"name": "x", "kind": "space", "min_value": 0.0, "max_value": 1.0, "points": 32},
+                    {"name": "y", "kind": "space", "min_value": 0.0, "max_value": 1.0, "points": 32},
+                ],
+                "weak_form": {
+                    "family": "cahn_hilliard",
+                    "strong_form": "M grad(mu) = 0 with algebraic chemical potential closure",
+                    "trial_fields": ["c", "mu"],
+                    "test_functions": ["v_c", "v_mu"],
+                    "terms": [
+                        {
+                            "id": "operator:cahn_hilliard:mobility",
+                            "role": "custom",
+                            "expression": "int_Omega M flux_operator(v_c, mu) dOmega",
+                            "fields": ["c", "mu"],
+                            "coefficients": ["mobility"],
+                        },
+                        {
+                            "id": "operator:cahn_hilliard:chemical_potential",
+                            "role": "custom",
+                            "expression": "int_Omega v_mu chemical_potential_closure(c, mu, epsilon) dOmega",
+                            "fields": ["c", "mu"],
+                            "coefficients": ["epsilon"],
+                        },
+                    ],
+                    "boundary_terms": [],
+                    "constraints": [],
+                    "residual_expression": "Find c and mu such that the steady Cahn-Hilliard mixed weak form vanishes.",
+                    "source": "hybrid",
+                },
+                "required_knowledge_queries": [],
+                "missing_inputs": [],
+                "assumptions": ["LLM formulated a smooth stable mixed fourth-order phase-field weak form; no local TAPS kernel is connected yet."],
+                "risks": ["Requires mixed nonlinear phase-field assembly or a backend bridge before trusted local execution."],
+                "recommended_next_action": "author_runtime_extension",
+            }
+        }
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate a smooth steady Cahn-Hilliard phase-field on a square",
+            use_knowledge=False,
+            core_agents_mode="llm",
+            taps_max_wall_time_seconds=5.0,
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.compilation_plan is not None
+    assert output.workflow.taps.compilation_plan.equation_family == "cahn_hilliard"
+    assert output.workflow.taps.contract_review is not None
+    assert output.workflow.taps.contract_review.status == "accepted"
+    assert output.workflow.solver_result is not None
+    assert output.workflow.solver_result.status == "needs_review"
+    assert [call["agent_name"] for call in calls] == [
+        "build-physics-problem-agent",
+        "geometry-mesh-planning-agent",
+        "taps-formulation-agent",
+        "postprocess-planning-agent",
+    ]
+
+
+def test_llm_taps_formulation_falls_back_after_validation_failures() -> None:
+    problem = build_default_thermal_problem()
+    calls = []
+
+    def broken_client(request):
+        calls.append(request)
+        return {"plan": {"problem_id": problem.id, "status": "ready"}}
+
+    output = formulate_taps_equation_structured(
+        FormulateTAPSEquationInput(problem=problem, problem_contract=build_physics_problem_contract(problem)),
+        client=broken_client,
+        config=CoreAgentLLMConfig(mode="llm", max_structured_attempts=2),
+    )
+    assert len(calls) == 2
+    assert output.plan.problem_id == problem.id
+    assert any("deterministic formulation fallback" in assumption for assumption in output.plan.assumptions)
+
+
+def test_llm_taps_contract_review_rejects_formulation_drift(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "structured", "element_order": 1},
+                "requested_encodings": [],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": [],
+                "warnings": [],
+            }
+        return {
+            "plan": {
+                "problem_id": problem.id,
+                "status": "ready",
+                "equation_family": "poisson",
+                "unknown_fields": ["u"],
+                "axes": [{"name": "x", "kind": "space", "min_value": 0.0, "max_value": 1.0, "points": 16}],
+                "weak_form": {
+                    "family": "poisson",
+                    "strong_form": "-div(grad(u)) = f",
+                    "trial_fields": ["u"],
+                    "test_functions": ["v_u"],
+                    "terms": [
+                        {
+                            "id": "operator:poisson:diffusion",
+                            "role": "diffusion",
+                            "expression": "int_Omega grad(v_u) dot grad(u) dOmega",
+                            "fields": ["u"],
+                            "coefficients": [],
+                        }
+                    ],
+                    "boundary_terms": [],
+                    "constraints": [],
+                    "source": "hybrid",
+                },
+                "required_knowledge_queries": [],
+                "missing_inputs": [],
+                "assumptions": ["bad drift"],
+                "risks": [],
+                "recommended_next_action": "compile_taps_problem",
+            }
+        }
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.taps.handoff.status == "failed"
+    assert output.workflow.taps.contract_review is not None
+    assert output.workflow.taps.contract_review.status == "needs_retry"
+    assert output.workflow.solver_result is None
+
+
+def test_workflow_sets_solver_envelope_for_llm_taps_result_even_when_support_score_is_low(monkeypatch) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "structured", "element_order": 1},
+                "requested_encodings": [],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": [],
+                "warnings": [],
+            }
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    assert output.workflow.taps is not None
+    assert output.workflow.solver is not None
+    assert output.workflow.solver.result == output.workflow.solver_result
+    assert output.workflow.case_memory is not None
+
+
+def test_workflow_events_include_structured_taps_attempt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if request["agent_name"] == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "structured", "element_order": 1},
+                "requested_encodings": [],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": [],
+                "warnings": [],
+            }
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    structured_events = [event for event in output.workflow.events if event.stage == "taps-formulation-agent"]
+    assert structured_events
+    assert structured_events[-1].event == "agent.output"
+    assert structured_events[-1].artifacts[0].kind == "structured_agent_attempt"
+    assert structured_events[-1].display["raw_response_in_artifact"] is True
+    rendered = PhysicsOSEventRenderer().render_many(structured_events)
+    assert any("[taps-formulation-agent]" in line for line in rendered)
+
+
+def test_natural_language_entry_logs_build_and_taps_structured_attempts_to_same_run(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        if request["agent_name"] == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if request["agent_name"] == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    event_log_name = "events-" + "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in output.workflow.run_id) + ".jsonl"
+    event_log = read_physicsos_events(runtime_paths().sessions / event_log_name)
+    stages = [event.stage for event in event_log if event.artifacts and event.artifacts[0].kind == "structured_agent_attempt"]
+    assert "build-physics-problem-agent" in stages
+    assert "taps-formulation-agent" in stages
+
+
+def test_geometry_mesh_planner_structured_retry_and_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem().model_copy(
+        update={"geometry": GeometrySpec(id="geometry:plate", source=GeometrySource(kind="generated"), dimension=2)}
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {"mesh_policy": {"strategy": "invalid"}}
+        return {
+            "mesh_policy": {"strategy": "unstructured", "target_element_size": 0.05, "element_order": 2},
+            "requested_encodings": ["mesh_graph", "sdf"],
+            "target_backends": ["taps"],
+            "require_boundary_confirmation": False,
+            "boundary_confidence_threshold": 0.7,
+            "assumptions": ["structured geometry plan"],
+            "warnings": [],
+        }
+
+    events = []
+    with structured_agent_event_context(run_id="workflow:geometry-test", case_id=problem.id, events=events):
+        plan = plan_geometry_mesh_structured(
+            GeometryMeshPlanInput(problem=problem, requested_encodings=["mesh_graph"], target_backends=["taps"]),
+            client=fake_client,
+            config=CoreAgentLLMConfig(mode="llm", max_structured_attempts=2),
+        )
+
+    assert plan.mesh_policy.target_element_size == 0.05
+    assert plan.mesh_policy.element_order == 2
+    assert plan.requested_encodings == ["mesh_graph", "sdf"]
+    assert [event.status for event in events] == ["retrying", "accepted"]
+    assert events[0].stage == "geometry-mesh-planning-agent"
+
+
+def test_postprocess_planner_structured_retry_and_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+    result = SolverResult(
+        id="result:postprocess",
+        problem_id=problem.id,
+        backend="taps:test",
+        status="success",
+        scalar_outputs={"max_temperature": 1.0},
+        residuals={"l2": 0.0},
+        provenance=Provenance(created_by="test"),
+    )
+    verification = VerificationReport(
+        problem_id=problem.id,
+        result_id=result.id,
+        status="accepted",
+        residuals={"l2": 0.0},
+        recommended_next_action="accept",
+        explanation="Verification accepted.",
+    )
+    calls = []
+
+    def fake_client(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {"visualization_plan": [{"kind": "not_a_kind"}]}
+        return _postprocess_plan_payload()
+
+    events = []
+    with structured_agent_event_context(run_id="run:postprocess", case_id=problem.id, events=events):
+        plan = plan_postprocess_structured(
+            PostprocessPlanInput(problem=problem, result=result, verification=verification),
+            client=fake_client,
+            config=CoreAgentLLMConfig(mode="llm", max_structured_attempts=2),
+        )
+
+    assert len(calls) == 2
+    assert plan.recommendations == ["Review verification result and generated report."]
+    assert [event.stage for event in events] == ["postprocess-planning-agent", "postprocess-planning-agent"]
+    assert events[0].event == "validation.retry"
+    assert events[-1].event == "agent.output"
+
+
+def test_backend_preparation_planner_structured_semantic_retry(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0),
+                MaterialProperty(name="density", value=1.0),
+                MaterialProperty(name="pressure_drop", value=1.0),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="wall", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="inlet", field="U", kind="inlet", value=[1.0, 0.0]),
+        BoundaryConditionSpec(id="bc:outlet", region_id="outlet", field="p", kind="outlet", value=0.0),
+    ]
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    calls = []
+
+    def payload(execute: bool) -> dict:
+        return {
+            "problem_id": problem.id,
+            "status": "needs_inputs",
+            "target_backend": "openfoam",
+            "backend_family": "openfoam",
+            "field_space_plan": [{"family": "incompressible_navier_stokes_mesh", "fields": ["U", "p"], "space": "mixed_velocity_pressure"}],
+            "mesh_export": {"required": True, "provided": False, "expected_kind": "backend_mesh_export_manifest"},
+            "coefficient_map": [{"name": coefficient.name, "role": coefficient.role, "region_ids": coefficient.region_ids} for coefficient in taps_problem.coefficients],
+            "boundary_tag_map": [
+                {"id": boundary.id, "field": boundary.field, "kind": boundary.kind, "region_id": boundary.region_id, "backend_tag": boundary.region_id}
+                for boundary in problem.boundary_conditions
+            ],
+            "stabilization_policy": {"required_review": True, "selected": "review_required_before_execution"},
+            "solver_controls": {"external_execution_enabled": execute, "review_required": True},
+            "dependency_checks": [{"name": "openfoam_runner_available", "command": "foamVersion", "required": False}],
+            "approval_gate": {"execute_external_solver": execute, "requires_user_approval": True, "requires_dependency_checks": True, "requires_mesh_export_manifest": True},
+            "expected_artifacts": ["taps_backend_bridge_manifest", "taps_backend_case_bundle"],
+            "validation_checks": ["approval_gate_blocks_execution"],
+            "assumptions": [],
+            "warnings": [],
+            "unsupported_reasons": [],
+        }
+
+    def fake_client(request):
+        calls.append(request)
+        return payload(execute=len(calls) == 1)
+
+    events = []
+    with structured_agent_event_context(run_id="run:backend-prep", case_id=problem.id, events=events):
+        output = plan_backend_preparation_structured(
+            PlanBackendPreparationInput(problem=problem, taps_problem=taps_problem, backend="openfoam"),
+            client=fake_client,
+            config=CoreAgentLLMConfig(mode="llm", max_structured_attempts=2),
+        )
+
+    assert len(calls) == 2
+    assert output.backend_family == "openfoam"
+    assert output.approval_gate["execute_external_solver"] is False
+    assert output.solver_controls["external_execution_enabled"] is False
+    assert [event.stage for event in events] == ["backend-preparation-planning-agent", "backend-preparation-planning-agent"]
+
+
+def test_geometry_mesh_planner_requests_boundary_confirmation_for_imported_geometry() -> None:
+    problem = build_default_thermal_problem().model_copy(
+        update={"geometry": GeometrySpec(id="geometry:imported", source=GeometrySource(kind="mesh_file", uri="part.msh"), dimension=2)}
+    )
+    plan = plan_geometry_mesh(GeometryMeshPlanInput(problem=problem, target_backends=["fenicsx"]))
+    assert plan.require_boundary_confirmation is True
+    assert "mesh_graph" in plan.requested_encodings
+
+
+def test_workflow_events_include_structured_geometry_attempt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        agent_name = request["agent_name"]
+        if agent_name == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if agent_name == "geometry-mesh-planning-agent":
+            return {
+                "mesh_policy": {"strategy": "structured", "element_order": 1},
+                "requested_encodings": [],
+                "target_backends": ["taps"],
+                "require_boundary_confirmation": False,
+                "boundary_confidence_threshold": 0.7,
+                "assumptions": ["no mesh required for 1D"],
+                "warnings": [],
+            }
+        if agent_name == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    stages = [event.stage for event in output.workflow.events if event.artifacts and event.artifacts[0].kind == "structured_agent_attempt"]
+    assert "geometry-mesh-planning-agent" in stages
+
+
+def test_workflow_events_include_structured_postprocess_attempt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PHYSICSOS_CORE_AGENTS_MODE", "llm")
+    monkeypatch.setenv("PHYSICSOS_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("PHYSICSOS_HOME", str(tmp_path / "home"))
+    problem = build_default_thermal_problem()
+
+    def fake_client(request):
+        agent_name = request["agent_name"]
+        if agent_name == "build-physics-problem-agent":
+            return {"problem": problem.model_dump(mode="json"), "missing_inputs": [], "assumptions": []}
+        if agent_name == "postprocess-planning-agent":
+            return _postprocess_plan_payload()
+        return formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).model_dump(mode="json")
+
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            core_agents_mode="llm",
+        ),
+        structured_client=fake_client,
+    )
+    assert output.workflow is not None
+    structured_events = [event for event in output.workflow.events if event.stage == "postprocess-planning-agent"]
+    assert structured_events
+    assert structured_events[-1].event == "agent.output"
+    assert structured_events[-1].artifacts[0].kind == "structured_agent_attempt"
+    assert output.workflow.postprocess is not None
+    assert "Review verification result and generated report." in output.workflow.postprocess.recommendations
 
 
 def test_universal_workflow_orders_knowledge_before_geometry_and_taps() -> None:
@@ -700,6 +1693,44 @@ def test_core_workflow_retries_typed_subagent_failures(monkeypatch) -> None:
     assert "agent_input" in result.validation_attempts[-1].input_context
 
 
+def test_core_workflow_retries_taps_wall_time_budget(monkeypatch) -> None:
+    def timed_out_taps(input):
+        raise TimeoutError(f"TAPS backend exceeded wall-time budget before solve: {input.max_wall_time_seconds}")
+
+    monkeypatch.setattr("physicsos.workflows.universal._run_taps_agent", timed_out_taps)
+    result = run_physicsos_workflow(use_knowledge=False, max_validation_attempts=2, taps_max_wall_time_seconds=0.01)
+    assert result.taps is None
+    assert result.trace[-1].status == "retry_exhausted"
+    assert [attempt.agent_name for attempt in result.validation_attempts] == ["taps-agent", "taps-agent"]
+    assert "wall-time budget" in result.validation_attempts[-1].errors[0]
+    assert result.validation_attempts[-1].input_context["agent_input"]["max_wall_time_seconds"] == 0.01
+
+
+def test_run_taps_backend_wall_time_budget_uses_subprocess(monkeypatch) -> None:
+    output = run_typed_physicsos_workflow(
+        RunTypedPhysicsOSWorkflowInput(
+            user_request="simulate one-dimensional steady heat conduction",
+            use_knowledge=False,
+            max_validation_attempts=1,
+            taps_max_wall_time_seconds=30.0,
+        )
+    )
+    assert output.workflow is not None
+    taps_input = RunTAPSBackendInput(problem=output.workflow.problem, taps_problem=output.workflow.taps_problem)
+    calls = []
+
+    expected_output = object()
+
+    def fake_subprocess(input):
+        calls.append(input)
+        return expected_output
+
+    monkeypatch.setattr("physicsos.tools.taps_tools._run_taps_backend_subprocess", fake_subprocess)
+    result = run_taps_backend(taps_input)
+    assert result is expected_output
+    assert calls[0].budget.max_wall_time_seconds == 120.0
+
+
 def test_natural_language_entry_runs_typed_workflow_for_1d_heat_conduction() -> None:
     output = run_typed_physicsos_workflow(
         RunTypedPhysicsOSWorkflowInput(
@@ -735,6 +1766,43 @@ def test_geometry_mesh_tools_report_real_backend_availability() -> None:
         assert any("gmsh" in issue.lower() for issue in result.mesh.quality.issues)
 
 
+def test_geometry_mesh_backend_uses_subprocess_from_worker_threads(monkeypatch) -> None:
+    class WorkerThread:
+        pass
+
+    geometry = GeometrySpec(id="geometry:worker", source=GeometrySource(kind="generated"), dimension=2)
+    payloads = []
+
+    def fake_subprocess(payload, timeout_seconds=120.0):
+        payloads.append(payload)
+        return {
+            "ok": True,
+            "mesh": {
+                "id": "mesh:geometry:worker",
+                "kind": "unstructured",
+                "dimension": 2,
+                "topology": {"cell_types": ["triangle"], "node_count": 3, "cell_count": 1},
+                "elements": {"total": 1, "by_type": {"triangle": 1}},
+                "regions": [],
+                "boundaries": [],
+                "quality": {"passes": True, "issues": []},
+                "files": [],
+                "solver_compatibility": ["taps"],
+            },
+            "artifacts": [],
+        }
+
+    main = object()
+    monkeypatch.setattr(geometry_mesh_backend.threading, "current_thread", lambda: WorkerThread())
+    monkeypatch.setattr(geometry_mesh_backend.threading, "main_thread", lambda: main)
+    monkeypatch.setattr(geometry_mesh_backend, "_run_backend_subprocess", fake_subprocess)
+
+    mesh, artifacts = geometry_mesh_backend.generate_mesh_backend(geometry, ["taps"], 0.2)
+    assert artifacts == []
+    assert mesh.quality.passes is True
+    assert payloads[0]["action"] == "generate_mesh"
+
+
 def test_taps_agent_formulates_non_template_custom_operator() -> None:
     problem = _minimal_fluid_problem()
     problem.operators[0].differential_terms.append(
@@ -743,8 +1811,325 @@ def test_taps_agent_formulates_non_template_custom_operator() -> None:
     plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
     assert plan.weak_form is not None
     assert plan.weak_form.terms
-    assert plan.weak_form.terms[0].role == "custom"
+    assert {term.role for term in plan.weak_form.terms} >= {"diffusion", "constraint", "advection"}
     assert plan.recommended_next_action in {"compile_taps_problem", "ask_knowledge_agent"}
+
+
+def test_taps_executes_low_re_navier_stokes_as_stokes_simplification() -> None:
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=0.1))
+    problem.operators[0].conserved_quantities.extend(["mass", "momentum"])
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="Low-Re Newtonian fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0, units="Pa*s"),
+                MaterialProperty(name="density", value=1.0, units="kg/m^3"),
+                MaterialProperty(name="pressure_drop", value=1.0, units="Pa"),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="walls", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="x_min", field="p", kind="inlet", value=1.0),
+        BoundaryConditionSpec(id="bc:outlet", region_id="x_max", field="p", kind="outlet", value=0.0),
+    ]
+
+    support = estimate_taps_support(EstimateTAPSSupportInput(problem=problem)).support
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert support.supported is True
+    assert plan.weak_form is not None
+    assert plan.weak_form.family == "navier_stokes"
+    assert {term.role for term in plan.weak_form.terms} >= {"diffusion", "constraint"}
+    assert all(term.role != "advection" for term in plan.weak_form.terms)
+    assert result.backend.startswith("taps:stokes_channel_2d")
+    assert result.status == "success"
+    assert result.scalar_outputs["full_navier_stokes_supported"] == 0
+    assert result.scalar_outputs["simplification"] == "steady_low_re_stokes_no_convection"
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "incompressible_stokes_channel_2d"
+    assert result.residuals["normalized_stokes_residual"] == 0.0
+    assert any(artifact.kind == "taps_stokes_solution_field" for artifact in result.artifacts)
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_stokes_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["numerical_plan_solver_family"] == "incompressible_stokes_channel_2d"
+    assert operator_payload["coefficient_values_applied"]["dynamic_viscosity"] == pytest.approx(1.0)
+
+
+def test_full_navier_stokes_compiles_but_requires_nonlinear_taps_extension() -> None:
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=100.0))
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="Newtonian fluid",
+            phase="liquid",
+            properties=[MaterialProperty(name="dynamic_viscosity", value=1.0), MaterialProperty(name="density", value=1.0)],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="walls", field="U", kind="wall", value=[0.0, 0.0])
+    ]
+
+    support = estimate_taps_support(EstimateTAPSSupportInput(problem=problem)).support
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert support.supported is False
+    assert plan.weak_form is not None
+    assert any(term.role == "advection" for term in plan.weak_form.terms)
+    assert validation.fallback_recommended is True
+    assert "no executable TAPS IR block mapping" in " ".join(validation.warnings)
+    assert result.status == "needs_review"
+    assert result.scalar_outputs["message"].startswith("TAPSProblem compiled, but no executable TAPS kernel")
+
+
+def test_taps_executes_oseen_linearized_navier_stokes_with_frozen_velocity() -> None:
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=25.0))
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="Linearized Newtonian fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0, units="Pa*s"),
+                MaterialProperty(name="density", value=1.0, units="kg/m^3"),
+                MaterialProperty(name="pressure_drop", value=1.0, units="Pa"),
+                MaterialProperty(name="frozen_velocity", value=[0.25, 0.0], units="m/s"),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="walls", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="x_min", field="p", kind="inlet", value=1.0),
+        BoundaryConditionSpec(id="bc:outlet", region_id="x_max", field="p", kind="outlet", value=0.0),
+    ]
+
+    support = estimate_taps_support(EstimateTAPSSupportInput(problem=problem)).support
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert support.supported is True
+    assert plan.weak_form is not None
+    assert any(term.role == "advection" and "U_bar" in term.expression for term in plan.weak_form.terms)
+    assert validation.fallback_recommended is False
+    assert result.status == "success"
+    assert result.backend.startswith("taps:oseen_channel_2d")
+    assert result.scalar_outputs["simplification"] == "linearized_oseen_frozen_convection"
+    assert result.scalar_outputs["full_navier_stokes_supported"] == 0
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "incompressible_oseen_channel_2d"
+    assert result.residuals["normalized_oseen_residual"] == 0.0
+    assert any(artifact.kind == "taps_oseen_solution_field" for artifact in result.artifacts)
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_oseen_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["numerical_plan_solver_family"] == "incompressible_oseen_channel_2d"
+    assert operator_payload["coefficient_values_applied"]["frozen_velocity"] == pytest.approx([0.25, 0.0])
+
+
+def test_taps_executes_laminar_channel_navier_stokes_picard_kernel() -> None:
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=50.0))
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="Laminar Newtonian fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0, units="Pa*s"),
+                MaterialProperty(name="density", value=1.0, units="kg/m^3"),
+                MaterialProperty(name="pressure_drop", value=0.2, units="Pa"),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="walls", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="x_min", field="U", kind="inlet", value=[1.0, 0.0]),
+        BoundaryConditionSpec(id="bc:outlet", region_id="x_max", field="p", kind="outlet", value=0.0),
+    ]
+
+    support = estimate_taps_support(EstimateTAPSSupportInput(problem=problem)).support
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert support.supported is True
+    assert plan.weak_form is not None
+    assert any(term.role == "advection" for term in plan.weak_form.terms)
+    assert validation.fallback_recommended is False
+    assert result.status == "success"
+    assert result.backend.startswith("taps:navier_stokes_channel_2d")
+    assert result.scalar_outputs["full_navier_stokes_supported"] == 1
+    assert result.scalar_outputs["support_scope"] == "restricted_steady_laminar_2d_channel"
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "incompressible_navier_stokes_channel_2d"
+    assert result.residuals["normalized_nonlinear_residual"] <= 1.5e-10
+    assert result.residuals["nonlinear_iterations"] >= 2.0
+    assert any(artifact.kind == "taps_navier_stokes_solution_field" for artifact in result.artifacts)
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_navier_stokes_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["numerical_plan_solver_family"] == "incompressible_navier_stokes_channel_2d"
+    assert operator_payload["solver_controls_applied"]["support_scope"] == "restricted_steady_laminar_2d_channel"
+
+
+def test_taps_rejects_high_re_navier_stokes_without_supported_phase3_scope() -> None:
+    problem = _minimal_fluid_problem()
+    problem.geometry = GeometrySpec(id="geometry:fluid-2d", source=GeometrySource(kind="generated"), dimension=2)
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=10000.0))
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="High-Re Newtonian fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0),
+                MaterialProperty(name="density", value=1.0),
+                MaterialProperty(name="pressure_drop", value=1.0),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="walls", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="x_min", field="U", kind="inlet", value=[1.0, 0.0]),
+        BoundaryConditionSpec(id="bc:outlet", region_id="x_max", field="p", kind="outlet", value=0.0),
+    ]
+
+    support = estimate_taps_support(EstimateTAPSSupportInput(problem=problem)).support
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert support.supported is False
+    assert validation.fallback_recommended is True
+    assert result.status == "needs_review"
+    assert result.scalar_outputs["message"].startswith("TAPSProblem compiled, but no executable TAPS kernel")
+
+
+def test_mesh_navier_stokes_exports_reviewed_backend_bridge_without_local_execution(tmp_path) -> None:
+    mesh_graph_path = tmp_path / "fluid_mesh_graph.json"
+    mesh_graph_path.write_text(
+        json.dumps(
+            {
+                "type": "mesh_graph",
+                "nodes": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                "edges": [[0, 1], [1, 2], [2, 3], [3, 0]],
+                "cells": [{"type": "triangle", "nodes": [0, 1, 2]}, {"type": "triangle", "nodes": [0, 2, 3]}],
+                "node_count": 4,
+                "boundary_edge_sets": {"boundary:inlet": [3], "boundary:outlet": [1], "boundary:wall": [0, 2]},
+                "physical_boundary_groups": [
+                    {"name": "inlet", "dimension": 1, "edge_ids": [3], "solver_native": {"openfoam_patch": "inlet", "su2_marker": "inlet"}},
+                    {"name": "outlet", "dimension": 1, "edge_ids": [1], "solver_native": {"openfoam_patch": "outlet", "su2_marker": "outlet"}},
+                    {"name": "wall", "dimension": 1, "edge_ids": [0, 2], "solver_native": {"openfoam_patch": "wall", "su2_marker": "wall"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = GeometrySpec(
+        id="geometry:fluid-mesh",
+        source=GeometrySource(kind="generated"),
+        dimension=2,
+        encodings=[GeometryEncoding(kind="mesh_graph", uri=str(mesh_graph_path), target_backend="taps")],
+    )
+    problem = _minimal_fluid_problem()
+    problem.geometry = geometry
+    problem.operators[0].nondimensional_numbers.append(NondimensionalNumber(name="Re", value=1000.0))
+    problem.materials = [
+        MaterialSpec(
+            id="material:fluid",
+            name="Mesh Newtonian fluid",
+            phase="liquid",
+            properties=[
+                MaterialProperty(name="dynamic_viscosity", value=1.0),
+                MaterialProperty(name="density", value=1.0),
+                MaterialProperty(name="pressure_drop", value=1.0),
+            ],
+        )
+    ]
+    problem.boundary_conditions = [
+        BoundaryConditionSpec(id="bc:wall", region_id="wall", field="U", kind="wall", value=[0.0, 0.0]),
+        BoundaryConditionSpec(id="bc:inlet", region_id="inlet", field="U", kind="inlet", value=[1.0, 0.0]),
+        BoundaryConditionSpec(id="bc:outlet", region_id="outlet", field="p", kind="outlet", value=0.0),
+    ]
+
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    validation = validate_taps_ir(ValidateTAPSIRInput(problem=problem, taps_problem=taps_problem))
+    fallback = plan_taps_adaptive_fallback(
+        PlanTAPSAdaptiveFallbackInput(problem=problem, taps_problem=taps_problem, preferred_backend="openfoam")
+    )
+    preparation_plan = plan_backend_preparation(
+        PlanBackendPreparationInput(problem=problem, taps_problem=taps_problem, backend="openfoam")
+    )
+    bridge = export_taps_backend_bridge(ExportTAPSBackendBridgeInput(problem=problem, taps_problem=taps_problem, backend="openfoam"))
+    bundle = prepare_taps_backend_case_bundle(
+        PrepareTAPSBackendCaseBundleInput(problem=problem, taps_problem=taps_problem, backend="openfoam")
+    )
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+
+    assert validation.valid
+    assert validation.fallback_recommended is True
+    assert any(check["name"] == "mesh_navier_stokes_backend_bridge_available" and check["passes"] for check in validation.checks)
+    assert fallback.decision["mode"] == "export_backend_bridge"
+    assert preparation_plan.status == "needs_inputs"
+    assert preparation_plan.approval_gate["execute_external_solver"] is False
+    assert preparation_plan.stabilization_policy["required_review"] is True
+    assert result.status == "needs_review"
+    bridge_payload = json.loads(open(bridge.manifest.uri, encoding="utf-8").read())
+    assert any(block["family"] == "incompressible_navier_stokes_mesh" for block in bridge_payload["blocks"])
+    assert bridge_payload["fallback_policy"]["preferred_full_solver_targets"] == ["openfoam", "su2"]
+    assert bridge_payload["mesh_requirements"]["required_boundary_roles"] == ["inlet", "outlet", "wall"]
+    assert bridge_payload["backend_preparation_plan"]["target_backend"] == "openfoam"
+    assert bridge_payload["backend_preparation_plan"]["stabilization_policy"]["required_review"] is True
+    assert bridge_payload["backend_preparation_validation"]["valid"] is True
+    assert bridge.draft_artifact is not None
+    assert "simpleFoam" in open(bridge.draft_artifact.uri, encoding="utf-8").read()
+    bundle_payload = json.loads(open(bundle.bundle.uri, encoding="utf-8").read())
+    assert bundle_payload["mesh_export"]["required"] is True
+    assert bundle_payload["approval_gate"]["execute_external_solver"] is False
+    assert bundle_payload["backend_preparation_plan"]["approval_gate"]["execute_external_solver"] is False
+    assert bundle_payload["stabilization_policy"]["required_review"] is True
+    assert {item["kind"] for item in bundle_payload["boundary_binding"]} >= {"inlet", "outlet", "wall"}
+    assert any(check["name"] == "openfoam_runner_available" for check in bundle_payload["dependency_checks"])
+    openfoam_runner = prepare_openfoam_runner_manifest(
+        PrepareOpenFOAMRunnerManifestInput(case_bundle=bundle.bundle, solver="simpleFoam")
+    )
+    runner_manifest = json.loads(open(openfoam_runner.runner_manifest.uri, encoding="utf-8").read())
+    assert runner_manifest["schema_version"] == "physicsos.full_solver_job.v1"
+    assert runner_manifest["backend"] == "openfoam"
+    assert runner_manifest["openfoam"]["solver"] == "simpleFoam"
+    assert runner_manifest["openfoam"]["mesh_mode"] == "blockMesh"
+    case_paths = {file["path"] for file in runner_manifest["openfoam"]["case_files"]}
+    assert {
+        "system/blockMeshDict",
+        "0/U",
+        "0/p",
+        "constant/transportProperties",
+        "constant/turbulenceProperties",
+        "system/fvSchemes",
+        "system/fvSolution",
+    } <= case_paths
+    case_contents = {file["path"]: file["content"] for file in runner_manifest["openfoam"]["case_files"]}
+    assert "writeInterval   1;" in case_contents["system/controlDict"]
+    assert "residualControl" not in case_contents["system/fvSolution"]
+    assert "simulationType  laminar;" in case_contents["constant/turbulenceProperties"]
+    assert "div((nuEff*dev2(T(grad(U))))) Gauss linear;" in case_contents["system/fvSchemes"]
+    dry_run = submit_full_solver_job(SubmitFullSolverJobInput(runner_manifest=openfoam_runner.runner_manifest, mode="dry_run"))
+    assert dry_run.submitted is False
+    assert dry_run.result.status == "needs_review"
 
 
 def test_taps_executes_custom_scalar_elliptic_weak_form_ir() -> None:
@@ -791,6 +2176,43 @@ def test_taps_executes_custom_scalar_elliptic_weak_form_ir() -> None:
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
     assert operator_payload["weak_form_blocks"]["operator_family"] == "scalar_elliptic"
     assert {block["role"] for block in operator_payload["weak_form_blocks"]["blocks"]} >= {"diffusion", "source"}
+
+
+def test_numerical_solve_plan_preserves_nonzero_dirichlet_boundaries() -> None:
+    built = BuildPhysicsProblemInput(
+        user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K"
+    )
+    problem = build_physics_problem(built).problem
+    assert problem is not None
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    solve_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=problem, taps_problem=taps_problem, plan=solve_plan)
+    )
+    assert validation.valid
+    assert solve_plan.solver_family == "scalar_elliptic_1d"
+    assert [(bc.region_id, bc.value) for bc in solve_plan.boundary_condition_bindings] == [("x=0", 300.0), ("x=L", 350.0)]
+
+
+def test_taps_1d_steady_heat_applies_nonzero_dirichlet_boundaries() -> None:
+    problem = build_physics_problem(
+        BuildPhysicsProblemInput(user_request="simulate 1D steady heat conduction in a rod with T(0)=300 K and T(1)=350 K")
+    ).problem
+    assert problem is not None
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    values = solution["values"]
+    middle = values[len(values) // 2]
+    assert result.status == "success"
+    assert result.scalar_outputs["boundary_condition_error"] == 0.0
+    assert values[0] == 300.0
+    assert values[-1] == 350.0
+    assert middle == pytest.approx(325.0, abs=1.0)
+    assert solution["boundary_values_applied"] == {"left": 300.0, "right": 350.0}
 
 
 def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
@@ -842,9 +2264,13 @@ def test_taps_executes_custom_transient_diffusion_weak_form_ir() -> None:
     assert result.status == "success"
     assert result.backend == "taps:weak_ir_transient_diffusion_1d:custom"
     assert result.scalar_outputs["weak_form_ir_blocks"] == 1.0
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "transient_diffusion_1d"
     metadata_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_reconstruction_metadata")
     metadata_payload = json.loads(open(metadata_artifact.uri, encoding="utf-8").read())
     assert metadata_payload["weak_form_blocks"]["operator_family"] == "transient_diffusion"
+    assert metadata_payload["field"] == "T"
+    assert metadata_payload["initial_condition_bindings"][0]["id"] == "ic:T"
+    assert metadata_payload["coefficient_values_applied"]["rank"] == 8
     bridge_payload = json.loads(open(bridge.manifest.uri, encoding="utf-8").read())
     assert bridge_payload["schema_version"] == "physicsos.taps_backend_bridge.v1"
     assert {"family": "transient_diffusion", "space": "H1", "time_integrator": "implicit_euler_or_crank_nicolson"} in bridge_payload["blocks"]
@@ -1032,6 +2458,8 @@ def test_taps_generic_scalar_assembler_executes_1d_poisson() -> None:
         "taps_solution_field",
         "taps_residual_history",
     }
+    visualizations = generate_visualizations(GenerateVisualizationsInput(problem=problem, result=result))
+    assert any(artifact.kind == "visualization:solution_line" and artifact.format == "png" for artifact in visualizations.artifacts)
 
 
 def test_taps_generic_scalar_assembler_executes_2d_poisson() -> None:
@@ -1066,11 +2494,62 @@ def test_taps_generic_scalar_assembler_executes_2d_poisson() -> None:
     assert residual.converged
     assert residual.rank == taps_problem.basis.tensor_rank
     assert result.scalar_outputs["tensor_rank"] == taps_problem.basis.tensor_rank
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "scalar_elliptic_2d"
     assert {artifact.kind for artifact in result.artifacts} >= {
         "taps_assembled_operator",
         "taps_solution_field",
         "taps_residual_history",
     }
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    assert solution_payload["field"] == "u"
+    assert solution_payload["boundary_values_applied"] == {"left": 0.0, "right": 0.0, "bottom": 0.0, "top": 0.0}
+    assert solution_payload["coefficient_values_applied"]["diffusion"] == 1.0
+    assert "boundary_condition_error" in solution_payload["residual_checks"]
+    visualizations = generate_visualizations(GenerateVisualizationsInput(problem=problem, result=result))
+    assert any(artifact.kind == "visualization:solution_heatmap" and artifact.format == "png" for artifact in visualizations.artifacts)
+
+
+def test_taps_2d_scalar_elliptic_applies_nonzero_dirichlet_boundary_lifting() -> None:
+    geometry = GeometrySpec(id="geometry:square-nonzero-bc", source=GeometrySource(kind="generated"), dimension=2)
+    problem = PhysicsProblem(
+        id="problem:poisson-2d-nonzero-bc",
+        user_intent={"raw_request": "solve 2D Poisson with nonzero Dirichlet boundary"},
+        domain="custom",
+        geometry=geometry,
+        fields=[FieldSpec(name="u", kind="scalar")],
+        operators=[
+            OperatorSpec(
+                id="operator:poisson",
+                name="Poisson",
+                domain="custom",
+                equation_class="poisson",
+                form="weak",
+                fields_out=["u"],
+            )
+        ],
+        materials=[],
+        boundary_conditions=[{"id": "bc:u", "region_id": "boundary", "field": "u", "kind": "dirichlet", "value": 5.0}],
+        targets=[{"name": "field", "field": "u", "objective": "observe"}],
+        provenance=Provenance(created_by="test"),
+    )
+    plan = formulate_taps_equation(FormulateTAPSEquationInput(problem=problem)).plan
+    taps_problem = build_taps_problem(BuildTAPSProblemInput(problem=problem, compilation_plan=plan)).taps_problem
+    solve_plan = plan_numerical_solve(NumericalSolvePlanInput(problem=problem, taps_problem=taps_problem))
+    validation = validate_numerical_solve_plan(
+        ValidateNumericalSolvePlanInput(problem=problem, taps_problem=taps_problem, plan=solve_plan)
+    )
+    result = run_taps_backend(RunTAPSBackendInput(problem=problem, taps_problem=taps_problem)).result
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    values = solution_payload["values"]
+    assert validation.valid
+    assert result.status == "success"
+    assert result.scalar_outputs["boundary_condition_error"] == 0.0
+    assert solution_payload["boundary_values_applied"] == {"left": 5.0, "right": 5.0, "bottom": 5.0, "top": 5.0}
+    assert all(value == 5.0 for value in values[0])
+    assert all(value == 5.0 for value in values[-1])
+    assert all(row[0] == 5.0 and row[-1] == 5.0 for row in values)
 
 
 def test_taps_nonlinear_reaction_diffusion_executes_1d() -> None:
@@ -1106,6 +2585,7 @@ def test_taps_nonlinear_reaction_diffusion_executes_1d() -> None:
     assert result.backend == "taps:nonlinear_reaction_diffusion_1d"
     assert result.status == "success"
     assert residual.converged
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "nonlinear_reaction_diffusion_1d"
     assert "normalized_nonlinear_residual" in result.residuals
     assert "nonlinear_iterations" in result.residuals
     assert {artifact.kind for artifact in result.artifacts} >= {
@@ -1113,6 +2593,10 @@ def test_taps_nonlinear_reaction_diffusion_executes_1d() -> None:
         "taps_solution_field",
         "taps_iteration_history",
     }
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    assert solution_payload["coefficient_values_applied"]["diffusion"] == 1.0
+    assert solution_payload["solver_controls_applied"]["damping"] == 0.8
 
 
 def test_taps_executes_custom_nonlinear_reaction_diffusion_weak_form_ir() -> None:
@@ -1191,6 +2675,7 @@ def test_taps_nonlinear_reaction_diffusion_executes_2d() -> None:
     assert result.backend == "taps:nonlinear_reaction_diffusion_2d"
     assert result.status == "success"
     assert residual.converged
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "nonlinear_reaction_diffusion_2d"
     assert "normalized_nonlinear_residual" in result.residuals
     assert "nonlinear_iterations" in result.residuals
     assert {artifact.kind for artifact in result.artifacts} >= {
@@ -1198,6 +2683,10 @@ def test_taps_nonlinear_reaction_diffusion_executes_2d() -> None:
         "taps_solution_field",
         "taps_iteration_history",
     }
+    solution_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_solution_field")
+    solution_payload = json.loads(open(solution_artifact.uri, encoding="utf-8").read())
+    assert solution_payload["coefficient_values_applied"]["linear_reaction"] == 1.0
+    assert solution_payload["solver_controls_applied"]["max_iterations"] == 50
 
 
 def test_taps_coupled_reaction_diffusion_executes_2d() -> None:
@@ -1235,6 +2724,7 @@ def test_taps_coupled_reaction_diffusion_executes_2d() -> None:
     assert result.backend == "taps:coupled_reaction_diffusion_2d"
     assert result.status == "success"
     assert result.scalar_outputs["field_count"] == 2
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "coupled_reaction_diffusion_2d"
     assert residual.converged
     assert "normalized_coupled_residual" in result.residuals
     assert {artifact.kind for artifact in result.artifacts} >= {
@@ -1242,6 +2732,11 @@ def test_taps_coupled_reaction_diffusion_executes_2d() -> None:
         "taps_coupled_solution_fields",
         "taps_iteration_history",
     }
+    operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_coupled_operator")
+    operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["numerical_plan_solver_family"] == "coupled_reaction_diffusion_2d"
+    assert operator_payload["fields"] == ["u", "v"]
+    assert operator_payload["solver_controls_applied"]["max_iterations"] == 50
 
 
 def test_taps_executes_custom_coupled_field_weak_form_ir() -> None:
@@ -1606,6 +3101,7 @@ def test_mesh_graph_taps_solves_em_curl_curl_nedelec() -> None:
     assert any(term.id.endswith(":curl_curl") for term in taps_problem.weak_form.terms)
     assert result.backend.startswith("taps:mesh_fem_em_curl_curl")
     assert result.status == "success"
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "mesh_fem_em_curl_curl"
     assert residual.converged
     assert result.residuals["fem_nodes"] > 0
     assert {artifact.kind for artifact in result.artifacts} >= {
@@ -1616,12 +3112,15 @@ def test_mesh_graph_taps_solves_em_curl_curl_nedelec() -> None:
     operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_em_curl_curl_operator")
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
     assert operator_payload["type"] == "triangle_nedelec_order1_em_curl_curl"
+    assert operator_payload["numerical_plan_solver_family"] == "mesh_fem_em_curl_curl"
     assert operator_payload["assembly"] == "nedelec_first_kind_edge_element_hcurl"
     assert operator_payload["edge_dof_count"] > 0
     assert operator_payload["boundary_edge_count"] > 0
     assert operator_payload["material"]["relative_permittivity"] == pytest.approx(2.5)
     assert operator_payload["material"]["wave_number"] == pytest.approx(0.4)
     assert operator_payload["material"]["source_amplitude"] == pytest.approx(0.75)
+    assert operator_payload["coefficient_values_applied"]["relative_permittivity"] == pytest.approx(2.5)
+    assert operator_payload["solver_controls_applied"]["max_iterations"] == 5000
     assert operator_payload["hcurl_scaffold"]["edge_dofs_required"] is True
     assert operator_payload["hcurl_scaffold"]["status"] == "nedelec_order1_edge_element"
     assert operator_payload["hcurl_scaffold"]["boundary_condition"] == "pec_tangential_zero"
@@ -2757,6 +4256,7 @@ def test_mesh_graph_taps_solves_linear_elasticity() -> None:
     }
     assert result.backend.startswith("taps:mesh_fem_linear_elasticity")
     assert result.status == "success"
+    assert result.scalar_outputs["numerical_plan_solver_family"] == "mesh_fem_linear_elasticity"
     assert residual.converged
     assert result.residuals["fem_dofs"] == pytest.approx(2.0 * result.residuals["fem_nodes"])
     assert {artifact.kind for artifact in result.artifacts} >= {
@@ -2766,10 +4266,13 @@ def test_mesh_graph_taps_solves_linear_elasticity() -> None:
     }
     operator_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "taps_mesh_fem_elasticity_operator")
     operator_payload = json.loads(open(operator_artifact.uri, encoding="utf-8").read())
+    assert operator_payload["numerical_plan_solver_family"] == "mesh_fem_linear_elasticity"
     assert operator_payload["material"]["young_modulus"] == pytest.approx(12.0)
     assert operator_payload["material"]["poisson_ratio"] == pytest.approx(0.25)
     assert operator_payload["material"]["constitutive_model"] == "plane_strain"
     assert operator_payload["material"]["body_force"] == pytest.approx([0.0, -2.0])
+    assert operator_payload["coefficient_values_applied"]["young_modulus"] == pytest.approx(12.0)
+    assert operator_payload["solver_controls_applied"]["max_iterations"] == 20000
 
 
 def test_mesh_graph_taps_executes_custom_vector_elasticity_weak_form_ir() -> None:

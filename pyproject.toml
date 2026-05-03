@@ -1,6 +1,6 @@
 [project]
 name = "physicsos"
-version = "0.1.4"
+version = "0.1.6"
 description = "AI-native physics simulation OS with TAPS-first physics IR, solver planning, and cloud runner tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,8 @@ dependencies = [
   "langgraph",
   "langchain-openai",
   "rich>=13.7",
+  "gmsh>=4.13",
+  "meshio>=5.3",
 ]
 keywords = ["physics", "simulation", "pde", "fem", "agents", "neural-operator"]
 classifiers = [
@@ -37,19 +39,13 @@ build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 agents = []
-geometry = [
-  "gmsh>=4.13",
-  "meshio>=5.3",
-]
+geometry = []
 dev = [
   "build>=1.2",
   "pytest>=8",
   "twine>=5",
 ]
-all = [
-  "gmsh>=4.13",
-  "meshio>=5.3",
-]
+all = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

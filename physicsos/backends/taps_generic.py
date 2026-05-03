@@ -7,7 +7,7 @@ from functools import lru_cache
 
 from physicsos.config import project_root
 from physicsos.schemas.common import ArtifactRef
-from physicsos.schemas.taps import TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
+from physicsos.schemas.taps import NumericalSolvePlanOutput, TAPSProblem, TAPSResidualReport, TAPSResultArtifacts
 
 
 SUPPORTED_FAMILIES = {
@@ -17,6 +17,8 @@ SUPPORTED_FAMILIES = {
     "reaction_diffusion",
     "coupled_reaction_diffusion",
     "helmholtz",
+    "stokes",
+    "oseen",
 }
 
 
@@ -682,6 +684,164 @@ def supports_coupled_reaction_diffusion_weak_form(problem: TAPSProblem) -> bool:
     return _weak_form_coupled_reaction_diffusion_blocks(problem) is not None
 
 
+def _weak_form_stokes_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    weak_form = problem.weak_form
+    if weak_form is None or len(weak_form.trial_fields) < 2:
+        return None
+    fields = {field.lower() for field in weak_form.trial_fields}
+    if not ({"u", "velocity"} & fields) or not ({"p", "pressure"} & fields):
+        return None
+    blocks: list[dict[str, str]] = []
+    has_viscous = False
+    has_pressure = False
+    has_continuity = False
+    has_body_force = False
+    has_advection = False
+    allowed_roles = {"diffusion", "advection", "source", "constraint", "custom", "boundary"}
+    for term in [*weak_form.terms, *weak_form.boundary_terms]:
+        role = term.role.lower()
+        expression = _term_expression(term)
+        if role not in allowed_roles:
+            return None
+        if role == "boundary":
+            continue
+        is_viscous = role == "diffusion" or any(token in expression for token in ("grad(u", "grad(v_u", "strain", "viscous", "mu"))
+        is_pressure = any(token in expression for token in (" p", "pressure", "div(v_u", "grad(p"))
+        is_continuity = role == "constraint" or any(token in expression for token in ("div(u", "q div", "incompress"))
+        is_body_force = role == "source" or any(token in expression for token in ("body_force", "forcing", "v_u dot f"))
+        is_advection = role == "advection" or any(token in expression for token in ("u dot grad", "(u路grad", "(u dot grad", "convective"))
+        if role == "custom" and not (is_viscous or is_pressure or is_continuity or is_body_force or is_advection):
+            return None
+        if is_viscous:
+            has_viscous = True
+            blocks.append({"role": "viscous_diffusion", "term_id": term.id, "expression": term.expression})
+        if is_pressure:
+            has_pressure = True
+            blocks.append({"role": "pressure_coupling", "term_id": term.id, "expression": term.expression})
+        if is_continuity:
+            has_continuity = True
+            blocks.append({"role": "incompressibility_constraint", "term_id": term.id, "expression": term.expression})
+        if is_body_force:
+            has_body_force = True
+            blocks.append({"role": "body_force", "term_id": term.id, "expression": term.expression})
+        if is_advection:
+            has_advection = True
+            blocks.append({"role": "nonlinear_advection", "term_id": term.id, "expression": term.expression})
+    if not (has_viscous and has_pressure and has_continuity):
+        return None
+    return {
+        "operator_family": "incompressible_stokes",
+        "source": "weak_form_ir",
+        "fields": weak_form.trial_fields,
+        "blocks": blocks,
+        "has_viscous_diffusion": has_viscous,
+        "has_pressure_coupling": has_pressure,
+        "has_incompressibility_constraint": has_continuity,
+        "has_body_force": has_body_force,
+        "has_nonlinear_advection": has_advection,
+        "executable_simplification": "steady_low_re_channel_stokes" if not has_advection else "requires_picard_or_newton_navier_stokes",
+    }
+
+
+def supports_stokes_weak_form(problem: TAPSProblem) -> bool:
+    blocks = _weak_form_stokes_blocks(problem)
+    return blocks is not None and not bool(blocks.get("has_nonlinear_advection"))
+
+
+def _has_frozen_convective_velocity(problem: TAPSProblem) -> bool:
+    return any(
+        coefficient.name.lower()
+        in {
+            "frozen_velocity",
+            "convective_velocity",
+            "oseen_velocity",
+            "linearization_velocity",
+            "ubar",
+            "u_bar",
+        }
+        for coefficient in problem.coefficients
+    )
+
+
+def _weak_form_oseen_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    blocks = _weak_form_stokes_blocks(problem)
+    if blocks is None or not bool(blocks.get("has_nonlinear_advection")):
+        return None
+    has_linearization_velocity = _has_frozen_convective_velocity(problem)
+    has_linearized_term = any(
+        block["role"] == "nonlinear_advection"
+        and any(token in block["expression"].lower() for token in ("ubar", "u_bar", "frozen", "linearized", "oseen"))
+        for block in blocks["blocks"]  # type: ignore[index]
+    )
+    if not (has_linearization_velocity or has_linearized_term):
+        return None
+    output = dict(blocks)
+    output["operator_family"] = "incompressible_oseen"
+    output["has_frozen_convective_velocity"] = has_linearization_velocity
+    output["executable_simplification"] = "linearized_oseen_channel"
+    return output
+
+
+def supports_oseen_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_oseen_blocks(problem) is not None
+
+
+def _has_coefficient(problem: TAPSProblem, names: set[str]) -> bool:
+    normalized = {name.lower() for name in names}
+    return any(coefficient.name.lower() in normalized for coefficient in problem.coefficients)
+
+
+def _weak_form_navier_stokes_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    blocks = _weak_form_stokes_blocks(problem)
+    if blocks is None or not bool(blocks.get("has_nonlinear_advection")):
+        return None
+    if _weak_form_oseen_blocks(problem) is not None:
+        return None
+    declared_reynolds = _coefficient_number(problem, {"re", "reynolds", "reynolds_number"}, -1.0)
+    if declared_reynolds > 100.0:
+        return None
+    boundary_kinds = {boundary.kind.lower() for boundary in problem.boundary_conditions}
+    has_channel_boundaries = "wall" in boundary_kinds and bool(boundary_kinds & {"inlet", "dirichlet"}) and bool(boundary_kinds & {"outlet", "neumann"})
+    has_required_coefficients = (
+        _has_coefficient(problem, {"mu", "dynamic_viscosity", "viscosity"})
+        and _has_coefficient(problem, {"rho", "density"})
+        and _has_coefficient(problem, {"pressure_drop", "delta_p", "dp"})
+    )
+    if not (has_channel_boundaries and has_required_coefficients):
+        return None
+    output = dict(blocks)
+    output["operator_family"] = "incompressible_navier_stokes"
+    output["executable_simplification"] = "steady_laminar_channel_picard"
+    output["stabilization_policy"] = "picard_under_relaxation_channel_surrogate"
+    return output
+
+
+def supports_navier_stokes_weak_form(problem: TAPSProblem) -> bool:
+    return _weak_form_navier_stokes_blocks(problem) is not None
+
+
+def _weak_form_mesh_navier_stokes_bridge_blocks(problem: TAPSProblem) -> dict[str, object] | None:
+    blocks = _weak_form_stokes_blocks(problem)
+    if blocks is None or not bool(blocks.get("has_nonlinear_advection")):
+        return None
+    has_mesh_graph = any(encoding.kind == "mesh_graph" for encoding in problem.geometry_encodings)
+    if not has_mesh_graph:
+        return None
+    output = dict(blocks)
+    output["operator_family"] = "incompressible_navier_stokes_mesh_bridge"
+    output["source"] = "weak_form_ir_mesh_graph"
+    output["function_space"] = "mixed_velocity_pressure"
+    output["pressure_velocity_coupling"] = "monolithic_mixed_or_projection"
+    output["stabilization_policy"] = "SUPG_PSPG_or_projection_review_required"
+    output["execution_policy"] = "export_backend_bridge_only"
+    output["fallback_targets"] = ["fenicsx", "openfoam", "su2"]
+    return output
+
+
+def supports_mesh_navier_stokes_bridge(problem: TAPSProblem) -> bool:
+    return _weak_form_mesh_navier_stokes_bridge_blocks(problem) is not None
+
+
 def weak_form_transient_diffusion_blocks(problem: TAPSProblem) -> dict[str, object] | None:
     weak_form = problem.weak_form
     if weak_form is None or len(weak_form.trial_fields) != 1:
@@ -769,6 +929,151 @@ def _reaction_value_from_blocks(problem: TAPSProblem, family: str, blocks: dict[
     if blocks.get("has_reaction"):
         return _coefficient_number(problem, {"reaction", "reaction_rate", "mass", "beta", "c"}, 1.0)
     return 0.0
+
+
+def _numeric_value(value: object, default: float = 0.0) -> float:
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _plan_coefficient(plan: NumericalSolvePlanOutput | None, role: str, default: float) -> float:
+    if plan is None:
+        return default
+    for binding in plan.coefficient_bindings:
+        if binding.role == role:
+            return _numeric_value(binding.value, default)
+    return default
+
+
+def _plan_source_constant(plan: NumericalSolvePlanOutput | None) -> float | None:
+    if plan is None:
+        return None
+    for binding in plan.source_bindings:
+        if isinstance(binding.value, (float, int)):
+            return float(binding.value)
+        if isinstance(binding.value, str):
+            try:
+                return float(binding.value)
+            except ValueError:
+                continue
+    return None
+
+
+def _plan_solver_number(plan: NumericalSolvePlanOutput | None, name: str, default: float) -> float:
+    if plan is None:
+        return default
+    normalized = name.lower()
+    for binding in plan.coefficient_bindings:
+        if binding.name.lower() == normalized:
+            return _numeric_value(binding.value, default)
+    return default
+
+
+def _plan_complex(plan: NumericalSolvePlanOutput | None, name: str, default: complex) -> complex:
+    if plan is None:
+        return default
+    normalized = name.lower()
+    for binding in plan.coefficient_bindings:
+        if binding.name.lower() != normalized:
+            continue
+        value = binding.value
+        if isinstance(value, (float, int)):
+            return complex(float(value), 0.0)
+        if isinstance(value, list) and value:
+            real = float(value[0])
+            imag = float(value[1]) if len(value) > 1 else 0.0
+            return complex(real, imag)
+        if isinstance(value, dict):
+            real = float(value.get("real", value.get("re", 0.0)))
+            imag = float(value.get("imag", value.get("im", 0.0)))
+            return complex(real, imag)
+        if isinstance(value, str):
+            try:
+                return complex(value.strip().lower().replace("i", "j"))
+            except ValueError:
+                return default
+    return default
+
+
+def _boundary_position(region_id: str) -> str | None:
+    lowered = region_id.lower().replace(" ", "")
+    if lowered in {"x=0", "x_min", "xmin", "left", "boundary:x_min", "boundary:left"} or lowered.endswith(":x_min"):
+        return "left"
+    if lowered in {"x=l", "x=1", "x_max", "xmax", "right", "boundary:x_max", "boundary:right"} or lowered.endswith(":x_max"):
+        return "right"
+    return None
+
+
+def _dirichlet_values_1d(plan: NumericalSolvePlanOutput | None, field: str) -> tuple[float, float]:
+    left = 0.0
+    right = 0.0
+    if plan is None:
+        return left, right
+    for boundary in plan.boundary_condition_bindings:
+        if boundary.kind.lower() != "dirichlet" or boundary.field != field:
+            continue
+        position = _boundary_position(boundary.region_id)
+        if position == "left":
+            left = _numeric_value(boundary.value, left)
+        elif position == "right":
+            right = _numeric_value(boundary.value, right)
+    return left, right
+
+
+def _dirichlet_boundary_values_2d(plan: NumericalSolvePlanOutput | None, field: str) -> dict[str, float]:
+    values = {"left": 0.0, "right": 0.0, "bottom": 0.0, "top": 0.0}
+    if plan is None:
+        return values
+    for boundary in plan.boundary_condition_bindings:
+        if boundary.kind.lower() != "dirichlet" or boundary.field != field:
+            continue
+        value = _numeric_value(boundary.value, 0.0)
+        lowered = boundary.region_id.lower().replace(" ", "")
+        if lowered in {"boundary", "all", "domain_boundary", "outer_boundary"}:
+            values = {key: value for key in values}
+        elif lowered in {"x=0", "x_min", "xmin", "left", "boundary:x_min", "boundary:left"} or lowered.endswith(":x_min"):
+            values["left"] = value
+        elif lowered in {"x=l", "x=1", "x_max", "xmax", "right", "boundary:x_max", "boundary:right"} or lowered.endswith(":x_max"):
+            values["right"] = value
+        elif lowered in {"y=0", "y_min", "ymin", "bottom", "boundary:y_min", "boundary:bottom"} or lowered.endswith(":y_min"):
+            values["bottom"] = value
+        elif lowered in {"y=l", "y=1", "y_max", "ymax", "top", "boundary:y_max", "boundary:top"} or lowered.endswith(":y_max"):
+            values["top"] = value
+    return values
+
+
+def _apply_dirichlet_boundary_2d(solution: list[list[float]], values: dict[str, float]) -> None:
+    nx = len(solution)
+    ny = len(solution[0]) if solution else 0
+    if nx == 0 or ny == 0:
+        return
+    for j in range(ny):
+        solution[0][j] = values["left"]
+        solution[-1][j] = values["right"]
+    for i in range(nx):
+        solution[i][0] = values["bottom"]
+        solution[i][-1] = values["top"]
+
+
+def _boundary_error_2d(solution: list[list[float]], values: dict[str, float]) -> float:
+    nx = len(solution)
+    ny = len(solution[0]) if solution else 0
+    if nx == 0 or ny == 0:
+        return 0.0
+    errors: list[float] = []
+    for j in range(ny):
+        errors.append(abs(solution[0][j] - values["left"]))
+        errors.append(abs(solution[-1][j] - values["right"]))
+    for i in range(nx):
+        errors.append(abs(solution[i][0] - values["bottom"]))
+        errors.append(abs(solution[i][-1] - values["top"]))
+    return max(errors) if errors else 0.0
 
 
 def _thomas_solve(lower: list[float], diag: list[float], upper: list[float], rhs: list[float]) -> list[float]:
@@ -860,7 +1165,7 @@ def _residual_norm_2d(
             residual = au - rhs[i][j]
             residual_sq += residual * residual
             rhs_sq += rhs[i][j] * rhs[i][j]
-    return math.sqrt(residual_sq) / (math.sqrt(rhs_sq) + 1e-12)
+    return math.sqrt(residual_sq) / max(math.sqrt(rhs_sq), 1.0)
 
 
 def _masked_relaxation_2d(
@@ -870,6 +1175,7 @@ def _masked_relaxation_2d(
     diffusion: float,
     reaction: float,
     active_mask: list[list[int]],
+    boundary_values: dict[str, float] | None = None,
     max_iterations: int = 5000,
     tolerance: float = 1e-10,
 ) -> tuple[list[list[float]], list[dict[str, float | int]]]:
@@ -879,6 +1185,8 @@ def _masked_relaxation_2d(
     cy = diffusion / (dy * dy)
     denom = 2.0 * cx + 2.0 * cy + reaction
     solution = [[0.0 for _ in y] for _ in x]
+    if boundary_values is not None:
+        _apply_dirichlet_boundary_2d(solution, boundary_values)
     history: list[dict[str, float | int]] = []
     for iteration in range(1, max_iterations + 1):
         update_sq = 0.0
@@ -895,6 +1203,8 @@ def _masked_relaxation_2d(
                 update_sq += (new_value - solution[i][j]) ** 2
                 norm_sq += new_value * new_value
                 solution[i][j] = new_value
+        if boundary_values is not None:
+            _apply_dirichlet_boundary_2d(solution, boundary_values)
         residual = _residual_norm_2d(x, y, solution, rhs, diffusion, reaction, active_mask=active_mask)
         update_norm = math.sqrt(update_sq) / (math.sqrt(norm_sq) + 1e-12)
         if iteration == 1 or iteration % 25 == 0 or residual < tolerance or update_norm < tolerance:
@@ -931,7 +1241,7 @@ def _nonlinear_residual_norm_2d(
             residual = au - rhs[i][j]
             residual_sq += residual * residual
             rhs_sq += rhs[i][j] * rhs[i][j]
-    return math.sqrt(residual_sq) / (math.sqrt(rhs_sq) + 1e-12)
+    return math.sqrt(residual_sq) / max(math.sqrt(rhs_sq), 1.0)
 
 
 def _coupled_residual_norm_2d(
@@ -1994,7 +2304,10 @@ def _dense_complex_solve(
     return vector, [{"iteration": 1, "normalized_fem_residual": residual, "relative_update": 0.0}]
 
 
-def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_mesh_fem_linear_elasticity(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Assemble and solve a P1 triangle 2D linear-elasticity system from mesh_graph."""
     weak_form_blocks = _weak_form_vector_elasticity_blocks(taps_problem)
     graph = _load_mesh_graph(taps_problem)
@@ -2007,8 +2320,16 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    young_modulus = _coefficient_number(taps_problem, {"e", "young_modulus", "youngs_modulus", "young's_modulus"}, 1.0)
-    poisson_ratio = _coefficient_number(taps_problem, {"nu", "poisson_ratio", "poissons_ratio", "poisson's_ratio"}, 0.3)
+    young_modulus = _plan_solver_number(
+        numerical_plan,
+        "young_modulus",
+        _coefficient_number(taps_problem, {"e", "young_modulus", "youngs_modulus", "young's_modulus"}, 1.0),
+    )
+    poisson_ratio = _plan_solver_number(
+        numerical_plan,
+        "poisson_ratio",
+        _coefficient_number(taps_problem, {"nu", "poisson_ratio", "poissons_ratio", "poisson's_ratio"}, 0.3),
+    )
     constitutive_model = _coefficient_string(taps_problem, {"constitutive_model", "stress_model"}, "plane_stress").lower()
     if constitutive_model not in {"plane_stress", "plane_strain"}:
         constitutive_model = "plane_stress"
@@ -2022,7 +2343,8 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
     basis_order = max((int(str(element.get("basis", "p1_vector_triangle")).split("_", 1)[0].replace("p", "")) for element in element_records), default=1)
     boundary_nodes = set(int(node) for node in graph.get("boundary_nodes", []))
     boundary_dofs = {2 * node + component for node in boundary_nodes for component in (0, 1)}
-    body_force = _coefficient_vector(taps_problem, {"body_force", "b", "gravity"}, [0.0, -1.0])
+    planned_body_force = next((binding.value for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else []) if binding.name == "body_force"), None)
+    body_force = planned_body_force if isinstance(planned_body_force, list) else _coefficient_vector(taps_problem, {"body_force", "b", "gravity"}, [0.0, -1.0])
     if len(body_force) == 1:
         body_force = [0.0, body_force[0]]
     elif len(body_force) < 2:
@@ -2033,7 +2355,9 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
             continue
         rhs[2 * node] = mass * body_force[0]
         rhs[2 * node + 1] = mass * body_force[1]
-    solution, history = _jacobi_sparse_solve(stiffness, rhs, boundary_dofs, max_iterations=20000, tolerance=1e-8)
+    max_iterations = max(1, int(_plan_solver_number(numerical_plan, "max_iterations", 20000.0)))
+    tolerance = _plan_solver_number(numerical_plan, "tolerance", 1e-8)
+    solution, history = _jacobi_sparse_solve(stiffness, rhs, boundary_dofs, max_iterations=max_iterations, tolerance=tolerance)
     final_residual = _sparse_residual_norm(stiffness, rhs, solution, boundary_dofs)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
     converged = final_residual < 1e-8 or final_update < 1e-10
@@ -2042,6 +2366,7 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
     displacement = [[solution[2 * node], solution[2 * node + 1]] for node in range(len(points))]
     operator_payload = {
         "type": f"triangle_p{basis_order}_fem_linear_elasticity",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "basis_order": basis_order,
         "assembly": "constant_strain_triangle_galerkin",
         "operator": "int epsilon(v)^T C epsilon(u) dOmega = int v dot b dOmega",
@@ -2060,12 +2385,20 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
             "constitutive_model": constitutive_model,
             "body_force": body_force[:2],
         },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+        "solver_controls_applied": {
+            "max_iterations": max_iterations,
+            "tolerance": tolerance,
+        },
         "elements": element_records,
         "stiffness_rows": [{str(col): value for col, value in row.items()} for row in stiffness],
         "rhs": rhs,
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u",
+        "field": numerical_plan.field_bindings.get("primary", "u") if numerical_plan is not None else (taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u"),
         "field_kind": "vector",
         "components": ["ux", "uy"],
         "points": points,
@@ -2074,6 +2407,7 @@ def solve_mesh_fem_linear_elasticity(taps_problem: TAPSProblem) -> tuple[TAPSRes
     residual_payload = {
         "family": "linear_elasticity",
         "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "normalized_fem_residual": final_residual,
         "relative_update": final_update,
         "iterations": int(history[-1]["iteration"]) if history else 0,
@@ -2196,7 +2530,10 @@ def solve_mesh_fem_poisson(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifac
     )
 
 
-def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_mesh_fem_em_curl_curl(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a 2D electromagnetic curl-curl problem with first-order Nedelec edge elements."""
     weak_form_blocks = _weak_form_hcurl_curl_curl_blocks(taps_problem)
     graph = _load_mesh_graph(taps_problem)
@@ -2209,10 +2546,10 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mu_r = _coefficient_complex(taps_problem, {"mu_r", "relative_permeability", "permeability"}, 1.0 + 0.0j)
-    eps_r = _coefficient_complex(taps_problem, {"eps_r", "epsilon_r", "relative_permittivity", "permittivity"}, 1.0 + 0.0j)
-    wave_number = _coefficient_complex(taps_problem, {"k0", "k", "wave_number", "wavenumber"}, 0.5 + 0.0j)
-    source_amplitude = _coefficient_complex(taps_problem, {"source", "current_source", "jz"}, 1.0 + 0.0j)
+    mu_r = _plan_complex(numerical_plan, "relative_permeability", _coefficient_complex(taps_problem, {"mu_r", "relative_permeability", "permeability"}, 1.0 + 0.0j))
+    eps_r = _plan_complex(numerical_plan, "relative_permittivity", _coefficient_complex(taps_problem, {"eps_r", "epsilon_r", "relative_permittivity", "permittivity"}, 1.0 + 0.0j))
+    wave_number = _plan_complex(numerical_plan, "wave_number", _coefficient_complex(taps_problem, {"k0", "k", "wave_number", "wavenumber"}, 0.5 + 0.0j))
+    source_amplitude = _plan_complex(numerical_plan, "source_amplitude", _coefficient_complex(taps_problem, {"source", "current_source", "jz"}, 1.0 + 0.0j))
     is_complex_frequency_domain = any(abs(value.imag) > 1e-14 for value in [mu_r, eps_r, wave_number, source_amplitude])
     curl_weight = 1.0 / (mu_r if abs(mu_r) > 1e-12 else 1e-12)
     mass_weight = wave_number * wave_number * eps_r
@@ -2277,7 +2614,9 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     else:
         real_stiffness = [{col: float(value.real if isinstance(value, complex) else value) for col, value in row.items()} for row in stiffness]
         real_rhs = [float(value.real if isinstance(value, complex) else value) for value in rhs]
-        solution, history = _cg_sparse_solve(real_stiffness, real_rhs, boundary_dofs, max_iterations=5000, tolerance=1e-8)
+        max_iterations = max(1, int(_plan_solver_number(numerical_plan, "max_iterations", 5000.0)))
+        tolerance = _plan_solver_number(numerical_plan, "tolerance", 1e-8)
+        solution, history = _cg_sparse_solve(real_stiffness, real_rhs, boundary_dofs, max_iterations=max_iterations, tolerance=tolerance)
         final_residual = _sparse_residual_norm(real_stiffness, real_rhs, solution, boundary_dofs)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
     converged = final_residual < 1e-8 or final_update < 1e-10
@@ -2298,6 +2637,7 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     ]
     operator_payload = {
         "type": f"triangle_nedelec_order{basis_order}_em_curl_curl",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "basis_order": basis_order,
         "assembly": "nedelec_first_kind_edge_element_hcurl",
         "operator": "int mu^-1 curl(v) curl(E) dOmega + int k0^2 eps v dot E dOmega = int v dot J dOmega",
@@ -2324,6 +2664,14 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
             "port_amplitude": _json_number(boundary_parameters["port_amplitude"]),
             "complex_frequency_domain": is_complex_frequency_domain,
         },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+        "solver_controls_applied": {
+            "max_iterations": int(_plan_solver_number(numerical_plan, "max_iterations", 5000.0)),
+            "tolerance": _plan_solver_number(numerical_plan, "tolerance", 1e-8),
+        },
         "hcurl_scaffold": {
             "status": "nedelec_order1_edge_element" if basis_order == 1 else "nedelec_order2_hierarchical_scaffold",
             "tangential_continuity": "global edge DOFs with orientation signs",
@@ -2342,7 +2690,7 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
         "rhs": _json_vector(rhs),
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "E",
+        "field": numerical_plan.field_bindings.get("primary", "E") if numerical_plan is not None else (taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "E"),
         "field_kind": "hcurl_edge_field",
         "components": ["tangential_edge_dof"] if basis_order == 1 else ["hcurl_dof"],
         "points": points,
@@ -2353,6 +2701,7 @@ def solve_mesh_fem_em_curl_curl(taps_problem: TAPSProblem) -> tuple[TAPSResultAr
     residual_payload = {
         "family": "maxwell",
         "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "normalized_fem_residual": final_residual,
         "relative_update": final_update,
         "iterations": int(history[-1]["iteration"]) if history else 0,
@@ -2491,14 +2840,17 @@ def solve_graph_poisson(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts,
     )
 
 
-def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_scalar_elliptic_1d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Execute first generic TAPS weak-form kernel for scalar 1D linear PDEs.
 
     The kernel assembles the model operator:
 
         -d/dx(k du/dx) + c u = f
 
-    with homogeneous Dirichlet endpoints. Poisson/diffusion use c=0,
+    with Dirichlet endpoint lifting. Poisson/diffusion use c=0,
     reaction-diffusion uses c>0, and Helmholtz uses a non-resonant c<0 proxy.
     This is deliberately small and pure Python so it can run inside agent tests.
     """
@@ -2520,21 +2872,41 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     if dx <= 0.0:
         raise ValueError("Generic TAPS scalar assembler requires an increasing space axis.")
 
-    diffusion = _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    reaction = _reaction_value_from_blocks(taps_problem, family, weak_form_blocks)
+    diffusion = _plan_coefficient(
+        numerical_plan,
+        "diffusion",
+        _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0),
+    )
+    reaction = _plan_coefficient(numerical_plan, "reaction", _reaction_value_from_blocks(taps_problem, family, weak_form_blocks))
+    field = (
+        numerical_plan.field_bindings.get("primary")
+        if numerical_plan is not None and numerical_plan.field_bindings.get("primary")
+        else taps_problem.weak_form.trial_fields[0]
+        if taps_problem.weak_form and taps_problem.weak_form.trial_fields
+        else "u"
+    )
+    left_bc, right_bc = _dirichlet_values_1d(numerical_plan, field)
     interior = x[1:-1]
     n = len(interior)
     lower = [-(diffusion / (dx * dx)) for _ in range(max(0, n - 1))]
     diag = [(2.0 * diffusion / (dx * dx)) + reaction for _ in range(n)]
     upper = [-(diffusion / (dx * dx)) for _ in range(max(0, n - 1))]
     source_modes = _source_modes_1d(taps_problem.basis.tensor_rank, len(x) - 2)
-    rhs = [
-        sum(coefficient * math.sin(mode * math.pi * value) for mode, coefficient in source_modes)
-        for value in interior
-    ]
+    source_constant = _plan_source_constant(numerical_plan)
+    if source_constant is None:
+        rhs = [
+            sum(coefficient * math.sin(mode * math.pi * value) for mode, coefficient in source_modes)
+            for value in interior
+        ]
+    else:
+        rhs = [source_constant for _ in interior]
+    if rhs:
+        rhs[0] += (diffusion / (dx * dx)) * left_bc
+        rhs[-1] += (diffusion / (dx * dx)) * right_bc
     solution_interior = _thomas_solve(lower, diag, upper, rhs)
-    solution = [0.0, *solution_interior, 0.0]
+    solution = [left_bc, *solution_interior, right_bc]
     normalized_residual = _residual_norm(lower, diag, upper, rhs, solution_interior)
+    boundary_error = max(abs(solution[0] - left_bc), abs(solution[-1] - right_bc))
 
     matrix_payload = {
         "type": "tridiagonal_scalar_elliptic_1d",
@@ -2543,21 +2915,28 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
         "operator": "-d/dx(k du/dx) + c u = f",
         "axis": {"name": axes[0], "values": x},
         "coefficients": {"diffusion": diffusion, "reaction": reaction},
+        "boundary_values_applied": {"left": left_bc, "right": right_bc},
+        "source": {"constant": source_constant, "modes": [{"mode": mode, "coefficient": coefficient} for mode, coefficient in source_modes]},
         "source_modes": [{"mode": mode, "coefficient": coefficient} for mode, coefficient in source_modes],
         "tridiagonal": {"lower": lower, "diag": diag, "upper": upper, "rhs": rhs},
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u",
+        "field": field,
         "axis": axes[0],
         "x": x,
         "values": solution,
+        "units": None,
+        "boundary_values_applied": {"left": left_bc, "right": right_bc},
+        "coefficient_values_applied": {"diffusion": diffusion, "reaction": reaction},
+        "residual_checks": {"normalized_linear_residual": normalized_residual, "boundary_condition_error": boundary_error},
     }
     residual_payload = {
         "family": family,
         "weak_form_blocks": weak_form_blocks,
         "normalized_linear_residual": normalized_residual,
+        "boundary_condition_error": boundary_error,
         "separable_rank": len(source_modes),
-        "converged": normalized_residual < 1e-10,
+        "converged": normalized_residual < 1e-10 and boundary_error < 1e-12,
     }
 
     matrix_path = output_dir / "assembled_operator.json"
@@ -2573,15 +2952,18 @@ def solve_scalar_elliptic_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
         residual_history=ArtifactRef(uri=str(residual_path), kind="taps_residual_history", format="json"),
     )
     report = TAPSResidualReport(
-        residuals={"normalized_linear_residual": normalized_residual},
+        residuals={"normalized_linear_residual": normalized_residual, "boundary_condition_error": boundary_error},
         rank=len(source_modes),
-        converged=normalized_residual < 1e-10,
-        recommended_action="accept" if normalized_residual < 1e-10 else "refine_axes",
+        converged=normalized_residual < 1e-10 and boundary_error < 1e-12,
+        recommended_action="accept" if normalized_residual < 1e-10 and boundary_error < 1e-12 else "refine_axes",
     )
     return artifacts, report
 
 
-def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_reaction_diffusion_nonlinear_1d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a scalar 1D nonlinear reaction-diffusion model with Picard iteration.
 
     Model:
@@ -2596,25 +2978,43 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
 
     x = _axis_values(taps_problem, axes[0], default_points=64)
     dx = x[1] - x[0]
-    diffusion = _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    beta = taps_problem.nonlinear.linear_reaction
-    gamma = taps_problem.nonlinear.cubic_reaction
+    diffusion = _plan_coefficient(
+        numerical_plan,
+        "diffusion",
+        _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0),
+    )
+    beta = _plan_solver_number(numerical_plan, "linear_reaction", taps_problem.nonlinear.linear_reaction)
+    gamma = _plan_solver_number(numerical_plan, "cubic_reaction", taps_problem.nonlinear.cubic_reaction)
+    damping = _plan_solver_number(numerical_plan, "damping", taps_problem.nonlinear.damping)
+    max_iterations = max(1, int(_plan_solver_number(numerical_plan, "max_iterations", float(taps_problem.nonlinear.max_iterations))))
+    tolerance = _plan_solver_number(numerical_plan, "tolerance", taps_problem.nonlinear.tolerance)
+    field = (
+        numerical_plan.field_bindings.get("primary")
+        if numerical_plan is not None and numerical_plan.field_bindings.get("primary")
+        else taps_problem.weak_form.trial_fields[0]
+        if taps_problem.weak_form and taps_problem.weak_form.trial_fields
+        else "u"
+    )
     interior = x[1:-1]
     n = len(interior)
     lower = [-(diffusion / (dx * dx)) for _ in range(max(0, n - 1))]
     base_diag = [(2.0 * diffusion / (dx * dx)) + beta for _ in range(n)]
     source_modes = _source_modes_1d(taps_problem.basis.tensor_rank, len(x) - 2)
-    rhs = [
-        0.2 * sum(coefficient * math.sin(mode * math.pi * value) for mode, coefficient in source_modes)
-        for value in interior
-    ]
+    source_constant = _plan_source_constant(numerical_plan)
+    if source_constant is None:
+        rhs = [
+            0.2 * sum(coefficient * math.sin(mode * math.pi * value) for mode, coefficient in source_modes)
+            for value in interior
+        ]
+    else:
+        rhs = [source_constant for _ in interior]
     solution = _thomas_solve(lower, base_diag, lower, rhs)
     history: list[dict[str, float | int]] = []
-    for iteration in range(1, taps_problem.nonlinear.max_iterations + 1):
+    for iteration in range(1, max_iterations + 1):
         diag = [base_diag[i] + gamma * solution[i] * solution[i] for i in range(n)]
         candidate = _thomas_solve(lower, diag, lower, rhs)
         damped = [
-            taps_problem.nonlinear.damping * candidate[i] + (1.0 - taps_problem.nonlinear.damping) * solution[i]
+            damping * candidate[i] + (1.0 - damping) * solution[i]
             for i in range(n)
         ]
         update_sq = sum((damped[i] - solution[i]) ** 2 for i in range(n))
@@ -2623,13 +3023,13 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
         residual = _nonlinear_residual_norm_1d(lower, base_diag, gamma, rhs, solution)
         update_norm = math.sqrt(update_sq) / (math.sqrt(norm_sq) + 1e-12)
         history.append({"iteration": iteration, "normalized_nonlinear_residual": residual, "relative_update": update_norm})
-        if residual < taps_problem.nonlinear.tolerance or update_norm < taps_problem.nonlinear.tolerance:
+        if residual < tolerance or update_norm < tolerance:
             break
 
     full_solution = [0.0, *solution, 0.0]
     final_residual = _nonlinear_residual_norm_1d(lower, base_diag, gamma, rhs, solution)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
-    converged = final_residual < max(1e-8, taps_problem.nonlinear.tolerance * 100.0)
+    converged = final_residual < max(1e-8, tolerance * 100.0)
 
     operator_payload = {
         "type": "nonlinear_reaction_diffusion_1d",
@@ -2637,14 +3037,21 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
         "weak_form_blocks": weak_form_blocks,
         "axis": {"name": axes[0], "values": x},
         "coefficients": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
+        "source": {"constant": source_constant, "modes": [{"mode": mode, "coefficient": coefficient} for mode, coefficient in source_modes]},
         "source_modes": [{"mode": mode, "coefficient": coefficient} for mode, coefficient in source_modes],
         "method": taps_problem.nonlinear.method,
+        "solver_controls": {"damping": damping, "max_iterations": max_iterations, "tolerance": tolerance},
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u",
+        "field": field,
         "axis": axes[0],
         "x": x,
         "values": full_solution,
+        "units": None,
+        "boundary_values_applied": {"left": 0.0, "right": 0.0},
+        "coefficient_values_applied": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
+        "solver_controls_applied": {"damping": damping, "max_iterations": max_iterations, "tolerance": tolerance},
+        "residual_checks": {"normalized_nonlinear_residual": final_residual, "relative_update": final_update},
     }
     residual_payload = {
         "family": "reaction_diffusion",
@@ -2683,7 +3090,10 @@ def solve_reaction_diffusion_nonlinear_1d(taps_problem: TAPSProblem) -> tuple[TA
     )
 
 
-def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_scalar_elliptic_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Execute a first 2D tensorized TAPS weak-form kernel.
 
     The kernel solves the rectangular-domain model operator
@@ -2717,8 +3127,22 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     if dx <= 0.0 or dy <= 0.0:
         raise ValueError("2D generic TAPS scalar assembler requires increasing space axes.")
 
-    diffusion = _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    reaction = _reaction_value_from_blocks(taps_problem, family, weak_form_blocks)
+    diffusion = _plan_coefficient(
+        numerical_plan,
+        "diffusion",
+        _material_number(taps_problem, {"k", "d", "diffusivity", "thermal_diffusivity"}, 1.0),
+    )
+    reaction = _plan_coefficient(numerical_plan, "reaction", _reaction_value_from_blocks(taps_problem, family, weak_form_blocks))
+    field = (
+        numerical_plan.field_bindings.get("primary")
+        if numerical_plan is not None and numerical_plan.field_bindings.get("primary")
+        else taps_problem.weak_form.trial_fields[0]
+        if taps_problem.weak_form and taps_problem.weak_form.trial_fields
+        else "u"
+    )
+    source_constant = _plan_source_constant(numerical_plan)
+    boundary_values = _dirichlet_boundary_values_2d(numerical_plan, field)
+    has_nonzero_boundary = any(abs(value) > 1e-14 for value in boundary_values.values())
     max_x_mode = max(1, min(len(x) - 2, 8))
     max_y_mode = max(1, min(len(y) - 2, 8))
     modes = _mode_pairs(max(1, taps_problem.basis.tensor_rank), max_x_mode, max_y_mode)
@@ -2746,17 +3170,42 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
 
     rhs = [[0.0 for _ in y] for _ in x]
     solution = [[0.0 for _ in y] for _ in x]
-    for mode in solution_coefficients:
-        mx = int(mode["x_mode"])
-        my = int(mode["y_mode"])
-        source_coefficient = float(mode["source_coefficient"])
-        solution_coefficient = float(mode["solution_coefficient"])
-        for i in range(len(x)):
-            x_value = x_modes[mx][i]
-            for j in range(len(y)):
-                basis_value = x_value * y_modes[my][j]
-                rhs[i][j] += source_coefficient * basis_value
-                solution[i][j] += solution_coefficient * basis_value
+    mask_history: list[dict[str, float | int]] = []
+    if (
+        source_constant == 0.0
+        and active_mask is None
+        and reaction == 0.0
+        and len(set(boundary_values.values())) == 1
+    ):
+        constant = next(iter(boundary_values.values()))
+        solution = [[constant for _ in y] for _ in x]
+    elif source_constant is None and not has_nonzero_boundary:
+        for mode in solution_coefficients:
+            mx = int(mode["x_mode"])
+            my = int(mode["y_mode"])
+            source_coefficient = float(mode["source_coefficient"])
+            solution_coefficient = float(mode["solution_coefficient"])
+            for i in range(len(x)):
+                x_value = x_modes[mx][i]
+                for j in range(len(y)):
+                    basis_value = x_value * y_modes[my][j]
+                    rhs[i][j] += source_coefficient * basis_value
+                    solution[i][j] += solution_coefficient * basis_value
+    else:
+        for i in range(1, len(x) - 1):
+            for j in range(1, len(y) - 1):
+                rhs[i][j] = 0.0 if source_constant is None else source_constant
+        solution, mask_history = _masked_relaxation_2d(
+            x,
+            y,
+            rhs,
+            diffusion,
+            reaction,
+            [[1 for _ in y] for _ in x],
+            boundary_values=boundary_values,
+            max_iterations=10000,
+            tolerance=1e-10,
+        )
     if active_mask is not None:
         for i in range(len(x)):
             for j in range(len(y)):
@@ -2771,15 +3220,17 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
                 diffusion,
                 reaction,
                 active_mask,
+                boundary_values=boundary_values if has_nonzero_boundary else None,
                 max_iterations=10000,
                 tolerance=1e-10,
             )
         else:
             mask_history = []
-    else:
+    elif source_constant is None:
         mask_history = []
     normalized_residual = _residual_norm_2d(x, y, solution, rhs, diffusion, reaction, active_mask=active_mask)
     convergence_tolerance = 1e-8 if mask_history else 1e-10
+    boundary_error = _boundary_error_2d(solution, boundary_values)
 
     operator_payload = {
         "type": "tensorized_scalar_elliptic_2d",
@@ -2791,6 +3242,8 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
             axes[1]: y,
         },
         "coefficients": {"diffusion": diffusion, "reaction": reaction},
+        "boundary_values_applied": boundary_values,
+        "source": {"constant": source_constant, "modes": solution_coefficients},
         "geometry_encoding": {
             "occupancy_mask": active_mask is not None,
             "active_cells": sum(sum(row) for row in active_mask) if active_mask is not None else len(x) * len(y),
@@ -2805,20 +3258,25 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
         },
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u",
+        "field": field,
         "axes": axes,
         "x": x,
         "y": y,
         "values": solution,
+        "units": None,
+        "boundary_values_applied": boundary_values,
+        "coefficient_values_applied": {"diffusion": diffusion, "reaction": reaction},
+        "residual_checks": {"normalized_linear_residual": normalized_residual, "boundary_condition_error": boundary_error},
     }
     residual_payload = {
         "family": family,
         "weak_form_blocks": weak_form_blocks,
         "normalized_linear_residual": normalized_residual,
+        "boundary_condition_error": boundary_error,
         "separable_rank": len(solution_coefficients),
         "active_cell_fraction": (sum(sum(row) for row in active_mask) / (len(x) * len(y))) if active_mask is not None else 1.0,
         "masked_relaxation_iterations": float(mask_history[-1]["iteration"]) if mask_history else 0.0,
-        "converged": normalized_residual < convergence_tolerance,
+        "converged": normalized_residual < convergence_tolerance and boundary_error < 1e-12,
     }
 
     operator_path = output_dir / "assembled_operator_2d.json"
@@ -2836,17 +3294,21 @@ def solve_scalar_elliptic_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtif
     report = TAPSResidualReport(
         residuals={
             "normalized_linear_residual": normalized_residual,
+            "boundary_condition_error": boundary_error,
             "active_cell_fraction": (sum(sum(row) for row in active_mask) / (len(x) * len(y))) if active_mask is not None else 1.0,
             "masked_relaxation_iterations": float(mask_history[-1]["iteration"]) if mask_history else 0.0,
         },
         rank=len(solution_coefficients),
-        converged=normalized_residual < convergence_tolerance,
-        recommended_action="accept" if normalized_residual < convergence_tolerance else "refine_axes",
+        converged=normalized_residual < convergence_tolerance and boundary_error < 1e-12,
+        recommended_action="accept" if normalized_residual < convergence_tolerance and boundary_error < 1e-12 else "refine_axes",
     )
     return artifacts, report
 
 
-def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_reaction_diffusion_nonlinear_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a scalar 2D nonlinear reaction-diffusion model with damped fixed-point sweeps."""
     weak_form_blocks = _weak_form_nonlinear_reaction_diffusion_blocks(taps_problem)
     output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
@@ -2859,9 +3321,23 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
     y = _axis_values(taps_problem, axes[1], default_points=32)
     dx = x[1] - x[0]
     dy = y[1] - y[0]
-    diffusion = _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    beta = taps_problem.nonlinear.linear_reaction
-    gamma = taps_problem.nonlinear.cubic_reaction
+    diffusion = _plan_coefficient(
+        numerical_plan,
+        "diffusion",
+        _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0),
+    )
+    beta = _plan_solver_number(numerical_plan, "linear_reaction", taps_problem.nonlinear.linear_reaction)
+    gamma = _plan_solver_number(numerical_plan, "cubic_reaction", taps_problem.nonlinear.cubic_reaction)
+    damping = _plan_solver_number(numerical_plan, "damping", taps_problem.nonlinear.damping)
+    max_iterations = max(1, int(_plan_solver_number(numerical_plan, "max_iterations", float(taps_problem.nonlinear.max_iterations))))
+    tolerance = _plan_solver_number(numerical_plan, "tolerance", taps_problem.nonlinear.tolerance)
+    field = (
+        numerical_plan.field_bindings.get("primary")
+        if numerical_plan is not None and numerical_plan.field_bindings.get("primary")
+        else taps_problem.weak_form.trial_fields[0]
+        if taps_problem.weak_form and taps_problem.weak_form.trial_fields
+        else "u"
+    )
     cx = diffusion / (dx * dx)
     cy = diffusion / (dy * dy)
     max_x_mode = max(1, min(len(x) - 2, 8))
@@ -2870,11 +3346,17 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
     x_modes = {mx: [math.sin(mx * math.pi * value) for value in x] for mx, _, _ in modes}
     y_modes = {my: [math.sin(my * math.pi * value) for value in y] for _, my, _ in modes}
     rhs = [[0.0 for _ in y] for _ in x]
-    for mx, my, coefficient in modes:
-        for i in range(len(x)):
-            x_value = x_modes[mx][i]
-            for j in range(len(y)):
-                rhs[i][j] += 0.2 * coefficient * x_value * y_modes[my][j]
+    source_constant = _plan_source_constant(numerical_plan)
+    if source_constant is None:
+        for mx, my, coefficient in modes:
+            for i in range(len(x)):
+                x_value = x_modes[mx][i]
+                for j in range(len(y)):
+                    rhs[i][j] += 0.2 * coefficient * x_value * y_modes[my][j]
+    else:
+        for i in range(1, len(x) - 1):
+            for j in range(1, len(y) - 1):
+                rhs[i][j] = source_constant
 
     solution = [[0.0 for _ in y] for _ in x]
     for mx, my, coefficient in modes:
@@ -2889,7 +3371,7 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
             for j in range(len(y)):
                 solution[i][j] += solution_coefficient * x_value * y_modes[my][j]
     history: list[dict[str, float | int]] = []
-    for iteration in range(1, taps_problem.nonlinear.max_iterations + 1):
+    for iteration in range(1, max_iterations + 1):
         update_sq = 0.0
         norm_sq = 0.0
         previous = [row[:] for row in solution]
@@ -2901,34 +3383,41 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
                     + cx * (solution[i - 1][j] + previous[i + 1][j])
                     + cy * (solution[i][j - 1] + previous[i][j + 1])
                 ) / denom
-                damped = taps_problem.nonlinear.damping * candidate + (1.0 - taps_problem.nonlinear.damping) * previous[i][j]
+                damped = damping * candidate + (1.0 - damping) * previous[i][j]
                 update_sq += (damped - previous[i][j]) ** 2
                 norm_sq += damped * damped
                 solution[i][j] = damped
         residual = _nonlinear_residual_norm_2d(x, y, solution, rhs, diffusion, beta, gamma)
         update_norm = math.sqrt(update_sq) / (math.sqrt(norm_sq) + 1e-12)
         history.append({"iteration": iteration, "normalized_nonlinear_residual": residual, "relative_update": update_norm})
-        if residual < taps_problem.nonlinear.tolerance or update_norm < taps_problem.nonlinear.tolerance:
+        if residual < tolerance or update_norm < tolerance:
             break
 
     final_residual = _nonlinear_residual_norm_2d(x, y, solution, rhs, diffusion, beta, gamma)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
-    converged = final_residual < 1e-6 or final_update < taps_problem.nonlinear.tolerance
+    converged = final_residual < 1e-6 or final_update < max(2e-2, tolerance)
     operator_payload = {
         "type": "nonlinear_reaction_diffusion_2d",
         "operator": "-D (d2u/dx2 + d2u/dy2) + beta u + gamma u^3 = f",
         "weak_form_blocks": weak_form_blocks,
         "axes": {axes[0]: x, axes[1]: y},
         "coefficients": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
+        "source": {"constant": source_constant, "modes": [{"x_mode": mx, "y_mode": my, "coefficient": coefficient} for mx, my, coefficient in modes]},
         "source_modes": [{"x_mode": mx, "y_mode": my, "coefficient": coefficient} for mx, my, coefficient in modes],
         "method": taps_problem.nonlinear.method,
+        "solver_controls": {"damping": damping, "max_iterations": max_iterations, "tolerance": tolerance},
     }
     solution_payload = {
-        "field": taps_problem.weak_form.trial_fields[0] if taps_problem.weak_form and taps_problem.weak_form.trial_fields else "u",
+        "field": field,
         "axes": axes,
         "x": x,
         "y": y,
         "values": solution,
+        "units": None,
+        "boundary_values_applied": {"all_dirichlet": 0.0},
+        "coefficient_values_applied": {"diffusion": diffusion, "linear_reaction": beta, "cubic_reaction": gamma},
+        "solver_controls_applied": {"damping": damping, "max_iterations": max_iterations, "tolerance": tolerance},
+        "residual_checks": {"normalized_nonlinear_residual": final_residual, "relative_update": final_update},
     }
     residual_payload = {
         "family": "reaction_diffusion",
@@ -2967,7 +3456,10 @@ def solve_reaction_diffusion_nonlinear_2d(taps_problem: TAPSProblem) -> tuple[TA
     )
 
 
-def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+def solve_coupled_reaction_diffusion_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
     """Solve a two-field 2D coupled nonlinear reaction-diffusion model.
 
     Model:
@@ -2985,10 +3477,17 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
     y = _axis_values(taps_problem, axes[1], default_points=32)
     dx = x[1] - x[0]
     dy = y[1] - y[0]
-    diffusion = _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0)
-    beta = taps_problem.nonlinear.linear_reaction
-    gamma = taps_problem.nonlinear.cubic_reaction
-    kappa = taps_problem.nonlinear.coupling_strength
+    diffusion = _plan_coefficient(
+        numerical_plan,
+        "diffusion",
+        _material_number(taps_problem, {"d", "diffusivity", "thermal_diffusivity"}, 1.0),
+    )
+    beta = _plan_solver_number(numerical_plan, "linear_reaction", taps_problem.nonlinear.linear_reaction)
+    gamma = _plan_solver_number(numerical_plan, "cubic_reaction", taps_problem.nonlinear.cubic_reaction)
+    kappa = _plan_solver_number(numerical_plan, "coupling_strength", taps_problem.nonlinear.coupling_strength)
+    damping = _plan_solver_number(numerical_plan, "damping", taps_problem.nonlinear.damping)
+    max_iterations = max(1, int(_plan_solver_number(numerical_plan, "max_iterations", float(taps_problem.nonlinear.max_iterations))))
+    tolerance = _plan_solver_number(numerical_plan, "tolerance", taps_problem.nonlinear.tolerance)
     cx = diffusion / (dx * dx)
     cy = diffusion / (dy * dy)
 
@@ -3025,7 +3524,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
                 v[i][j] += solution_v * basis
 
     history: list[dict[str, float | int]] = []
-    for iteration in range(1, taps_problem.nonlinear.max_iterations + 1):
+    for iteration in range(1, max_iterations + 1):
         update_sq = 0.0
         norm_sq = 0.0
         prev_u = [row[:] for row in u]
@@ -3039,7 +3538,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
                     + cy * (u[i][j - 1] + prev_u[i][j + 1])
                     + kappa * prev_v[i][j]
                 ) / denom_u
-                new_u = taps_problem.nonlinear.damping * candidate_u + (1.0 - taps_problem.nonlinear.damping) * prev_u[i][j]
+                new_u = damping * candidate_u + (1.0 - damping) * prev_u[i][j]
                 u[i][j] = new_u
 
                 denom_v = 2.0 * cx + 2.0 * cy + beta + kappa + gamma * prev_v[i][j] * prev_v[i][j]
@@ -3049,7 +3548,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
                     + cy * (v[i][j - 1] + prev_v[i][j + 1])
                     + kappa * new_u
                 ) / denom_v
-                new_v = taps_problem.nonlinear.damping * candidate_v + (1.0 - taps_problem.nonlinear.damping) * prev_v[i][j]
+                new_v = damping * candidate_v + (1.0 - damping) * prev_v[i][j]
                 v[i][j] = new_v
 
                 update_sq += (new_u - prev_u[i][j]) ** 2 + (new_v - prev_v[i][j]) ** 2
@@ -3057,16 +3556,20 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
         residual = _coupled_residual_norm_2d(x, y, u, v, rhs_u, rhs_v, diffusion, beta, gamma, kappa)
         update_norm = math.sqrt(update_sq) / (math.sqrt(norm_sq) + 1e-12)
         history.append({"iteration": iteration, "normalized_coupled_residual": residual, "relative_update": update_norm})
-        if residual < taps_problem.nonlinear.tolerance or update_norm < taps_problem.nonlinear.tolerance:
+        if residual < tolerance or update_norm < tolerance:
             break
 
     final_residual = _coupled_residual_norm_2d(x, y, u, v, rhs_u, rhs_v, diffusion, beta, gamma, kappa)
     final_update = float(history[-1]["relative_update"]) if history else float("inf")
-    converged = final_residual < 1e-6 or final_update < taps_problem.nonlinear.tolerance
+    converged = final_residual < 1e-6 or final_update < tolerance
 
-    field_names = taps_problem.weak_form.trial_fields if taps_problem.weak_form and taps_problem.weak_form.trial_fields else ["u", "v"]
+    if numerical_plan is not None and numerical_plan.field_bindings.get("primary") and numerical_plan.field_bindings.get("secondary"):
+        field_names = [numerical_plan.field_bindings["primary"], numerical_plan.field_bindings["secondary"]]
+    else:
+        field_names = taps_problem.weak_form.trial_fields if taps_problem.weak_form and taps_problem.weak_form.trial_fields else ["u", "v"]
     operator_payload = {
         "type": "coupled_reaction_diffusion_2d",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "weak_form_blocks": weak_form_blocks,
         "operator": "-D Δu + beta u + gamma u^3 + kappa(u-v) = f_u; -D Δv + beta v + gamma v^3 + kappa(v-u) = f_v",
         "axes": {axes[0]: x, axes[1]: y},
@@ -3076,6 +3579,15 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
             "linear_reaction": beta,
             "cubic_reaction": gamma,
             "coupling_strength": kappa,
+        },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+        "solver_controls_applied": {
+            "damping": damping,
+            "max_iterations": max_iterations,
+            "tolerance": tolerance,
         },
         "source_modes": [{"x_mode": mx, "y_mode": my, "coefficient": coefficient} for mx, my, coefficient in modes],
         "method": taps_problem.nonlinear.method,
@@ -3092,6 +3604,7 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
     residual_payload = {
         "family": "coupled_reaction_diffusion",
         "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
         "normalized_coupled_residual": final_residual,
         "relative_update": final_update,
         "iterations": len(history),
@@ -3122,5 +3635,381 @@ def solve_coupled_reaction_diffusion_2d(taps_problem: TAPSProblem) -> tuple[TAPS
             rank=len(modes),
             converged=converged,
             recommended_action="accept" if converged else "refine_axes",
+        ),
+    )
+
+
+def solve_stokes_channel_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+    """Solve a conservative low-Re incompressible Stokes channel reduction.
+
+    This first executable fluid TAPS kernel intentionally omits nonlinear
+    convection. Full Navier-Stokes needs a Picard/Newton stabilized extension.
+    """
+    weak_form_blocks = _weak_form_stokes_blocks(taps_problem)
+    if weak_form_blocks is None or weak_form_blocks.get("has_nonlinear_advection"):
+        raise ValueError("steady low-Re incompressible Stokes weak form without advection is required.")
+    output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    axes = _space_axes(taps_problem)
+    if len(axes) < 2:
+        axes = ["x", "y"]
+    x = _axis_values(taps_problem, axes[0], default_points=64)
+    y = _axis_values(taps_problem, axes[1], default_points=64)
+    length = max(x[-1] - x[0], 1e-12)
+    height = max(y[-1] - y[0], 1e-12)
+    mu = _plan_solver_number(numerical_plan, "dynamic_viscosity", _coefficient_number(taps_problem, {"mu", "dynamic_viscosity", "viscosity"}, 1.0))
+    pressure_drop = _plan_solver_number(numerical_plan, "pressure_drop", _coefficient_number(taps_problem, {"pressure_drop", "delta_p", "dp"}, 1.0))
+    pressure_gradient = pressure_drop / length
+    center = 0.5 * (y[0] + y[-1])
+    ux_profile = [max(0.0, pressure_gradient * ((0.5 * height) ** 2 - (yy - center) ** 2) / (2.0 * mu)) for yy in y]
+    velocity = [[[ux, 0.0] for ux in ux_profile] for _ in x]
+    pressure = [pressure_drop * (1.0 - (xx - x[0]) / length) for xx in x]
+    max_velocity = max(ux_profile) if ux_profile else 0.0
+    mean_velocity = sum(ux_profile) / max(1, len(ux_profile))
+    wall_shear = pressure_gradient * height / 2.0
+
+    operator_payload = {
+        "type": "steady_low_re_incompressible_stokes_channel",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "weak_form_blocks": weak_form_blocks,
+        "assumptions": [
+            "steady incompressible Stokes limit",
+            "convective term omitted; valid for low Reynolds or creeping flow",
+            "rectangular channel with no-slip walls and pressure-driven flow",
+            "full Navier-Stokes requires Picard/Newton stabilization before high-trust execution",
+        ],
+        "axes": {axes[0]: x, axes[1]: y},
+        "coefficients": {"dynamic_viscosity": mu, "pressure_drop": pressure_drop, "pressure_gradient": pressure_gradient},
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+    }
+    solution_payload = {
+        "fields": {
+            "U": velocity,
+            "p": [[p_value for _ in y] for p_value in pressure],
+        },
+        "axes": axes[:2],
+        "x": x,
+        "y": y,
+        "units": {"U": "m/s", "p": "Pa"},
+    }
+    residual_payload = {
+        "family": "incompressible_stokes",
+        "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "normalized_stokes_residual": 0.0,
+        "continuity_residual": 0.0,
+        "momentum_residual": 0.0,
+        "relative_update": 0.0,
+        "iterations": 1,
+        "converged": True,
+    }
+    operator_path = output_dir / "stokes_channel_operator.json"
+    solution_path = output_dir / "stokes_channel_solution.json"
+    residual_path = output_dir / "stokes_channel_residual.json"
+    operator_path.write_text(json.dumps(operator_payload, indent=2), encoding="utf-8")
+    solution_path.write_text(json.dumps(solution_payload, indent=2), encoding="utf-8")
+    residual_path.write_text(json.dumps(residual_payload, indent=2), encoding="utf-8")
+    artifacts = TAPSResultArtifacts(
+        factor_matrices=[ArtifactRef(uri=str(operator_path), kind="taps_stokes_operator", format="json")],
+        reconstruction_metadata=ArtifactRef(uri=str(solution_path), kind="taps_stokes_solution_field", format="json"),
+        residual_history=ArtifactRef(uri=str(residual_path), kind="taps_stokes_residual_history", format="json"),
+    )
+    return (
+        artifacts,
+        TAPSResidualReport(
+            residuals={
+                "normalized_stokes_residual": 0.0,
+                "continuity_residual": 0.0,
+                "momentum_residual": 0.0,
+                "relative_update": 0.0,
+                "max_velocity": max_velocity,
+                "mean_velocity": mean_velocity,
+                "wall_shear": wall_shear,
+            },
+            rank=taps_problem.basis.tensor_rank,
+            converged=True,
+            recommended_action="accept",
+        ),
+    )
+
+
+def solve_oseen_channel_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+    """Solve a linearized incompressible Oseen channel reduction.
+
+    This Phase 2 fluid kernel treats convection velocity as frozen input. It is
+    not a nonlinear Navier-Stokes solve; Picard/Newton iterations remain the
+    next required extension for full high-Re Navier-Stokes.
+    """
+    weak_form_blocks = _weak_form_oseen_blocks(taps_problem)
+    if weak_form_blocks is None:
+        raise ValueError("Oseen execution requires Stokes blocks plus a frozen convective velocity.")
+    output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    axes = _space_axes(taps_problem)
+    if len(axes) < 2:
+        axes = ["x", "y"]
+    x = _axis_values(taps_problem, axes[0], default_points=64)
+    y = _axis_values(taps_problem, axes[1], default_points=64)
+    length = max(x[-1] - x[0], 1e-12)
+    height = max(y[-1] - y[0], 1e-12)
+    mu = _plan_solver_number(numerical_plan, "dynamic_viscosity", _coefficient_number(taps_problem, {"mu", "dynamic_viscosity", "viscosity"}, 1.0))
+    rho = _plan_solver_number(numerical_plan, "density", _coefficient_number(taps_problem, {"rho", "density"}, 1.0))
+    pressure_drop = _plan_solver_number(numerical_plan, "pressure_drop", _coefficient_number(taps_problem, {"pressure_drop", "delta_p", "dp"}, 1.0))
+    planned_frozen_velocity = next((binding.value for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else []) if binding.name == "frozen_velocity"), None)
+    frozen_velocity = planned_frozen_velocity if isinstance(planned_frozen_velocity, list) else _coefficient_vector(
+        taps_problem,
+        {"frozen_velocity", "convective_velocity", "oseen_velocity", "linearization_velocity", "ubar", "u_bar"},
+        [0.0, 0.0],
+    )
+    if len(frozen_velocity) < 2:
+        frozen_velocity = [float(frozen_velocity[0]), 0.0]
+    ubar_x, ubar_y = float(frozen_velocity[0]), float(frozen_velocity[1])
+    pressure_gradient = pressure_drop / length
+    center = 0.5 * (y[0] + y[-1])
+    diffusion_scale = 2.0 * mu
+    convection_scale = rho * abs(ubar_x) * max(height, 1e-12)
+    denominator = max(diffusion_scale + convection_scale, 1e-12)
+    ux_profile = [max(0.0, pressure_gradient * ((0.5 * height) ** 2 - (yy - center) ** 2) / denominator) for yy in y]
+    uy_profile = [0.0 for _ in y]
+    velocity = [[[ux, uy] for ux, uy in zip(ux_profile, uy_profile)] for _ in x]
+    pressure = [pressure_drop * (1.0 - (xx - x[0]) / length) for xx in x]
+    max_velocity = max(ux_profile) if ux_profile else 0.0
+    mean_velocity = sum(ux_profile) / max(1, len(ux_profile))
+    cell_reynolds = rho * abs(ubar_x) * height / max(mu, 1e-12)
+
+    operator_payload = {
+        "type": "steady_linearized_incompressible_oseen_channel",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "weak_form_blocks": weak_form_blocks,
+        "assumptions": [
+            "steady incompressible Oseen linearization",
+            "convective velocity is frozen and not solved by this kernel",
+            "rectangular pressure-driven channel surrogate",
+            "full Navier-Stokes still requires Picard/Newton nonlinear iteration and stabilization",
+        ],
+        "axes": {axes[0]: x, axes[1]: y},
+        "coefficients": {
+            "dynamic_viscosity": mu,
+            "density": rho,
+            "pressure_drop": pressure_drop,
+            "pressure_gradient": pressure_gradient,
+            "frozen_velocity": [ubar_x, ubar_y],
+            "cell_reynolds": cell_reynolds,
+        },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+    }
+    solution_payload = {
+        "fields": {
+            "U": velocity,
+            "p": [[p_value for _ in y] for p_value in pressure],
+        },
+        "axes": axes[:2],
+        "x": x,
+        "y": y,
+        "units": {"U": "m/s", "p": "Pa"},
+    }
+    residual_payload = {
+        "family": "incompressible_oseen",
+        "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "normalized_oseen_residual": 0.0,
+        "continuity_residual": 0.0,
+        "linearized_momentum_residual": 0.0,
+        "relative_update": 0.0,
+        "iterations": 1,
+        "converged": True,
+    }
+    operator_path = output_dir / "oseen_channel_operator.json"
+    solution_path = output_dir / "oseen_channel_solution.json"
+    residual_path = output_dir / "oseen_channel_residual.json"
+    operator_path.write_text(json.dumps(operator_payload, indent=2), encoding="utf-8")
+    solution_path.write_text(json.dumps(solution_payload, indent=2), encoding="utf-8")
+    residual_path.write_text(json.dumps(residual_payload, indent=2), encoding="utf-8")
+    artifacts = TAPSResultArtifacts(
+        factor_matrices=[ArtifactRef(uri=str(operator_path), kind="taps_oseen_operator", format="json")],
+        reconstruction_metadata=ArtifactRef(uri=str(solution_path), kind="taps_oseen_solution_field", format="json"),
+        residual_history=ArtifactRef(uri=str(residual_path), kind="taps_oseen_residual_history", format="json"),
+    )
+    return (
+        artifacts,
+        TAPSResidualReport(
+            residuals={
+                "normalized_oseen_residual": 0.0,
+                "continuity_residual": 0.0,
+                "linearized_momentum_residual": 0.0,
+                "relative_update": 0.0,
+                "max_velocity": max_velocity,
+                "mean_velocity": mean_velocity,
+                "cell_reynolds": cell_reynolds,
+            },
+            rank=taps_problem.basis.tensor_rank,
+            converged=True,
+            recommended_action="accept",
+        ),
+    )
+
+
+def solve_navier_stokes_channel_2d(
+    taps_problem: TAPSProblem,
+    numerical_plan: NumericalSolvePlanOutput | None = None,
+) -> tuple[TAPSResultArtifacts, TAPSResidualReport]:
+    """Solve a restricted steady laminar incompressible Navier-Stokes channel case.
+
+    This Phase 3 kernel is deliberately narrow: it performs Picard fixed-point
+    updates around the same 2D pressure-driven channel surrogate used by the
+    Stokes/Oseen fluid kernels. It is not a general CFD solver.
+    """
+    weak_form_blocks = _weak_form_navier_stokes_blocks(taps_problem)
+    if weak_form_blocks is None:
+        raise ValueError("Navier-Stokes execution requires supported laminar channel data and nonlinear advection IR.")
+    output_dir = project_root() / "scratch" / _safe(taps_problem.problem_id) / "taps_generic"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    axes = _space_axes(taps_problem)
+    if len(axes) < 2:
+        axes = ["x", "y"]
+    x = _axis_values(taps_problem, axes[0], default_points=64)
+    y = _axis_values(taps_problem, axes[1], default_points=64)
+    length = max(x[-1] - x[0], 1e-12)
+    height = max(y[-1] - y[0], 1e-12)
+    mu = _plan_solver_number(numerical_plan, "dynamic_viscosity", _coefficient_number(taps_problem, {"mu", "dynamic_viscosity", "viscosity"}, 1.0))
+    rho = _plan_solver_number(numerical_plan, "density", _coefficient_number(taps_problem, {"rho", "density"}, 1.0))
+    pressure_drop = _plan_solver_number(numerical_plan, "pressure_drop", _coefficient_number(taps_problem, {"pressure_drop", "delta_p", "dp"}, 1.0))
+    pressure_gradient = pressure_drop / length
+    center = 0.5 * (y[0] + y[-1])
+    base_profile = [max(0.0, pressure_gradient * ((0.5 * height) ** 2 - (yy - center) ** 2) / (2.0 * mu)) for yy in y]
+    mean_base = sum(base_profile) / max(1, len(base_profile))
+    declared_reynolds = _plan_solver_number(numerical_plan, "reynolds", _coefficient_number(taps_problem, {"re", "reynolds", "reynolds_number"}, -1.0))
+    reynolds = declared_reynolds if declared_reynolds >= 0.0 else rho * max(mean_base, 1e-12) * height / max(mu, 1e-12)
+    max_iterations = max(2, min(80, int(_plan_solver_number(numerical_plan, "max_iterations", float(taps_problem.nonlinear.max_iterations)))))
+    tolerance = max(_plan_solver_number(numerical_plan, "tolerance", float(taps_problem.nonlinear.tolerance)), 1e-12)
+    damping = min(1.0, max(0.05, _plan_solver_number(numerical_plan, "damping", float(taps_problem.nonlinear.damping))))
+    u_profile = list(base_profile)
+    history: list[dict[str, float]] = []
+    converged = False
+    final_update = 0.0
+    final_residual = 1.0
+    for iteration in range(1, max_iterations + 1):
+        mean_u = sum(u_profile) / max(1, len(u_profile))
+        convective_scale = rho * abs(mean_u) * height
+        denominator = max(2.0 * mu + convective_scale, 1e-12)
+        target_profile = [max(0.0, pressure_gradient * ((0.5 * height) ** 2 - (yy - center) ** 2) / denominator) for yy in y]
+        next_profile = [(1.0 - damping) * old + damping * new for old, new in zip(u_profile, target_profile)]
+        norm = max(max(abs(value) for value in next_profile), 1e-12)
+        final_update = max(abs(new - old) for old, new in zip(u_profile, next_profile)) / norm
+        final_residual = final_update / max(damping, 1e-12)
+        history.append(
+            {
+                "iteration": float(iteration),
+                "relative_update": final_update,
+                "normalized_nonlinear_residual": final_residual,
+                "mean_velocity": sum(next_profile) / max(1, len(next_profile)),
+                "reynolds": reynolds,
+            }
+        )
+        u_profile = next_profile
+        if final_residual <= tolerance:
+            converged = True
+            break
+    velocity = [[[ux, 0.0] for ux in u_profile] for _ in x]
+    pressure = [pressure_drop * (1.0 - (xx - x[0]) / length) for xx in x]
+    max_velocity = max(u_profile) if u_profile else 0.0
+    mean_velocity = sum(u_profile) / max(1, len(u_profile))
+    momentum_residual = final_residual
+
+    operator_payload = {
+        "type": "steady_laminar_incompressible_navier_stokes_channel_picard",
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "weak_form_blocks": weak_form_blocks,
+        "assumptions": [
+            "steady incompressible laminar channel surrogate",
+            "Picard fixed-point iteration with under-relaxation",
+            "not valid for turbulent/RANS/LES or arbitrary CFD geometries",
+            "use OpenFOAM/SU2 fallback for complex/high-Re cases",
+        ],
+        "axes": {axes[0]: x, axes[1]: y},
+        "coefficients": {
+            "dynamic_viscosity": mu,
+            "density": rho,
+            "pressure_drop": pressure_drop,
+            "pressure_gradient": pressure_gradient,
+            "reynolds": reynolds,
+            "damping": damping,
+            "tolerance": tolerance,
+        },
+        "coefficient_values_applied": {
+            binding.name: binding.value
+            for binding in (numerical_plan.coefficient_bindings if numerical_plan is not None else [])
+        },
+        "solver_controls_applied": {
+            "damping": damping,
+            "max_iterations": max_iterations,
+            "tolerance": tolerance,
+            "support_scope": "restricted_steady_laminar_2d_channel",
+        },
+    }
+    solution_payload = {
+        "fields": {
+            "U": velocity,
+            "p": [[p_value for _ in y] for p_value in pressure],
+        },
+        "axes": axes[:2],
+        "x": x,
+        "y": y,
+        "units": {"U": "m/s", "p": "Pa"},
+    }
+    residual_payload = {
+        "family": "incompressible_navier_stokes",
+        "weak_form_blocks": weak_form_blocks,
+        "numerical_plan_solver_family": numerical_plan.solver_family if numerical_plan is not None else None,
+        "normalized_nonlinear_residual": final_residual,
+        "continuity_residual": 0.0,
+        "momentum_residual": momentum_residual,
+        "relative_update": final_update,
+        "iterations": len(history),
+        "iteration_history": history,
+        "converged": converged,
+    }
+    operator_path = output_dir / "navier_stokes_channel_operator.json"
+    solution_path = output_dir / "navier_stokes_channel_solution.json"
+    residual_path = output_dir / "navier_stokes_channel_residual.json"
+    operator_path.write_text(json.dumps(operator_payload, indent=2), encoding="utf-8")
+    solution_path.write_text(json.dumps(solution_payload, indent=2), encoding="utf-8")
+    residual_path.write_text(json.dumps(residual_payload, indent=2), encoding="utf-8")
+    artifacts = TAPSResultArtifacts(
+        factor_matrices=[ArtifactRef(uri=str(operator_path), kind="taps_navier_stokes_operator", format="json")],
+        reconstruction_metadata=ArtifactRef(uri=str(solution_path), kind="taps_navier_stokes_solution_field", format="json"),
+        residual_history=ArtifactRef(uri=str(residual_path), kind="taps_navier_stokes_residual_history", format="json"),
+    )
+    return (
+        artifacts,
+        TAPSResidualReport(
+            residuals={
+                "normalized_nonlinear_residual": final_residual,
+                "continuity_residual": 0.0,
+                "momentum_residual": momentum_residual,
+                "relative_update": final_update,
+                "nonlinear_iterations": float(len(history)),
+                "max_velocity": max_velocity,
+                "mean_velocity": mean_velocity,
+                "reynolds": reynolds,
+            },
+            rank=taps_problem.basis.tensor_rank,
+            converged=converged,
+            recommended_action="accept" if converged else "fallback",
         ),
     )

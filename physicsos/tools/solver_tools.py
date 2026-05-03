@@ -127,6 +127,18 @@ class SubmitFullSolverJobOutput(StrictBaseModel):
     submitted: bool = False
 
 
+class PrepareOpenFOAMRunnerManifestInput(StrictBaseModel):
+    case_bundle: ArtifactRef
+    solver: Literal["simpleFoam", "icoFoam"] = "simpleFoam"
+    budget: ComputeBudget = Field(default_factory=ComputeBudget)
+    service_base_url: str | None = None
+
+
+class PrepareOpenFOAMRunnerManifestOutput(StrictBaseModel):
+    runner_manifest: ArtifactRef
+    warnings: list[str] = Field(default_factory=list)
+
+
 def _backend_info(backend_name: str):
     return next((backend for backend in DEFAULT_BACKENDS if backend.name == backend_name), None)
 
@@ -206,6 +218,295 @@ def _write_runner_response(manifest: dict, payload: dict) -> ArtifactRef:
     path = _runner_response_path(manifest, str(payload.get("mode", "runner")))
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return ArtifactRef(uri=str(Path(path)), kind="full_solver_runner_response", format="json")
+
+
+def _load_taps_case_bundle(artifact: ArtifactRef) -> dict:
+    if artifact.kind != "taps_backend_case_bundle":
+        raise ValueError(f"Expected taps_backend_case_bundle artifact, got {artifact.kind}.")
+    try:
+        payload = json.loads(Path(artifact.uri).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read TAPS backend case bundle: {artifact.uri}") from exc
+    if payload.get("schema_version") != "physicsos.taps_backend_case_bundle.v1":
+        raise ValueError(f"Unsupported TAPS backend case bundle schema: {payload.get('schema_version')}")
+    return payload
+
+
+def _openfoam_file(path: str, content: str) -> dict[str, str]:
+    return {"path": path, "content": content}
+
+
+def _foam_header(class_name: str, object_name: str) -> str:
+    return (
+        "FoamFile\n"
+        "{\n"
+        "    version     2.0;\n"
+        "    format      ascii;\n"
+        f"    class       {class_name};\n"
+        f"    object      {object_name};\n"
+        "}\n"
+    )
+
+
+def _of_scalar(value: object, default: float) -> float:
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _bundle_coefficient(bundle: dict, names: set[str], default: float) -> float:
+    normalized = {name.lower() for name in names}
+    plan = bundle.get("backend_preparation_plan") if isinstance(bundle.get("backend_preparation_plan"), dict) else {}
+    coefficient_map = plan.get("coefficient_map") if isinstance(plan.get("coefficient_map"), list) else bundle.get("coefficient_binding", [])
+    if isinstance(coefficient_map, list):
+        for item in coefficient_map:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").lower()
+            if name in normalized and "value" in item:
+                return _of_scalar(item.get("value"), default)
+    return default
+
+
+def _bundle_boundary_roles(bundle: dict) -> set[str]:
+    boundaries = bundle.get("boundary_binding", [])
+    roles: set[str] = set()
+    if isinstance(boundaries, list):
+        for item in boundaries:
+            if isinstance(item, dict):
+                roles.add(str(item.get("kind") or item.get("backend_tag") or "").lower())
+                roles.add(str(item.get("region_id") or "").lower())
+    return roles
+
+
+def _openfoam_channel_case_files(*, nu: float, solver: str) -> list[dict[str, str]]:
+    end_time = "50" if solver == "simpleFoam" else "0.5"
+    delta_t = "1" if solver == "simpleFoam" else "0.005"
+    return [
+        _openfoam_file(
+            "system/blockMeshDict",
+            _foam_header("dictionary", "blockMeshDict")
+            + """
+convertToMeters 1;
+vertices
+(
+    (0 0 0)
+    (1 0 0)
+    (1 1 0)
+    (0 1 0)
+    (0 0 0.05)
+    (1 0 0.05)
+    (1 1 0.05)
+    (0 1 0.05)
+);
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (20 20 1) simpleGrading (1 1 1)
+);
+edges ();
+boundary
+(
+    inlet  { type patch; faces ((0 4 7 3)); }
+    outlet { type patch; faces ((1 2 6 5)); }
+    walls  { type wall; faces ((0 1 5 4) (3 7 6 2)); }
+    frontAndBack { type empty; faces ((0 3 2 1) (4 5 6 7)); }
+);
+mergePatchPairs ();
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "0/U",
+            _foam_header("volVectorField", "U")
+            + """
+dimensions      [0 1 -1 0 0 0 0];
+internalField   uniform (0 0 0);
+boundaryField
+{
+    inlet        { type fixedValue; value uniform (1 0 0); }
+    outlet       { type zeroGradient; }
+    walls        { type noSlip; }
+    frontAndBack { type empty; }
+}
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "0/p",
+            _foam_header("volScalarField", "p")
+            + """
+dimensions      [0 2 -2 0 0 0 0];
+internalField   uniform 0;
+boundaryField
+{
+    inlet        { type zeroGradient; }
+    outlet       { type fixedValue; value uniform 0; }
+    walls        { type zeroGradient; }
+    frontAndBack { type empty; }
+}
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "constant/transportProperties",
+            _foam_header("dictionary", "transportProperties")
+            + f"""
+transportModel  Newtonian;
+nu              [0 2 -1 0 0 0 0] {nu:.12g};
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "constant/turbulenceProperties",
+            _foam_header("dictionary", "turbulenceProperties")
+            + """
+simulationType  laminar;
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "system/controlDict",
+            _foam_header("dictionary", "controlDict")
+            + f"""
+application     {solver};
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         {end_time};
+deltaT          {delta_t};
+writeControl    timeStep;
+writeInterval   1;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  6;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable true;
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "system/fvSchemes",
+            _foam_header("dictionary", "fvSchemes")
+            + """
+ddtSchemes      { default steadyState; }
+gradSchemes     { default Gauss linear; }
+divSchemes
+{
+    default         none;
+    div(phi,U)      bounded Gauss upwind;
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes    { default corrected; }
+""".lstrip(),
+        ),
+        _openfoam_file(
+            "system/fvSolution",
+            _foam_header("dictionary", "fvSolution")
+            + """
+solvers
+{
+    p { solver PCG; preconditioner DIC; tolerance 1e-06; relTol 0.05; }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-05; relTol 0.1; }
+}
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+}
+relaxationFactors
+{
+    fields { p 0.3; }
+    equations { U 0.7; }
+}
+""".lstrip(),
+        ),
+    ]
+
+
+def _validate_openfoam_case_files(case_files: list[dict[str, str]]) -> None:
+    safe_path = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-")
+    required = {
+        "system/blockMeshDict",
+        "0/U",
+        "0/p",
+        "constant/transportProperties",
+        "constant/turbulenceProperties",
+        "system/controlDict",
+        "system/fvSchemes",
+        "system/fvSolution",
+    }
+    paths = {file.get("path", "") for file in case_files}
+    missing = sorted(required - paths)
+    if missing:
+        raise ValueError(f"OpenFOAM case_files missing required files: {missing}")
+    for file in case_files:
+        path = file.get("path", "")
+        if not path or path.startswith("/") or ".." in path or any(char not in safe_path for char in path):
+            raise ValueError(f"Unsafe OpenFOAM case file path: {path}")
+        if not isinstance(file.get("content"), str):
+            raise ValueError(f"OpenFOAM case file content must be a string: {path}")
+
+
+def prepare_openfoam_runner_manifest(input: PrepareOpenFOAMRunnerManifestInput) -> PrepareOpenFOAMRunnerManifestOutput:
+    """Convert a reviewed TAPS backend case bundle into foamvm's OpenFOAM runner manifest."""
+    bundle = _load_taps_case_bundle(input.case_bundle)
+    if str(bundle.get("backend", "")).lower() != "openfoam":
+        raise ValueError("OpenFOAM runner manifest adapter requires bundle.backend=openfoam.")
+    approval_gate = bundle.get("approval_gate") if isinstance(bundle.get("approval_gate"), dict) else {}
+    if approval_gate.get("execute_external_solver") is not False:
+        raise ValueError("Case bundle approval gate must not pre-enable external solver execution.")
+    mesh_export = bundle.get("mesh_export") if isinstance(bundle.get("mesh_export"), dict) else {}
+    if mesh_export.get("required") and mesh_export.get("provided"):
+        raise NotImplementedError("polyMesh/gmshToFoam runner manifests are not enabled yet; first adapter supports blockMesh-only channel cases.")
+    roles = _bundle_boundary_roles(bundle)
+    if not ({"inlet", "outlet"} <= roles and ("wall" in roles or "walls" in roles)):
+        raise ValueError("OpenFOAM first adapter requires inlet, outlet, and wall boundary roles.")
+    mu = _bundle_coefficient(bundle, {"dynamic_viscosity", "mu", "viscosity"}, 1.0)
+    rho = _bundle_coefficient(bundle, {"density", "rho"}, 1.0)
+    nu = mu / rho if abs(rho) > 1e-12 else mu
+    case_files = _openfoam_channel_case_files(nu=nu, solver=input.solver)
+    _validate_openfoam_case_files(case_files)
+    problem_id = str(bundle.get("problem_id") or "problem:openfoam")
+    workspace = _solver_workspace(problem_id, "openfoam")
+    manifest = {
+        "schema_version": "physicsos.full_solver_job.v1",
+        "problem_id": problem_id,
+        "backend": "openfoam",
+        "backend_command": input.solver,
+        "service": {
+            "base_url": input.service_base_url,
+            "mode": "prepare_only",
+            "requires_approval_token": True,
+        },
+        "budget": input.budget.model_dump(mode="json"),
+        "inputs": {
+            "source_case_bundle": input.case_bundle.uri,
+            "source_schema_version": bundle.get("schema_version"),
+            "adapter": "physicsos.openfoam.blockmesh_channel.v1",
+        },
+        "openfoam": {
+            "solver": input.solver,
+            "mesh_mode": "blockMesh",
+            "case_files": case_files,
+        },
+        "execution_policy": {
+            "sandboxed_workspace": str(workspace),
+            "network_access": "runner_service_only",
+            "external_process_execution": "disabled_until_approved",
+            "artifact_collection": ["log.blockMesh", f"log.{input.solver}", "VTK.tar.gz", "native_outputs"],
+        },
+    }
+    path = workspace / "openfoam_runner_manifest.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    artifact = ArtifactRef(
+        uri=str(path),
+        kind="full_solver_runner_manifest",
+        format="json",
+        description="foamvm-compatible OpenFOAM full-solver runner manifest.",
+    )
+    return PrepareOpenFOAMRunnerManifestOutput(runner_manifest=artifact)
 
 
 def _http_submit_job(manifest: dict, service_base_url: str, approval_token: str) -> dict:
@@ -323,6 +624,7 @@ for _tool, _input, _output, _approval in [
     (route_solver_backend, RouteSolverBackendInput, RouteSolverBackendOutput, False),
     (run_surrogate_solver, RunSurrogateSolverInput, RunSurrogateSolverOutput, False),
     (prepare_full_solver_case, PrepareFullSolverCaseInput, PrepareFullSolverCaseOutput, False),
+    (prepare_openfoam_runner_manifest, PrepareOpenFOAMRunnerManifestInput, PrepareOpenFOAMRunnerManifestOutput, False),
     (submit_full_solver_job, SubmitFullSolverJobInput, SubmitFullSolverJobOutput, True),
     (run_full_solver, RunFullSolverInput, RunFullSolverOutput, True),
     (run_hybrid_solver, RunHybridSolverInput, RunHybridSolverOutput, False),

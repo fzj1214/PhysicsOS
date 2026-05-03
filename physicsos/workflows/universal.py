@@ -6,8 +6,14 @@ from uuid import uuid4
 
 from pydantic import Field, ValidationError
 
+from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, structured_agent_event_context
 from physicsos.events import PhysicsOSEvent, emit_physicsos_event
-from physicsos.schemas.common import StrictBaseModel
+from physicsos.schemas.common import ComputeBudget, StrictBaseModel
+from physicsos.schemas.contracts import (
+    ContractReviewReport,
+    build_physics_problem_contract,
+    review_problem_to_taps_contract,
+)
 from physicsos.schemas.agents import (
     AgentHandoff,
     CaseMemoryAgentInput,
@@ -32,10 +38,22 @@ from physicsos.schemas.mesh import MeshSpec
 from physicsos.schemas.postprocess import PostprocessResult
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverResult
-from physicsos.schemas.taps import TAPSProblem, TAPSResidualReport, TAPSBasisConfig
+from physicsos.schemas.taps import TAPSCompilationPlan, TAPSProblem, TAPSResidualReport, TAPSBasisConfig
 from physicsos.schemas.verification import VerificationReport
 from physicsos.schemas.operators import PhysicsSpec
-from physicsos.tools.geometry_tools import GenerateGeometryEncodingInput, GenerateMeshInput, LabelRegionsInput, generate_geometry_encoding, generate_mesh, label_regions
+from physicsos.tools.geometry_tools import (
+    CreateBoundaryLabelingArtifactInput,
+    GenerateGeometryEncodingInput,
+    GenerateMeshInput,
+    GeometryMeshPlanInput,
+    LabelRegionsInput,
+    create_boundary_labeling_artifact,
+    generate_geometry_encoding,
+    generate_mesh,
+    label_regions,
+    plan_geometry_mesh,
+    plan_geometry_mesh_structured,
+)
 from physicsos.tools.knowledge_tools import BuildKnowledgeContextInput, build_knowledge_context
 from physicsos.tools.memory_tools import (
     AppendCaseMemoryEventInput,
@@ -50,10 +68,13 @@ from physicsos.tools.memory_tools import (
 )
 from physicsos.tools.postprocess_tools import (
     ExtractKPIsInput,
+    PostprocessPlanInput,
     GenerateVisualizationsInput,
     WriteSimulationReportInput,
     extract_kpis,
     generate_visualizations,
+    plan_postprocess,
+    plan_postprocess_structured,
     write_simulation_report,
 )
 from physicsos.tools.problem_tools import ValidatePhysicsProblemInput, validate_physics_problem
@@ -62,11 +83,16 @@ from physicsos.tools.taps_tools import (
     BuildTAPSProblemInput,
     EstimateTAPSResidualInput,
     EstimateTAPSSupportInput,
+    FormulateTAPSEquationInput,
     RunTAPSBackendInput,
+    ValidateTAPSIRInput,
     build_taps_problem,
     estimate_taps_residual,
     estimate_taps_support,
+    formulate_taps_equation,
+    formulate_taps_equation_structured,
     run_taps_backend,
+    validate_taps_ir,
 )
 from physicsos.tools.verification_tools import (
     CheckConservationLawsInput,
@@ -107,6 +133,7 @@ class PhysicsOSWorkflowResult(StrictBaseModel):
     postprocess: PostprocessResult | None = None
     case_store: StoreCaseResultOutput | None = None
     validation_attempts: list[ValidationRetryContext] = Field(default_factory=list)
+    contract_review: ContractReviewReport | None = None
     trace: list[WorkflowStep] = Field(default_factory=list)
     events: list[PhysicsOSEvent] = Field(default_factory=list)
 
@@ -265,7 +292,7 @@ def _run_agent_with_retries(
     for attempt in range(1, max_attempts + 1):
         try:
             return runner(agent_input)
-        except (ValidationError, ValueError, RuntimeError) as exc:
+        except (ValidationError, ValueError, RuntimeError, TimeoutError) as exc:
             final_attempt = attempt == max_attempts
             retry = ValidationRetryContext(
                 agent_name=agent_name,
@@ -305,6 +332,33 @@ def _run_agent_with_retries(
 
 
 def _run_geometry_mesh_agent(input: GeometryMeshAgentInput) -> GeometryMeshAgentOutput:
+    return _run_geometry_mesh_agent_with_planner(input)
+
+
+def _run_geometry_mesh_agent_with_planner(
+    input: GeometryMeshAgentInput,
+    *,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
+    problem_contract: PhysicsProblemContract | None = None,
+    knowledge_context: KnowledgeContext | None = None,
+) -> GeometryMeshAgentOutput:
+    plan_input = GeometryMeshPlanInput(
+        problem=input.problem,
+        problem_contract=problem_contract,
+        requested_encodings=input.requested_encodings,
+        target_backends=input.target_backends,
+        knowledge_context=knowledge_context,
+        case_memory_context=input.case_memory_context,
+    )
+    if (
+        structured_client is not None
+        and core_agent_config is not None
+        and core_agent_config.mode in {"llm", "hybrid"}
+    ):
+        plan = plan_geometry_mesh_structured(plan_input, client=structured_client, config=core_agent_config)
+    else:
+        plan = plan_geometry_mesh(plan_input)
     problem = input.problem
     geometry = problem.geometry
     artifacts = []
@@ -319,13 +373,14 @@ def _run_geometry_mesh_agent(input: GeometryMeshAgentInput) -> GeometryMeshAgent
             GenerateMeshInput(
                 geometry=geometry,
                 physics=PhysicsSpec(domains=[problem.domain]),
-                target_backends=input.target_backends,
+                mesh_policy=plan.mesh_policy,
+                target_backends=plan.target_backends or input.target_backends,
             )
         ).mesh
         quality = mesh.quality
 
     encodings = list(geometry.encodings)
-    requested = input.requested_encodings
+    requested = plan.requested_encodings or input.requested_encodings
     if requested:
         generated = generate_geometry_encoding(
             GenerateGeometryEncodingInput(geometry=geometry, mesh=mesh, encodings=requested)
@@ -333,6 +388,24 @@ def _run_geometry_mesh_agent(input: GeometryMeshAgentInput) -> GeometryMeshAgent
         encodings.extend(generated.encodings)
         artifacts.extend(generated.artifacts)
         geometry = geometry.model_copy(update={"encodings": encodings})
+
+    if plan.require_boundary_confirmation:
+        labeling = create_boundary_labeling_artifact(CreateBoundaryLabelingArtifactInput(geometry=geometry))
+        artifacts.append(labeling.artifact)
+        return GeometryMeshAgentOutput(
+            handoff=_handoff(
+                agent_name="geometry-mesh-agent",
+                status="needs_user_input",
+                problem_id=problem.id,
+                summary="Geometry boundary labels require confirmation before solver execution.",
+                recommended_next_agent="main-agent",
+                recommended_next_action="confirm_boundary_labels",
+            ).model_copy(update={"artifacts": artifacts, "warnings": [*plan.warnings, *labeling.warnings]}),
+            geometry=geometry,
+            mesh=mesh,
+            encodings=encodings,
+            quality=quality,
+        )
 
     return GeometryMeshAgentOutput(
         handoff=_handoff(
@@ -342,7 +415,7 @@ def _run_geometry_mesh_agent(input: GeometryMeshAgentInput) -> GeometryMeshAgent
             summary=f"geometry={geometry.id}; mesh={'ready' if mesh is not None else 'not_required_or_not_generated'}; encodings={len(encodings)}",
             recommended_next_agent="taps-agent",
             recommended_next_action="validate_and_compile_taps_problem",
-        ).model_copy(update={"artifacts": artifacts}),
+        ).model_copy(update={"artifacts": artifacts, "warnings": plan.warnings}),
         geometry=geometry,
         mesh=mesh,
         encodings=encodings,
@@ -427,9 +500,38 @@ def _validate_problem_with_retries(
     )
 
 
-def _run_taps_agent(input: TAPSAgentInput) -> TAPSAgentOutput:
+def _formulate_taps_with_llm_first_fallback(
+    input: FormulateTAPSEquationInput,
+    *,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
+) -> TAPSCompilationPlan:
+    if (
+        structured_client is not None
+        and core_agent_config is not None
+        and core_agent_config.mode in {"llm", "hybrid"}
+    ):
+        return formulate_taps_equation_structured(
+            input,
+            client=structured_client,
+            config=core_agent_config,
+        ).plan
+    return formulate_taps_equation(input).plan
+
+
+def _run_taps_agent(
+    input: TAPSAgentInput,
+    *,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
+) -> TAPSAgentOutput:
     support = estimate_taps_support(EstimateTAPSSupportInput(problem=input.problem)).support
-    if not support.supported:
+    llm_formulation_available = (
+        structured_client is not None
+        and core_agent_config is not None
+        and core_agent_config.mode in {"llm", "hybrid"}
+    )
+    if not support.supported and not llm_formulation_available:
         return TAPSAgentOutput(
             handoff=_handoff(
                 agent_name="taps-agent",
@@ -442,13 +544,48 @@ def _run_taps_agent(input: TAPSAgentInput) -> TAPSAgentOutput:
             support=support,
         )
 
+    compilation_plan = _formulate_taps_with_llm_first_fallback(
+        FormulateTAPSEquationInput(
+            problem=input.problem,
+            problem_contract=input.problem_contract,
+            knowledge_context=input.knowledge_context,
+        ),
+        structured_client=structured_client,
+        core_agent_config=core_agent_config,
+    )
     taps_problem = build_taps_problem(
         BuildTAPSProblemInput(
             problem=input.problem,
             basis=TAPSBasisConfig(tensor_rank=input.tensor_rank, reproducing_order=2),
+            compilation_plan=compilation_plan,
         )
     ).taps_problem
-    solver_result = run_taps_backend(RunTAPSBackendInput(problem=input.problem, taps_problem=taps_problem)).result
+    contract_review = None
+    if input.problem_contract is not None:
+        contract_review = review_problem_to_taps_contract(input.problem_contract, taps_problem, compilation_plan)
+        if contract_review.status != "accepted":
+            return TAPSAgentOutput(
+                handoff=_handoff(
+                    agent_name="taps-agent",
+                    status="failed",
+                    problem_id=input.problem.id,
+                    summary="TAPS contract review failed before execution: " + "; ".join(contract_review.errors),
+                    recommended_next_agent="taps-agent",
+                    recommended_next_action="retry_taps_formulation_with_contract",
+                ),
+                support=support,
+                compilation_plan=compilation_plan,
+                taps_problem=taps_problem,
+                contract_review=contract_review,
+            )
+    ir_validation = validate_taps_ir(ValidateTAPSIRInput(problem=input.problem, taps_problem=taps_problem))
+    solver_result = run_taps_backend(
+        RunTAPSBackendInput(
+            problem=input.problem,
+            taps_problem=taps_problem,
+            budget=ComputeBudget(max_wall_time_seconds=input.max_wall_time_seconds),
+        )
+    ).result
     residual = estimate_taps_residual(
         EstimateTAPSResidualInput(problem=input.problem, taps_problem=taps_problem, result=solver_result)
     ).report
@@ -457,12 +594,14 @@ def _run_taps_agent(input: TAPSAgentInput) -> TAPSAgentOutput:
             agent_name="taps-agent",
             status="complete" if solver_result.status in {"success", "needs_review"} else "failed",
             problem_id=input.problem.id,
-            summary=f"backend={solver_result.backend}; action={residual.recommended_action}",
+            summary=f"backend={solver_result.backend}; action={residual.recommended_action}; ir={ir_validation.recommended_action}",
             recommended_next_agent="verification-agent",
             recommended_next_action="verify_result",
         ),
         support=support,
+        compilation_plan=compilation_plan,
         taps_problem=taps_problem,
+        contract_review=contract_review,
         result=solver_result,
         residual=residual,
     )
@@ -503,16 +642,46 @@ def _run_verification_agent(input: VerificationAgentInput) -> VerificationAgentO
     )
 
 
-def _run_postprocess_agent(input: PostprocessAgentInput) -> PostprocessAgentOutput:
+def _run_postprocess_agent(
+    input: PostprocessAgentInput,
+    *,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
+    problem_contract: PhysicsProblemContract | None = None,
+    knowledge_context: KnowledgeContext | None = None,
+) -> PostprocessAgentOutput:
+    plan_input = PostprocessPlanInput(
+        problem=input.problem,
+        problem_contract=problem_contract,
+        result=input.result,
+        verification=input.verification,
+        available_artifacts=input.result.artifacts,
+        knowledge_context=knowledge_context,
+        case_memory_context=input.case_memory_context,
+    )
+    if (
+        structured_client is not None
+        and core_agent_config is not None
+        and core_agent_config.mode in {"llm", "hybrid"}
+    ):
+        plan = plan_postprocess_structured(plan_input, client=structured_client, config=core_agent_config)
+    else:
+        plan = plan_postprocess(plan_input)
     kpis = extract_kpis(ExtractKPIsInput(problem=input.problem, result=input.result))
-    visualizations = generate_visualizations(GenerateVisualizationsInput(problem=input.problem, result=input.result))
+    visualizations = generate_visualizations(
+        GenerateVisualizationsInput(
+            problem=input.problem,
+            result=input.result,
+            visualization_plan=plan.visualization_plan,
+        )
+    )
     postprocess = PostprocessResult(
         problem_id=input.problem.id,
         result_id=input.result.id,
         kpis=kpis.kpis,
         units=kpis.units,
         visualizations=visualizations.artifacts,
-        recommendations=[input.verification.explanation],
+        recommendations=plan.recommendations or [input.verification.explanation],
     )
     report = write_simulation_report(
         WriteSimulationReportInput(
@@ -533,7 +702,7 @@ def _run_postprocess_agent(input: PostprocessAgentInput) -> PostprocessAgentOutp
             summary=f"Report written to {report.report.uri}.",
             recommended_next_agent="case-memory",
             recommended_next_action="store_case_result",
-        ),
+        ).model_copy(update={"warnings": [*plan.warnings, *visualizations.warnings]}),
         result=postprocess,
     )
 
@@ -562,11 +731,15 @@ def _run_case_memory_agent(input: CaseMemoryAgentInput) -> CaseMemoryAgentOutput
 def run_physicsos_workflow(
     problem: PhysicsProblem | None = None,
     *,
+    run_id: str | None = None,
     use_knowledge: bool = True,
     arxiv_max_results: int = 0,
     use_deepsearch: bool = False,
     taps_rank: int = 8,
     max_validation_attempts: int = 2,
+    taps_max_wall_time_seconds: float = 120.0,
+    structured_client: StructuredLLMClient | None = None,
+    core_agent_config: CoreAgentLLMConfig | None = None,
 ) -> PhysicsOSWorkflowResult:
     """Run the local PhysicsOS orchestration loop.
 
@@ -575,9 +748,10 @@ def run_physicsos_workflow(
     """
     trace: list[WorkflowStep] = []
     events: list[PhysicsOSEvent] = []
-    run_id = f"workflow:{uuid4().hex}"
+    run_id = run_id or f"workflow:{uuid4().hex}"
     problem = problem or build_default_thermal_problem()
-    state = PhysicsOSWorkflowState(problem=problem, run_id=run_id)
+    problem_contract = build_physics_problem_contract(problem)
+    state = PhysicsOSWorkflowState(problem=problem, run_id=run_id, problem_contract=problem_contract)
     trace.append(WorkflowStep(name="problem", status="ready", summary=f"Using PhysicsProblem {problem.id}."))
     _emit_workflow_event(
         events,
@@ -587,6 +761,7 @@ def run_physicsos_workflow(
         stage="problem",
         status="ready",
         summary=f"Using PhysicsProblem {problem.id}.",
+        payload={"problem_contract": problem_contract.model_dump(mode="json")},
     )
 
     case_memory_context = build_case_memory_context(SearchCaseMemoryInput(problem=problem, top_k=3))
@@ -696,17 +871,24 @@ def run_physicsos_workflow(
         status="started",
         summary="geometry-mesh-agent started.",
     )
-    geometry = _run_agent_with_retries(
-        agent_name="geometry-mesh-agent",
-        stage="geometry-mesh-agent",
-        problem=problem,
-        agent_input=geometry_input,
-        runner=_run_geometry_mesh_agent,
-        state=state,
-        max_validation_attempts=max_validation_attempts,
-        events=events,
-        run_id=run_id,
-    )
+    with structured_agent_event_context(run_id=run_id, case_id=problem.id, events=events):
+        geometry = _run_agent_with_retries(
+            agent_name="geometry-mesh-agent",
+            stage="geometry-mesh-agent",
+            problem=problem,
+            agent_input=geometry_input,
+            runner=lambda agent_input: _run_geometry_mesh_agent_with_planner(
+                agent_input,
+                structured_client=structured_client,
+                core_agent_config=core_agent_config,
+                problem_contract=problem_contract,
+                knowledge_context=knowledge_context,
+            ),
+            state=state,
+            max_validation_attempts=max_validation_attempts,
+            events=events,
+            run_id=run_id,
+        )
     if geometry is None:
         return PhysicsOSWorkflowResult(
             state=state,
@@ -728,7 +910,9 @@ def run_physicsos_workflow(
         )
     state.geometry = geometry
     problem = problem.model_copy(update={"geometry": geometry.geometry, "mesh": geometry.mesh})
+    problem_contract = build_physics_problem_contract(problem)
     state.problem = problem
+    state.problem_contract = problem_contract
     trace.append(
         WorkflowStep(
             name="geometry-mesh-agent",
@@ -802,9 +986,11 @@ def run_physicsos_workflow(
 
     taps_input = TAPSAgentInput(
         problem=problem,
+        problem_contract=problem_contract,
         knowledge_context=knowledge_context,
         case_memory_context=case_memory_context,
         tensor_rank=taps_rank,
+        max_wall_time_seconds=taps_max_wall_time_seconds,
     )
     _emit_workflow_event(
         events,
@@ -815,17 +1001,27 @@ def run_physicsos_workflow(
         status="started",
         summary="taps-agent started.",
     )
-    taps = _run_agent_with_retries(
-        agent_name="taps-agent",
-        stage="taps-agent",
-        problem=problem,
-        agent_input=taps_input,
-        runner=_run_taps_agent,
-        state=state,
-        max_validation_attempts=max_validation_attempts,
-        events=events,
-        run_id=run_id,
+    taps_runner = (
+        _run_taps_agent
+        if structured_client is None and core_agent_config is None
+        else lambda agent_input: _run_taps_agent(
+            agent_input,
+            structured_client=structured_client,
+            core_agent_config=core_agent_config,
+        )
     )
+    with structured_agent_event_context(run_id=run_id, case_id=problem.id, events=events):
+        taps = _run_agent_with_retries(
+            agent_name="taps-agent",
+            stage="taps-agent",
+            problem=problem,
+            agent_input=taps_input,
+            runner=taps_runner,
+            state=state,
+            max_validation_attempts=max_validation_attempts,
+            events=events,
+            run_id=run_id,
+        )
     if taps is None:
         return PhysicsOSWorkflowResult(
             state=state,
@@ -874,10 +1070,37 @@ def run_physicsos_workflow(
         payload={"supported": support.supported, "risks": support.risks},
     )
 
+    if taps.handoff.status == "failed":
+        trace.append(
+            WorkflowStep(
+                name="taps-agent",
+                status="failed",
+                summary=taps.handoff.summary,
+            )
+        )
+        return PhysicsOSWorkflowResult(
+            state=state,
+            run_id=run_id,
+            problem=problem,
+            case_memory_context=case_memory_context,
+            geometry=geometry,
+            knowledge=knowledge,
+            taps=taps,
+            knowledge_context=knowledge_context,
+            taps_problem=taps.taps_problem,
+            contract_review=taps.contract_review,
+            validation_attempts=state.validation_attempts,
+            trace=trace,
+            events=events,
+        )
+
     taps_problem = None
     taps_residual = None
-    if support.supported:
-        if taps.taps_problem is None or taps.result is None:
+    solver = None
+    verification_agent = None
+    has_taps_result = taps.taps_problem is not None and taps.result is not None
+    if support.supported or has_taps_result:
+        if not has_taps_result:
             raise RuntimeError("taps-agent returned supported status without taps_problem/result")
         taps_problem = taps.taps_problem
         solver_result = taps.result
@@ -910,6 +1133,7 @@ def run_physicsos_workflow(
                 solver_result=solver_result,
                 knowledge_context=knowledge_context,
                 taps_problem=taps_problem,
+                contract_review=taps.contract_review,
                 validation_attempts=state.validation_attempts,
                 trace=trace
                 + [
@@ -1039,7 +1263,7 @@ def run_physicsos_workflow(
             summary=f"backend={solver_result.backend}; action={verification.recommended_next_action}",
             payload=solver_result.model_dump(mode="json"),
         )
-    if support.supported:
+    if has_taps_result:
         solver = SolverAgentOutput(
             handoff=taps.handoff,
             result=solver_result,
@@ -1071,17 +1295,24 @@ def run_physicsos_workflow(
         verification=verification,
         case_memory_context=case_memory_context,
     )
-    postprocess_agent = _run_agent_with_retries(
-        agent_name="postprocess-agent",
-        stage="postprocess-agent",
-        problem=problem,
-        agent_input=postprocess_input,
-        runner=_run_postprocess_agent,
-        state=state,
-        max_validation_attempts=max_validation_attempts,
-        events=events,
-        run_id=run_id,
-    )
+    with structured_agent_event_context(run_id=run_id, case_id=problem.id, events=events):
+        postprocess_agent = _run_agent_with_retries(
+            agent_name="postprocess-agent",
+            stage="postprocess-agent",
+            problem=problem,
+            agent_input=postprocess_input,
+            runner=lambda agent_input: _run_postprocess_agent(
+                agent_input,
+                structured_client=structured_client,
+                core_agent_config=core_agent_config,
+                problem_contract=problem_contract,
+                knowledge_context=knowledge_context,
+            ),
+            state=state,
+            max_validation_attempts=max_validation_attempts,
+            events=events,
+            run_id=run_id,
+        )
     if postprocess_agent is None:
         return PhysicsOSWorkflowResult(
             state=state,
@@ -1096,6 +1327,7 @@ def run_physicsos_workflow(
             knowledge_context=knowledge_context,
             taps_problem=taps_problem,
             taps_residual=taps_residual,
+            contract_review=taps.contract_review,
             solver_result=solver_result,
             verification=verification,
             validation_attempts=state.validation_attempts,
@@ -1162,6 +1394,7 @@ def run_physicsos_workflow(
             knowledge_context=knowledge_context,
             taps_problem=taps_problem,
             taps_residual=taps_residual,
+            contract_review=taps.contract_review,
             solver_result=solver_result,
             verification=verification,
             postprocess=postprocess,
@@ -1219,6 +1452,7 @@ def run_physicsos_workflow(
         knowledge_context=knowledge_context,
         taps_problem=taps_problem,
         taps_residual=taps_residual,
+        contract_review=taps.contract_review,
         solver_result=solver_result,
         verification=verification,
         postprocess=postprocess,

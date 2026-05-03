@@ -28,6 +28,9 @@ def physicsos_home() -> Path:
 
 
 def project_root() -> Path:
+    workspace_override = os.environ.get("PHYSICSOS_WORKSPACE")
+    if workspace_override:
+        return Path(workspace_override).expanduser()
     if os.environ.get("PHYSICSOS_HOME"):
         return physicsos_home()
     package_parent = Path(__file__).resolve().parents[1]
@@ -77,6 +80,11 @@ def default_config() -> dict[str, Any]:
             "agent": "physicsos",
             "banner": "physicsos",
         },
+        "core_agents": {
+            "mode": "llm",
+            "max_structured_attempts": 3,
+            "prompt_version": "v1",
+        },
     }
 
 
@@ -97,6 +105,25 @@ def config_path() -> Path:
     return runtime_paths().config_json
 
 
+def _loads_config_json(text: str, target: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        # Some hand-written Windows configs contain unescaped local path
+        # backslashes such as "\.physicsos". JSON only allows a narrow set of
+        # escape sequences, so repair those path-like escapes before failing.
+        import re
+
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
+        try:
+            loaded = json.loads(repaired)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid PhysicsOS config JSON: {target}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"PhysicsOS config must be a JSON object: {target}")
+    return loaded
+
+
 def load_config(path: str | Path | None = None, *, create: bool = True) -> dict[str, Any]:
     target = Path(path).expanduser() if path is not None else config_path()
     if not target.exists():
@@ -104,12 +131,7 @@ def load_config(path: str | Path | None = None, *, create: bool = True) -> dict[
         if create:
             save_config(config, target)
         return config
-    try:
-        loaded = json.loads(target.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid PhysicsOS config JSON: {target}") from exc
-    if not isinstance(loaded, dict):
-        raise ValueError(f"PhysicsOS config must be a JSON object: {target}")
+    loaded = _loads_config_json(target.read_text(encoding="utf-8"), target)
     return _merge_defaults(loaded, default_config())
 
 

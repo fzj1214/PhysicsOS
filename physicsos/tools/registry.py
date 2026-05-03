@@ -24,22 +24,30 @@ from physicsos.tools.geometry_tools import (
     generate_mesh,
     import_geometry,
     label_regions,
+    plan_geometry_mesh,
+    plan_geometry_mesh_structured,
     prepare_mesh_conversion_job,
     repair_geometry,
     submit_mesh_conversion_job,
 )
 from physicsos.tools.knowledge_tools import build_knowledge_context, ingest_knowledge_document, run_deepsearch, search_arxiv, search_knowledge_base
 from physicsos.tools.memory_tools import append_case_memory_event, read_case_memory_events, search_case_memory, store_case_result
-from physicsos.tools.postprocess_tools import extract_kpis, generate_visualizations, write_simulation_report
+from physicsos.tools.postprocess_tools import (
+    extract_kpis,
+    generate_visualizations,
+    plan_postprocess,
+    plan_postprocess_structured,
+    write_simulation_report,
+)
 from physicsos.tools.problem_tools import build_physics_problem, validate_physics_problem
-from physicsos.tools.solver_tools import estimate_solver_support, prepare_full_solver_case, route_solver_backend, run_full_solver, run_hybrid_solver, run_surrogate_solver, submit_full_solver_job
+from physicsos.tools.solver_tools import estimate_solver_support, prepare_full_solver_case, prepare_openfoam_runner_manifest, route_solver_backend, run_full_solver, run_hybrid_solver, run_surrogate_solver, submit_full_solver_job
 from physicsos.tools.surrogate_tools import (
     estimate_surrogate_support,
     list_available_surrogates,
     route_surrogate_model,
     run_surrogate_inference,
 )
-from physicsos.tools.taps_tools import author_taps_runtime_extension, build_taps_problem, estimate_taps_residual, estimate_taps_support, export_taps_backend_bridge, formulate_taps_equation, plan_taps_adaptive_fallback, prepare_taps_backend_case_bundle, run_taps_backend, validate_taps_ir
+from physicsos.tools.taps_tools import author_taps_runtime_extension, build_taps_problem, estimate_taps_residual, estimate_taps_support, export_taps_backend_bridge, formulate_taps_equation, plan_backend_preparation, plan_backend_preparation_structured, plan_numerical_solve, plan_numerical_solve_structured, plan_taps_adaptive_fallback, prepare_taps_backend_case_bundle, run_taps_backend, validate_backend_preparation_plan, validate_numerical_solve_plan, validate_taps_ir
 from physicsos.tools.verification_tools import check_conservation_laws, compute_physics_residuals, detect_ood_case, estimate_uncertainty, validate_selected_slices
 from physicsos.tools.workflow_tools import run_typed_physicsos_workflow
 
@@ -69,6 +77,8 @@ GEOMETRY_MESH_TOOLS = [
     import_geometry,
     repair_geometry,
     label_regions,
+    plan_geometry_mesh,
+    plan_geometry_mesh_structured,
     apply_boundary_labels,
     create_boundary_labeling_artifact,
     apply_boundary_labeling_artifact,
@@ -90,6 +100,12 @@ TAPS_TOOLS = [
     formulate_taps_equation,
     build_taps_problem,
     validate_taps_ir,
+    plan_numerical_solve,
+    plan_numerical_solve_structured,
+    validate_numerical_solve_plan,
+    plan_backend_preparation,
+    plan_backend_preparation_structured,
+    validate_backend_preparation_plan,
     export_taps_backend_bridge,
     plan_taps_adaptive_fallback,
     prepare_taps_backend_case_bundle,
@@ -106,6 +122,7 @@ SOLVER_TOOLS = [
     run_surrogate_inference,
     estimate_solver_support,
     route_solver_backend,
+    prepare_openfoam_runner_manifest,
     run_surrogate_solver,
     prepare_full_solver_case,
     submit_full_solver_job,
@@ -123,6 +140,8 @@ VERIFICATION_TOOLS = [
 
 POSTPROCESS_TOOLS = [
     extract_kpis,
+    plan_postprocess,
+    plan_postprocess_structured,
     generate_visualizations,
     write_simulation_report,
 ]

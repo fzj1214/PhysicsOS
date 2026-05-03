@@ -172,3 +172,74 @@ class TAPSResultArtifacts(StrictBaseModel):
     factor_matrices: list[ArtifactRef] = Field(default_factory=list)
     reconstruction_metadata: ArtifactRef | None = None
     residual_history: ArtifactRef | None = None
+
+
+class NumericalDiscretizationSpec(StrictBaseModel):
+    dimension: int
+    node_counts: dict[str, int] = Field(default_factory=dict)
+    element_order: int = 1
+    quadrature_order: int | None = None
+
+
+class NumericalCoefficientBinding(StrictBaseModel):
+    name: str
+    role: Literal["diffusion", "reaction", "source", "boundary", "operator", "solver"]
+    value: float | int | str | list[float] | dict
+    source_name: str | None = None
+    units: str | None = None
+
+
+class NumericalBoundaryConditionBinding(StrictBaseModel):
+    id: str
+    region_id: str
+    field: str
+    kind: str
+    value: float | int | str | list[float] | dict
+    units: str | None = None
+
+
+class NumericalSourceBinding(StrictBaseModel):
+    name: str
+    value: float | int | str | list[float] | dict
+    expression: str | None = None
+    units: str | None = None
+
+
+class NumericalSolvePlanOutput(StrictBaseModel):
+    problem_id: str
+    status: Literal["ready", "fallback_required", "unsupported"] = "ready"
+    solver_family: str
+    backend_target: str = "taps"
+    field_bindings: dict[str, str] = Field(default_factory=dict)
+    discretization: NumericalDiscretizationSpec
+    coefficient_bindings: list[NumericalCoefficientBinding] = Field(default_factory=list)
+    source_bindings: list[NumericalSourceBinding] = Field(default_factory=list)
+    boundary_condition_bindings: list[NumericalBoundaryConditionBinding] = Field(default_factory=list)
+    initial_condition_bindings: list[dict[str, float | int | str | list[float] | dict]] = Field(default_factory=list)
+    linearization_policy: str | None = None
+    expected_artifacts: list[str] = Field(default_factory=list)
+    validation_checks: list[str] = Field(default_factory=list)
+    fallback_decision: str | None = None
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    unsupported_reasons: list[str] = Field(default_factory=list)
+
+
+class BackendPreparationPlanOutput(StrictBaseModel):
+    problem_id: str
+    status: Literal["ready", "needs_inputs", "unsupported"] = "ready"
+    target_backend: str
+    backend_family: Literal["fenicsx", "mfem", "petsc", "openfoam", "su2", "generic"]
+    field_space_plan: list[dict[str, object]] = Field(default_factory=list)
+    mesh_export: dict[str, object] = Field(default_factory=dict)
+    coefficient_map: list[dict[str, object]] = Field(default_factory=list)
+    boundary_tag_map: list[dict[str, object]] = Field(default_factory=list)
+    stabilization_policy: dict[str, object] = Field(default_factory=dict)
+    solver_controls: dict[str, object] = Field(default_factory=dict)
+    dependency_checks: list[dict[str, object]] = Field(default_factory=list)
+    approval_gate: dict[str, object] = Field(default_factory=dict)
+    expected_artifacts: list[str] = Field(default_factory=list)
+    validation_checks: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    unsupported_reasons: list[str] = Field(default_factory=list)
