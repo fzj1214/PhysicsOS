@@ -44,3 +44,28 @@ def from_agent_path(path: str | Path, *, workspace: str | Path | None = None) ->
     if workspace is not None and not local.is_absolute():
         return Path(workspace) / local
     return local
+
+
+def resolve_workspace_path(path: str | Path, *, workspace: str | Path | None = None, must_be_within_workspace: bool = False) -> Path:
+    """Resolve any PhysicsOS path spelling to a local path.
+
+    Accepted spellings:
+    - agent-visible `/workspace/...`
+    - cwd/workspace-relative `scratch/...`
+    - native absolute paths such as `D:\\repo\\scratch\\...`
+    """
+    value = str(path)
+    if is_remote_uri(value):
+        raise ValueError(f"Remote URI cannot be resolved as a local workspace path: {value}")
+    root = Path(workspace).resolve() if workspace is not None else Path.cwd().resolve()
+    local = from_agent_path(value, workspace=root)
+    try:
+        resolved = local.resolve(strict=False)
+    except OSError:
+        resolved = local.absolute()
+    if must_be_within_workspace:
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Path is outside workspace: {value}") from exc
+    return resolved

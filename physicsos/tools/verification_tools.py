@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field
 
 from physicsos.config import project_root
+from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverResult
@@ -40,6 +41,26 @@ def _is_residual_key(key: str) -> bool:
 
 def compute_physics_residuals(input: ComputePhysicsResidualsInput) -> ComputePhysicsResidualsOutput:
     """Compute PDE/operator residuals from backend-reported verification metrics."""
+    heat_payload = _heat_1d_payload(input.result)
+    if heat_payload is not None:
+        residuals = _heat_1d_residual_from_payload(heat_payload) or {}
+        normalized = {key: value for key, value in residuals.items() if key.startswith("normalized")}
+        threshold = _residual_threshold(input.problem)
+        passes = bool(normalized) and all(abs(value) <= threshold for value in normalized.values())
+        if input.result.status not in {"success", "partial"}:
+            passes = False
+        artifact = _write_verification_artifact(
+            input.problem.id,
+            "physics_residuals",
+            {
+                "residuals": residuals,
+                "normalized_residuals": normalized,
+                "threshold": threshold,
+                "passes": passes,
+                "source": "independent_heat_1d_solution_artifact",
+            },
+        )
+        return ComputePhysicsResidualsOutput(passes=passes, residuals=residuals, normalized_residuals=normalized, artifact=artifact)
     residuals = {key: float(value) for key, value in input.result.residuals.items() if _is_residual_key(key)}
     normalized = {
         key: value
@@ -171,7 +192,7 @@ class CheckBoundaryConditionApplicationOutput(StrictBaseModel):
 
 def _load_json_artifact(uri: str) -> dict | None:
     try:
-        return json.loads(Path(uri).read_text(encoding="utf-8"))
+        return json.loads(resolve_workspace_path(uri, workspace=project_root()).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -186,7 +207,127 @@ def _solution_payload(result: SolverResult) -> dict | None:
         payload = _load_json_artifact(artifact.uri)
         if payload is not None:
             return payload
+    taps_payload = _taps_separated_solution_payload(result)
+    if taps_payload is not None:
+        return taps_payload
     return None
+
+
+def _artifact_payload_by_kind(result: SolverResult, kind: str) -> dict | list | None:
+    artifact = next((artifact for artifact in result.artifacts if artifact.kind == kind and artifact.format == "json"), None)
+    if artifact is None:
+        return None
+    return _load_json_artifact(artifact.uri)
+
+
+def _taps_separated_solution_payload(result: SolverResult) -> dict | None:
+    if result.backend != "taps:separated_galerkin":
+        return None
+    factors = _artifact_payload_by_kind(result, "taps_factors")
+    axis_operators = _artifact_payload_by_kind(result, "taps_axis_operators")
+    samples = _artifact_payload_by_kind(result, "taps_reconstruction_samples")
+    if not isinstance(factors, dict) or not isinstance(axis_operators, dict):
+        return None
+    terms = factors.get("terms")
+    axis_order = factors.get("axis_order")
+    if not isinstance(terms, list) or not terms or not isinstance(axis_order, list) or not axis_order:
+        return None
+    primary_axis = str(axis_order[0])
+    axis_payload = axis_operators.get(primary_axis)
+    if not isinstance(axis_payload, dict):
+        return None
+    nodes = axis_payload.get("nodes")
+    first_term = terms[0]
+    if not isinstance(first_term, dict):
+        return None
+    term_factors = first_term.get("factors")
+    if not isinstance(term_factors, dict):
+        return None
+    values = term_factors.get(primary_axis)
+    if not isinstance(nodes, list) or not isinstance(values, list):
+        return None
+    try:
+        points = [float(value) for value in nodes]
+        field_values = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    if len(points) != len(field_values):
+        return None
+    boundary_values_applied = {}
+    if field_values:
+        boundary_values_applied = {
+            "x_min": field_values[0],
+            "left": field_values[0],
+            "x_max": field_values[-1],
+            "right": field_values[-1],
+        }
+    return {
+        "schema_version": "physicsos.solution.v1",
+        "backend_id": "taps:separated_galerkin",
+        "field": "primary",
+        "axis_order": [str(axis) for axis in axis_order],
+        "points": points,
+        "values": field_values,
+        "boundary_values_applied": boundary_values_applied,
+        "reconstruction_samples": samples if isinstance(samples, list) else [],
+        "source_artifacts": {
+            "taps_factors": True,
+            "taps_axis_operators": True,
+            "taps_reconstruction_samples": isinstance(samples, list),
+        },
+    }
+
+
+def _heat_1d_payload(result: SolverResult) -> dict | None:
+    payload = _solution_payload(result)
+    if payload is None or payload.get("schema_version") != "physicsos.solution.v1":
+        return None
+    if payload.get("backend_id") != "fdm_heat_1d":
+        return None
+    if not all(key in payload for key in ("x", "t", "values")):
+        return None
+    return payload
+
+
+def _heat_1d_residual_from_payload(payload: dict) -> dict[str, float] | None:
+    try:
+        x = [float(value) for value in payload["x"]]
+        t = [float(value) for value in payload["t"]]
+        values = [[float(item) for item in row] for row in payload["values"]]
+        alpha = float(payload["coefficient_values_applied"]["thermal_diffusivity"])
+        method = str(payload.get("solver_controls_applied", {}).get("method") or "implicit_euler")
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(x) < 3 or len(t) < 2 or len(values) != len(t):
+        return None
+    dx = x[1] - x[0]
+    dt = t[1] - t[0]
+    if dx <= 0 or dt <= 0:
+        return None
+    residual_sq = 0.0
+    scale_sq = 0.0
+    count = 0
+    for n in range(len(values) - 1):
+        old = values[n]
+        new = values[n + 1]
+        if len(old) != len(x) or len(new) != len(x):
+            return None
+        for i in range(1, len(x) - 1):
+            time_term = (new[i] - old[i]) / dt
+            laplace_new = (new[i - 1] - 2.0 * new[i] + new[i + 1]) / (dx * dx)
+            if method == "crank_nicolson":
+                laplace_old = (old[i - 1] - 2.0 * old[i] + old[i + 1]) / (dx * dx)
+                diffusion_term = alpha * 0.5 * (laplace_new + laplace_old)
+            else:
+                diffusion_term = alpha * laplace_new
+            residual = time_term - diffusion_term
+            residual_sq += residual * residual
+            scale_sq += time_term * time_term + diffusion_term * diffusion_term
+            count += 1
+    return {
+        "rms_pde_residual": math.sqrt(residual_sq / max(count, 1)),
+        "normalized_pde_residual": math.sqrt(residual_sq) / (math.sqrt(scale_sq) + 1e-30),
+    }
 
 
 def _boundary_role_from_id(region_id: str) -> str | None:
@@ -262,7 +403,27 @@ def check_boundary_condition_application(input: CheckBoundaryConditionApplicatio
     checked: list[str] = []
     errors: dict[str, float] = {}
     missing: list[str] = []
-    if not isinstance(applied, dict):
+    heat_payload = _heat_1d_payload(input.result)
+    if heat_payload is not None:
+        try:
+            rows = heat_payload["values"]
+            by_role = {"x_min": [row[0] for row in rows], "x_max": [row[-1] for row in rows]}
+        except (KeyError, TypeError, IndexError):
+            by_role = {}
+        for boundary in input.problem.boundary_conditions:
+            if boundary.kind != "dirichlet":
+                continue
+            role = _canonical_role(input.problem, boundary.region_id, boundary.boundary_role)
+            actual_values = by_role.get(role or "")
+            expected = _flatten_numbers(boundary.value)
+            if not actual_values or not expected:
+                missing.append(boundary.id)
+                continue
+            checked.append(boundary.id)
+            error = max(abs(float(actual) - expected[0]) for actual in actual_values)
+            if error > 1e-9:
+                errors[boundary.id] = error
+    elif not isinstance(applied, dict):
         missing = [boundary.id for boundary in input.problem.boundary_conditions if boundary.kind == "dirichlet"]
     else:
         for boundary in input.problem.boundary_conditions:

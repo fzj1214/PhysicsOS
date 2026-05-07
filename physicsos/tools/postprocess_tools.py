@@ -12,6 +12,7 @@ from pydantic import Field
 
 from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent
 from physicsos.config import project_root
+from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
 from physicsos.schemas.contracts import PhysicsProblemContract
 from physicsos.schemas.knowledge import KnowledgeContext
@@ -149,16 +150,7 @@ def plan_postprocess_structured(
     )
     if result.output is not None:
         return result.output
-    fallback = plan_postprocess(input)
-    return fallback.model_copy(
-        update={
-            "assumptions": [
-                *fallback.assumptions,
-                "Structured LLM postprocess planning failed validation; deterministic fallback was used.",
-                result.error or "Structured postprocess planner returned no validated output.",
-            ]
-        }
-    )
+    raise RuntimeError(result.error or "Structured postprocess planner returned no validated output.")
 
 
 def generate_visualizations(input: GenerateVisualizationsInput) -> GenerateVisualizationsOutput:
@@ -329,7 +321,7 @@ def _load_solution_payload(result: SolverResult) -> dict | None:
         if artifact.format != "json" or "solution" not in artifact.kind:
             continue
         try:
-            return json.loads(Path(artifact.uri).read_text(encoding="utf-8"))
+            return json.loads(resolve_workspace_path(artifact.uri, workspace=project_root()).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
     return None
@@ -523,7 +515,7 @@ def _build_report_manifest(input: WriteSimulationReportInput) -> dict:
                 "format": artifact.format,
                 "uri": artifact.uri,
                 "description": artifact.description,
-                "exists": Path(artifact.uri).exists(),
+                "exists": resolve_workspace_path(artifact.uri, workspace=project_root()).exists(),
             }
         )
     return {
@@ -577,6 +569,8 @@ def _render_markdown_report(input: WriteSimulationReportInput, manifest: dict, m
         f"- Domain: `{input.problem.domain}`",
         f"- Solver backend: `{input.result.backend}`",
         f"- Solver status: `{input.result.status}`",
+        f"- Capability status: `{input.result.scalar_outputs.get('capability_status', 'unspecified')}`",
+        f"- Support scope: {input.result.scalar_outputs.get('support_scope', input.result.scalar_outputs.get('support_scope_details', 'unspecified'))}",
         f"- Verification status: `{input.verification.status}`",
         f"- Recommended next action: `{input.verification.recommended_next_action}`",
         f"- Explanation: {input.verification.explanation}",
@@ -614,7 +608,7 @@ def _render_markdown_report(input: WriteSimulationReportInput, manifest: dict, m
     visualizations = input.postprocess.visualizations if input.postprocess is not None else []
     if visualizations:
         for artifact in visualizations:
-            path = Path(artifact.uri)
+            path = resolve_workspace_path(artifact.uri, workspace=project_root())
             if artifact.format in {"png", "svg", "jpg", "jpeg", "webp"}:
                 lines.append(f"![{artifact.kind}]({path.as_posix()})")
             elif artifact.format == "json":

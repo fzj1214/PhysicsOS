@@ -30,6 +30,14 @@ def physicsos_home() -> Path:
 def project_root() -> Path:
     workspace_override = os.environ.get("PHYSICSOS_WORKSPACE")
     if workspace_override:
+        auto_value = os.environ.get("PHYSICSOS_WORKSPACE_AUTO_VALUE")
+        is_auto_workspace = (
+            os.environ.get("PHYSICSOS_WORKSPACE_SOURCE") == "physicsos_cli_auto"
+            and auto_value is not None
+            and Path(workspace_override).expanduser() == Path(auto_value).expanduser()
+        )
+        if is_auto_workspace and os.environ.get("PHYSICSOS_HOME"):
+            return physicsos_home()
         return Path(workspace_override).expanduser()
     if os.environ.get("PHYSICSOS_HOME"):
         return physicsos_home()
@@ -69,6 +77,12 @@ def default_config() -> dict[str, Any]:
             "runner_url": "https://foamvm.vercel.app",
             "access_token": "",
         },
+        "search": {
+            "enabled": False,
+            "provider": "tavily",
+            "tavily_api_key": "",
+            "max_results": 5,
+        },
         "storage": {
             "home": str(physicsos_home()),
             "scratch": "scratch",
@@ -82,7 +96,7 @@ def default_config() -> dict[str, Any]:
         },
         "core_agents": {
             "mode": "llm",
-            "max_structured_attempts": 3,
+            "max_structured_attempts": 5,
             "prompt_version": "v1",
         },
     }
@@ -132,7 +146,10 @@ def load_config(path: str | Path | None = None, *, create: bool = True) -> dict[
             save_config(config, target)
         return config
     loaded = _loads_config_json(target.read_text(encoding="utf-8"), target)
-    return _merge_defaults(loaded, default_config())
+    merged = _merge_defaults(loaded, default_config())
+    if create and merged != loaded:
+        save_config(merged, target)
+    return merged
 
 
 def save_config(config: dict[str, Any], path: str | Path | None = None) -> Path:

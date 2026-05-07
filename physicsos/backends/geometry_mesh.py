@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 from physicsos.config import project_root
+from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import (
     BoundaryRegionSpec,
@@ -116,10 +117,7 @@ def _run_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _source_path(source: GeometrySource) -> Path | None:
     if source.uri is None:
         return None
-    path = Path(source.uri)
-    if not path.is_absolute():
-        path = project_root() / path
-    return path
+    return resolve_workspace_path(source.uri, workspace=project_root())
 
 
 def _physical_group_labels(gmsh: Any) -> dict[tuple[int, int], list[tuple[int, str]]]:

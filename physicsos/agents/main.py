@@ -5,14 +5,16 @@ from typing import Any
 from physicsos.agents.prompts import PHYSICSOS_SYSTEM_PROMPT
 from physicsos.agents.runtime import DeepAgentsRuntimeConfig, build_runtime_kwargs
 from physicsos.agents.subagents import SUBAGENTS
-from physicsos.tools.registry import PHYSICSOS_TOOLS
+from physicsos.tools.registry import DEEPAGENTS_MAIN_BRIDGE_TOOLS
 
 
 def create_physicsos_agent(model: Any = "openai:gpt-5.4", runtime: DeepAgentsRuntimeConfig | None = None, **kwargs: Any) -> Any:
-    """Create the DeepAgents-powered PhysicsOS orchestrator.
+    """Create the DeepAgents main-agent interface for PhysicsOS.
 
-    This function keeps DeepAgents optional so schema/tool development can proceed
-    without installing the agent runtime.
+    This is not the LangGraph/PhysicsOS workflow constructor. It creates the
+    flexible DeepAgents main agent with a small catalog bridge and the
+    paper-style TAPS subagents. Legacy typed workflow entry points are not
+    exposed on the default DeepAgents tool surface.
     """
     try:
         from deepagents import create_deep_agent
@@ -23,7 +25,7 @@ def create_physicsos_agent(model: Any = "openai:gpt-5.4", runtime: DeepAgentsRun
     runtime_kwargs = build_runtime_kwargs(runtime_config)
     options: dict[str, Any] = {
         "model": model if not isinstance(model, str) else runtime_config.model,
-        "tools": PHYSICSOS_TOOLS,
+        "tools": DEEPAGENTS_MAIN_BRIDGE_TOOLS,
         "subagents": SUBAGENTS,
         "system_prompt": PHYSICSOS_SYSTEM_PROMPT,
     }

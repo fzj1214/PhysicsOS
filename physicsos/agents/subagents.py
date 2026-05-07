@@ -1,51 +1,74 @@
 from __future__ import annotations
 
 from physicsos.agents.prompts import (
-    GEOMETRY_MESH_AGENT_PROMPT,
-    KNOWLEDGE_AGENT_PROMPT,
+    ANALYSIS_FILE_AGENT_PROMPT,
+    GEOMETRY_EMBEDDING_AGENT_PROMPT,
     POSTPROCESS_AGENT_PROMPT,
-    SOLVER_AGENT_PROMPT,
-    TAPS_AGENT_PROMPT,
+    TAPS_DERIVATION_AGENT_PROMPT,
+    TAPS_IMPLEMENTATION_AGENT_PROMPT,
     VERIFICATION_AGENT_PROMPT,
 )
-from physicsos.tools.registry import SUBAGENT_TOOL_GROUPS
+from physicsos.tools.registry import (
+    DEEPAGENTS_SUBAGENT_TOOL_GROUPS,
+)
 
 
-SUBAGENTS = [
+SUBAGENTS: list[dict] = [
     {
-        "name": "geometry-mesh-agent",
-        "description": "Build GeometrySpec and MeshSpec from CAD/STL/STEP/CIF/POSCAR/molecular/text inputs.",
-        "system_prompt": GEOMETRY_MESH_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["geometry-mesh-agent"],
+        "name": "analysis-file-agent",
+        "description": (
+            "Extracts PDEs, fields, geometry sources, boundary/initial conditions, "
+            "parameters, targets, and missing inputs from user analysis files."
+        ),
+        "system_prompt": ANALYSIS_FILE_AGENT_PROMPT,
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["analysis-file-agent"],
     },
     {
-        "name": "taps-agent",
-        "description": "Compile and run TAPS-first equation-driven surrogate solves for explicit parameterized PDEs.",
-        "system_prompt": TAPS_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["taps-agent"],
+        "name": "geometry-embedding-agent",
+        "description": (
+            "Imports STL/CAD and prepares Gmsh/SDF/voxel/background-grid geometry "
+            "embeddings for immersed-boundary or IFE TAPS."
+        ),
+        "system_prompt": GEOMETRY_EMBEDDING_AGENT_PROMPT,
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["geometry-embedding-agent"],
     },
     {
-        "name": "solver-agent",
-        "description": "Select and run non-TAPS surrogate, full, or hybrid fallback solver backends for a validated PhysicsProblem.",
-        "system_prompt": SOLVER_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["solver-agent"],
+        "name": "taps-derivation-agent",
+        "description": (
+            "Creates paper-style TAPS derivation prompts, derivation Markdown, "
+            "implementation notes, and geometry-coupled subspace iteration derivations."
+        ),
+        "system_prompt": TAPS_DERIVATION_AGENT_PROMPT,
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["taps-derivation-agent"],
+    },
+    {
+        "name": "taps-implementation-agent",
+        "description": (
+            "Turns TAPS derivations and geometry embeddings into case-local TAPS "
+            "kernels and execution plans."
+        ),
+        "system_prompt": TAPS_IMPLEMENTATION_AGENT_PROMPT,
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["taps-implementation-agent"],
     },
     {
         "name": "verification-agent",
-        "description": "Check residuals, uncertainty, conservation, OOD risk, and recommended next actions.",
+        "description": (
+            "Runs the paper-style verification chain: exact solution code, "
+            "convergence study code, execution, plots, and verification reports."
+        ),
         "system_prompt": VERIFICATION_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["verification-agent"],
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["verification-agent"],
     },
     {
         "name": "postprocess-agent",
-        "description": "Extract KPIs, visualizations, reports, and optimization suggestions from solver results.",
+        "description": "Writes final TAPS figures, engineering report, and summary artifacts.",
         "system_prompt": POSTPROCESS_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["postprocess-agent"],
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["postprocess-agent"],
     },
     {
         "name": "knowledge-agent",
-        "description": "Retrieve local knowledge, arXiv papers, DeepSearch reports, prior cases, materials, operator templates, validation rules, and paper notes.",
-        "system_prompt": KNOWLEDGE_AGENT_PROMPT,
-        "tools": SUBAGENT_TOOL_GROUPS["knowledge-agent"],
+        "description": "Retrieves local TAPS references, matrix definitions, verification patterns, and source-grounded notes.",
+        "system_prompt": "Use the local knowledge/reference tools to support the paper-style TAPS workflow. Do not invent citations.",
+        "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["knowledge-agent"],
     },
 ]

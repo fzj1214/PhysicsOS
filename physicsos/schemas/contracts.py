@@ -6,7 +6,7 @@ from pydantic import Field
 
 from physicsos.schemas.common import StrictBaseModel
 from physicsos.schemas.problem import PhysicsProblem
-from physicsos.schemas.taps import TAPSCompilationPlan, TAPSProblem
+from physicsos.schemas.taps import TAPSProblem
 
 
 class PhysicsProblemContract(StrictBaseModel):
@@ -119,65 +119,13 @@ def _canonical_operator_family(value: str | None) -> str:
 def review_problem_to_taps_contract(
     contract: PhysicsProblemContract,
     taps_problem: TAPSProblem,
-    compilation_plan: TAPSCompilationPlan | None = None,
 ) -> ContractReviewReport:
-    errors: list[str] = []
-    warnings: list[str] = []
-    reviewed_items: dict[str, bool] = {}
-
-    weak_form = taps_problem.weak_form
-    contract_fields = {field["name"] for field in contract.fields}
-    taps_fields = set(weak_form.trial_fields if weak_form is not None else [])
-    reviewed_items["fields_preserved"] = bool(contract_fields) and contract_fields <= taps_fields
-    if not reviewed_items["fields_preserved"]:
-        errors.append(f"TAPS trial fields {sorted(taps_fields)} do not preserve PhysicsProblem fields {sorted(contract_fields)}.")
-
-    contract_boundaries = {(bc["id"], bc["region_id"], bc["field"], bc["kind"], str(bc["value"])) for bc in contract.boundary_conditions}
-    taps_boundaries = {(bc.id, bc.region_id, bc.field, bc.kind, str(bc.value)) for bc in taps_problem.boundary_conditions}
-    reviewed_items["boundary_conditions_preserved"] = contract_boundaries <= taps_boundaries
-    if not reviewed_items["boundary_conditions_preserved"]:
-        errors.append("TAPSProblem boundary conditions do not preserve the locked PhysicsProblemContract.")
-
-    material_coefficients = {
-        prop["name"].lower()
-        for material in contract.materials
-        for prop in material.get("properties", [])
-        if isinstance(prop, dict) and "name" in prop
-    }
-    taps_coefficients = {coefficient.name.lower() for coefficient in taps_problem.coefficients}
-    missing_coefficients = sorted(material_coefficients - taps_coefficients)
-    reviewed_items["material_coefficients_preserved"] = not missing_coefficients
-    if missing_coefficients:
-        warnings.append(f"Material coefficients not explicitly bound in TAPSProblem: {missing_coefficients}")
-
-    contract_operator_families = {operator["equation_class"].lower() for operator in contract.operators}
-    canonical_contract_families = {_canonical_operator_family(family) for family in contract_operator_families}
-    taps_family = weak_form.family.lower() if weak_form is not None else None
-    canonical_taps_family = _canonical_operator_family(taps_family)
-    reviewed_items["operator_family_preserved"] = canonical_taps_family in canonical_contract_families
-    if canonical_taps_family not in canonical_contract_families:
-        errors.append(
-            f"TAPS weak-form family {taps_family!r} does not match locked operator families {sorted(contract_operator_families)}."
-        )
-
-    if compilation_plan is not None and compilation_plan.problem_id != contract.problem_id:
-        errors.append("TAPSCompilationPlan problem_id does not match PhysicsProblemContract.")
-        reviewed_items["plan_problem_id_matches"] = False
-    else:
-        reviewed_items["plan_problem_id_matches"] = True
-
-    status = "accepted" if not errors else "needs_retry"
+    errors = ["Mechanical TAPS contract review is disabled for the paper-replication route; review derivation.md and verification/report.json."]
     return ContractReviewReport(
         problem_id=contract.problem_id,
-        status=status,
+        status="failed",
         fingerprint=contract.fingerprint,
         errors=errors,
-        warnings=warnings,
-        reviewed_items=reviewed_items,
-        retry_instruction=(
-            "Retry TAPS formulation using the locked PhysicsProblemContract. Do not change fields, boundary values, "
-            "operator family, or material bindings unless the output explicitly requests user approval."
-            if errors
-            else None
-        ),
+        reviewed_items={},
+        retry_instruction="Use taps-derivation-agent to revise derivation.md and rerun the Fig.7 verification chain.",
     )

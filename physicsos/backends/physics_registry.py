@@ -25,7 +25,7 @@ class OperatorTemplate(StrictBaseModel):
 
 class SolverBackendEntry(StrictBaseModel):
     id: str
-    family: Literal["taps", "surrogate", "neural_operator", "fem", "fvm", "md", "dft", "kinetics", "monte_carlo", "custom"]
+    family: Literal["taps", "surrogate", "neural_operator", "fdm", "fem", "fvm", "md", "dft", "kinetics", "monte_carlo", "custom"]
     domains: list[PhysicsDomain]
     command: str | None = None
     python_integration: str
@@ -33,6 +33,9 @@ class SolverBackendEntry(StrictBaseModel):
     default_remote_runner: str | None = None
     open_source: bool = True
     requires_remote_service: bool = False
+    capability_status: Literal["production", "experimental", "demo_only", "scaffold", "disabled"] = "experimental"
+    support_scope: str | None = None
+    verification_methods: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -132,12 +135,26 @@ OPERATOR_TEMPLATES: tuple[OperatorTemplate, ...] = (
 
 SOLVER_BACKEND_REGISTRY: tuple[SolverBackendEntry, ...] = (
     SolverBackendEntry(
+        id="fdm_heat_1d",
+        family="fdm",
+        domains=["thermal"],
+        python_integration="PhysicsOS native",
+        role="production finite-difference transient 1D heat solver",
+        capability_status="production",
+        support_scope="1D transient heat/diffusion with numeric uniform IC, numeric left/right Dirichlet BCs, and scalar thermal diffusivity",
+        verification_methods=["independent_discrete_residual", "boundary_values_from_solution", "initial_condition_from_solution", "maximum_principle_range"],
+        notes=["Preferred for small single-case rod heat conduction when the typed problem matches the support scope."],
+    ),
+    SolverBackendEntry(
         id="taps",
         family="taps",
         domains=["thermal", "custom", "multiphysics"],
         python_integration="PhysicsOS native",
-        role="primary equation-driven solver compiler",
-        notes=["TAPS-first for explicit PDEs with verifiable residuals."],
+        role="paper-style derivation-to-kernel TAPS route",
+        capability_status="production",
+        support_scope="DeepAgents paper-replication route: derivation.md and implementation_notes.md generate a case-local TAPS kernel, then verification-agent runs exact/manufactured solution and convergence checks",
+        verification_methods=["generated_exact_solution", "generated_convergence_study", "plot_result", "verification_report"],
+        notes=["Use TAPS as the primary route for paper-style derivation, implementation, verification, and revision. Do not require a typed TAPS IR layer."],
     ),
     SolverBackendEntry(
         id="grid_neural_operator",
@@ -145,6 +162,9 @@ SOLVER_BACKEND_REGISTRY: tuple[SolverBackendEntry, ...] = (
         domains=["fluid", "thermal", "custom"],
         python_integration="PyTorch/checkpoint adapter",
         role="regular-grid surrogate fallback",
+        capability_status="experimental",
+        support_scope="registered surrogate checkpoints only",
+        verification_methods=["ood_score", "residual_proxy", "reference_case_check"],
         notes=["Use for structured fields and fast approximate inference."],
     ),
     SolverBackendEntry(
@@ -153,6 +173,9 @@ SOLVER_BACKEND_REGISTRY: tuple[SolverBackendEntry, ...] = (
         domains=["fluid", "thermal", "solid", "custom"],
         python_integration="PyTorch Geometric-style adapter",
         role="mesh graph surrogate fallback",
+        capability_status="experimental",
+        support_scope="registered mesh-graph surrogate checkpoints only",
+        verification_methods=["ood_score", "residual_proxy", "reference_case_check"],
         notes=["Use when geometry is naturally represented as graph/mesh connectivity."],
     ),
     *(
@@ -172,6 +195,9 @@ SOLVER_BACKEND_REGISTRY: tuple[SolverBackendEntry, ...] = (
             role=backend.role,
             default_remote_runner="foamvm" if backend.name == "openfoam" else None,
             requires_remote_service=backend.name in {"openfoam", "su2", "quantum_espresso", "cp2k", "lammps"},
+            capability_status="experimental" if backend.name in {"fenicsx", "mfem", "openfoam", "su2", "cantera"} else "disabled",
+            support_scope=backend.role,
+            verification_methods=["backend_logs", "independent_artifact_verification_required"],
         )
         for backend in DEFAULT_BACKENDS
     ),

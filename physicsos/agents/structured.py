@@ -22,7 +22,7 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 class CoreAgentLLMConfig(StrictBaseModel):
     mode: str = "llm"
     model: str | None = None
-    max_structured_attempts: int = 3
+    max_structured_attempts: int = 5
     prompt_version: str = "v1"
 
 
@@ -73,10 +73,12 @@ def load_core_agent_config() -> CoreAgentLLMConfig:
     config = load_config(create=False)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
     core_config = config.get("core_agents", {}) if isinstance(config.get("core_agents"), dict) else {}
+    configured_attempts = int(core_config.get("max_structured_attempts", 5))
+    attempts = int(os.environ["PHYSICSOS_CORE_AGENT_MAX_ATTEMPTS"]) if "PHYSICSOS_CORE_AGENT_MAX_ATTEMPTS" in os.environ else max(5, configured_attempts)
     return CoreAgentLLMConfig(
         mode=os.environ.get("PHYSICSOS_CORE_AGENTS_MODE", str(core_config.get("mode", "llm"))),
         model=os.environ.get("PHYSICSOS_CORE_AGENT_MODEL", str(model_config.get("name") or "")) or None,
-        max_structured_attempts=int(os.environ.get("PHYSICSOS_CORE_AGENT_MAX_ATTEMPTS", core_config.get("max_structured_attempts", 3))),
+        max_structured_attempts=attempts,
         prompt_version=str(core_config.get("prompt_version", "v1")),
     )
 
@@ -104,7 +106,9 @@ def create_openai_structured_client() -> StructuredLLMClient:
         raise RuntimeError("Set PHYSICSOS_OPENAI_API_KEY or model.api_key in ~/.physicsos/config.json.")
     base_url = os.environ.get("PHYSICSOS_OPENAI_BASE_URL") or str(model_config.get("base_url") or "https://api.tu-zi.com/v1")
     default_model = os.environ.get("PHYSICSOS_CORE_AGENT_MODEL") or os.environ.get("PHYSICSOS_OPENAI_MODEL") or str(model_config.get("name") or "gpt-5.4")
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    use_responses_api = str(os.environ.get("PHYSICSOS_STRUCTURED_USE_RESPONSES_API", False)).strip().lower() in {"1", "true", "yes", "on"}
+    timeout_seconds = float(os.environ.get("PHYSICSOS_OPENAI_TIMEOUT_SECONDS", model_config.get("timeout_seconds", 40.0)))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds, max_retries=0)
 
     def invoke(request: dict[str, Any]) -> str:
         model = str(request.get("model") or default_model)
@@ -125,6 +129,14 @@ def create_openai_structured_client() -> StructuredLLMClient:
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
+        if use_responses_api:
+            response = client.responses.create(
+                model=model,
+                instructions=messages[0]["content"],
+                input=messages[1]["content"],
+                text={"format": {"type": "json_object"}},
+            )
+            return getattr(response, "output_text", "") or ""
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -136,6 +148,8 @@ def create_openai_structured_client() -> StructuredLLMClient:
     invoke.model = default_model  # type: ignore[attr-defined]
     invoke.base_url = base_url  # type: ignore[attr-defined]
     invoke.api_key = _redacted_config_value(api_key)  # type: ignore[attr-defined]
+    invoke.use_responses_api = use_responses_api  # type: ignore[attr-defined]
+    invoke.timeout_seconds = timeout_seconds  # type: ignore[attr-defined]
     return invoke
 
 

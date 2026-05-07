@@ -8,8 +8,10 @@ from urllib import request
 from pydantic import Field
 
 from physicsos.backends.catalog import DEFAULT_BACKENDS
+from physicsos.backends.heat_1d import heat_1d_supports, run_heat_1d_solver
 from physicsos.backends.surrogate_runtime import route_surrogate, run_surrogate_scaffold
 from physicsos.config import project_root
+from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef, ComputeBudget, Provenance, StrictBaseModel
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import HybridPolicy, PreparedSolverCase, SolverDecision, SolverPolicy, SolverResult, SupportScore
@@ -28,6 +30,16 @@ def estimate_solver_support(input: EstimateSolverSupportInput) -> EstimateSolver
     """Score registered open-source solver backends for a PhysicsProblem."""
     requested = set(input.candidate_backends)
     scores: list[SupportScore] = []
+    if (not requested or "fdm_heat_1d" in requested) and heat_1d_supports(input.problem):
+        scores.append(
+            SupportScore(
+                backend="fdm_heat_1d",
+                score=0.98,
+                supported=True,
+                reasons=["Production finite-difference backend exactly matches 1D transient heat with numeric Dirichlet BC/IC."],
+                risks=[],
+            )
+        )
     for backend in DEFAULT_BACKENDS:
         if requested and backend.name not in requested:
             continue
@@ -57,7 +69,10 @@ class RouteSolverBackendOutput(StrictBaseModel):
 def route_solver_backend(input: RouteSolverBackendInput) -> RouteSolverBackendOutput:
     """Select surrogate, full solver, hybrid, warm-start, or corrector mode."""
     supported = [score for score in input.support_scores if score.supported]
-    if not supported:
+    if any(score.backend == "fdm_heat_1d" for score in supported):
+        selected = "fdm_heat_1d"
+        reason = "Selected production deterministic finite-difference backend matching the typed heat equation, 1D geometry, material, BC, IC, and time horizon."
+    elif not supported:
         selected = "custom_python"
         reason = "No domain-specific backend matched; route to custom PDE scaffold."
     else:
@@ -86,6 +101,8 @@ class RunSurrogateSolverOutput(StrictBaseModel):
 
 def run_surrogate_solver(input: RunSurrogateSolverInput) -> RunSurrogateSolverOutput:
     """Run a neural operator or surrogate backend through the surrogate runtime."""
+    if input.backend == "fdm_heat_1d" or (not input.backend and heat_1d_supports(input.problem)):
+        return RunSurrogateSolverOutput(result=run_heat_1d_solver(input.problem))
     decision = route_surrogate(input.problem, mode="fast_solver")
     if input.backend:
         decision = decision.model_copy(update={"selected_model_id": input.backend})
@@ -198,7 +215,7 @@ def _load_manifest(artifact: ArtifactRef) -> dict:
     if artifact.kind != "full_solver_runner_manifest":
         raise ValueError(f"Expected full_solver_runner_manifest artifact, got {artifact.kind}.")
     try:
-        return json.loads(Path(artifact.uri).read_text(encoding="utf-8"))
+        return json.loads(resolve_workspace_path(artifact.uri, workspace=project_root()).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read solver runner manifest: {artifact.uri}") from exc
 
@@ -224,7 +241,7 @@ def _load_taps_case_bundle(artifact: ArtifactRef) -> dict:
     if artifact.kind != "taps_backend_case_bundle":
         raise ValueError(f"Expected taps_backend_case_bundle artifact, got {artifact.kind}.")
     try:
-        payload = json.loads(Path(artifact.uri).read_text(encoding="utf-8"))
+        payload = json.loads(resolve_workspace_path(artifact.uri, workspace=project_root()).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read TAPS backend case bundle: {artifact.uri}") from exc
     if payload.get("schema_version") != "physicsos.taps_backend_case_bundle.v1":
@@ -248,18 +265,18 @@ def _foam_header(class_name: str, object_name: str) -> str:
     )
 
 
-def _of_scalar(value: object, default: float) -> float:
+def _of_scalar(value: object) -> float | None:
     if isinstance(value, (float, int)):
         return float(value)
     if isinstance(value, str):
         try:
             return float(value)
         except ValueError:
-            return default
-    return default
+            return None
+    return None
 
 
-def _bundle_coefficient(bundle: dict, names: set[str], default: float) -> float:
+def _bundle_coefficient(bundle: dict, names: set[str]) -> float | None:
     normalized = {name.lower() for name in names}
     plan = bundle.get("backend_preparation_plan") if isinstance(bundle.get("backend_preparation_plan"), dict) else {}
     coefficient_map = plan.get("coefficient_map") if isinstance(plan.get("coefficient_map"), list) else bundle.get("coefficient_binding", [])
@@ -269,8 +286,8 @@ def _bundle_coefficient(bundle: dict, names: set[str], default: float) -> float:
                 continue
             name = str(item.get("name") or "").lower()
             if name in normalized and "value" in item:
-                return _of_scalar(item.get("value"), default)
-    return default
+                return _of_scalar(item.get("value"))
+    return None
 
 
 def _bundle_boundary_roles(bundle: dict) -> set[str]:
@@ -463,8 +480,10 @@ def prepare_openfoam_runner_manifest(input: PrepareOpenFOAMRunnerManifestInput) 
     roles = _bundle_boundary_roles(bundle)
     if not ({"inlet", "outlet"} <= roles and ("wall" in roles or "walls" in roles)):
         raise ValueError("OpenFOAM first adapter requires inlet, outlet, and wall boundary roles.")
-    mu = _bundle_coefficient(bundle, {"dynamic_viscosity", "mu", "viscosity"}, 1.0)
-    rho = _bundle_coefficient(bundle, {"density", "rho"}, 1.0)
+    mu = _bundle_coefficient(bundle, {"dynamic_viscosity", "mu", "viscosity"})
+    rho = _bundle_coefficient(bundle, {"density", "rho"})
+    if mu is None or rho is None:
+        raise ValueError("OpenFOAM runner manifest requires explicit dynamic_viscosity and density; no defaults may be injected.")
     nu = mu / rho if abs(rho) > 1e-12 else mu
     case_files = _openfoam_channel_case_files(nu=nu, solver=input.solver)
     _validate_openfoam_case_files(case_files)

@@ -88,6 +88,7 @@ class GeometryTransform(StrictBaseModel):
 
 class GeometryEncoding(StrictBaseModel):
     kind: Literal[
+        "structured_axes",
         "sdf",
         "occupancy_mask",
         "surface_point_cloud",
@@ -102,6 +103,59 @@ class GeometryEncoding(StrictBaseModel):
     resolution: list[int] | None = None
     feature_names: list[str] = Field(default_factory=list)
     target_backend: str | None = None
+
+
+class GeometrySemanticRegion(StrictBaseModel):
+    id: str
+    label: str
+    kind: Literal["domain", "subdomain", "material", "interface", "boundary", "source_support", "initial_slice", "custom"]
+    role: BoundaryRole | None = None
+    entity_ids: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+    source: Literal["user", "cad_physical_group", "mesh_tag", "generated", "inferred", "unknown"] = "unknown"
+    metadata: dict[str, str | float | int | bool] = Field(default_factory=dict)
+
+
+class GeometrySemanticContract(StrictBaseModel):
+    geometry_id: str
+    dimension: Literal[0, 1, 2, 3]
+    coordinate_system: CoordinateSystem = Field(default_factory=CoordinateSystem)
+    domains: list[GeometrySemanticRegion] = Field(default_factory=list)
+    subdomains: list[GeometrySemanticRegion] = Field(default_factory=list)
+    boundaries: list[GeometrySemanticRegion] = Field(default_factory=list)
+    interfaces: list[GeometrySemanticRegion] = Field(default_factory=list)
+    source_supports: list[GeometrySemanticRegion] = Field(default_factory=list)
+    unresolved_bindings: list[str] = Field(default_factory=list)
+    min_confidence: float = 1.0
+    provenance: dict[str, str | float | int | bool] = Field(default_factory=dict)
+
+
+class GeometryNumericalEncoding(StrictBaseModel):
+    kind: Literal[
+        "structured_axes",
+        "mesh_graph",
+        "sdf",
+        "occupancy_mask",
+        "boundary_graph",
+        "laplacian_eigenbasis",
+        "multi_resolution_grid",
+        "parametric_shape_vector",
+        "nurbs_mapping",
+        "separated_geometry_operator",
+    ]
+    uri: str | None = None
+    target_backend: str | None = None
+    axis_names: list[str] = Field(default_factory=list)
+    resolution: list[int] | None = None
+    quality: dict[str, float | int | bool | str] = Field(default_factory=dict)
+    metadata: dict[str, str | float | int | bool] = Field(default_factory=dict)
+
+
+class GeometryMeshContract(StrictBaseModel):
+    semantic: GeometrySemanticContract
+    numerical_encodings: list[GeometryNumericalEncoding] = Field(default_factory=list)
+    mesh_export_manifest: ArtifactRef | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class GeometryQualityReport(StrictBaseModel):

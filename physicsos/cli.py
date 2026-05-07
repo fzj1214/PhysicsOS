@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from datetime import UTC, datetime
 import inspect
 import json
@@ -10,15 +11,8 @@ import sys
 import textwrap
 from pathlib import Path
 
-from physicsos.agents.prompts import (
-    GEOMETRY_MESH_AGENT_PROMPT,
-    KNOWLEDGE_AGENT_PROMPT,
-    PHYSICSOS_SYSTEM_PROMPT,
-    POSTPROCESS_AGENT_PROMPT,
-    SOLVER_AGENT_PROMPT,
-    TAPS_AGENT_PROMPT,
-    VERIFICATION_AGENT_PROMPT,
-)
+from physicsos.agents.prompts import PHYSICSOS_SYSTEM_PROMPT
+from physicsos.agents.subagents import SUBAGENTS
 from physicsos.cloud.auth import start_device_login
 from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
@@ -27,42 +21,12 @@ from physicsos.config import load_config, runtime_paths
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import GeometrySpec
-from physicsos.schemas.problem import PhysicsProblem
 from physicsos.tools.geometry_tools import ApplyBoundaryLabelingArtifactInput, apply_boundary_labeling_artifact
-from physicsos.workflows.universal import run_physicsos_workflow
 
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "workflow", "legacy-repl"}
-
-SUBAGENT_PROMPTS = {
-    "geometry-mesh-agent": (
-        "Build GeometrySpec and MeshSpec from geometry, CAD, mesh, text, and boundary labeling inputs.",
-        GEOMETRY_MESH_AGENT_PROMPT,
-    ),
-    "taps-agent": (
-        "Primary TAPS compiler and solver agent for equation-driven physics simulation.",
-        TAPS_AGENT_PROMPT,
-    ),
-    "solver-agent": (
-        "Route surrogate, full-solver, and hybrid fallback backends after TAPS-first planning.",
-        SOLVER_AGENT_PROMPT,
-    ),
-    "verification-agent": (
-        "Check residuals, conservation, uncertainty, mesh quality, OOD risk, and trustworthiness.",
-        VERIFICATION_AGENT_PROMPT,
-    ),
-    "postprocess-agent": (
-        "Extract KPIs, generate visualizations, and write simulation reports.",
-        POSTPROCESS_AGENT_PROMPT,
-    ),
-    "knowledge-agent": (
-        "Retrieve scientific computing, PDE, solver, materials, and TAPS knowledge.",
-        KNOWLEDGE_AGENT_PROMPT,
-    ),
-}
-
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "legacy-repl"}
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -130,6 +94,32 @@ def _patch_deepagents_workspace_paths() -> None:
     except ImportError:
         return
 
+    try:
+        from deepagents.backends import LocalShellBackend
+    except ImportError:
+        LocalShellBackend = None  # type: ignore[assignment]
+
+    if LocalShellBackend is not None and not getattr(LocalShellBackend.execute, "_physicsos_utf8_shell", False):
+        try:
+            source = inspect.getsource(LocalShellBackend.execute)
+        except (OSError, TypeError):
+            source = ""
+        old = (
+            "                text=True,\n"
+            "                timeout=effective_timeout,\n"
+        )
+        new = (
+            "                text=True,\n"
+            "                encoding=\"utf-8\",\n"
+            "                errors=\"replace\",\n"
+            "                timeout=effective_timeout,\n"
+        )
+        if old in source:
+            namespace = LocalShellBackend.execute.__globals__
+            exec(compile(textwrap.dedent(source.replace(old, new, 1)), "<physicsos_deepagents_shell_utf8_patch>", "exec"), namespace)
+            namespace["execute"]._physicsos_utf8_shell = True  # type: ignore[attr-defined]
+            LocalShellBackend.execute = namespace["execute"]
+
     original_get_system_prompt = cli_agent.get_system_prompt
     if not getattr(original_get_system_prompt, "_physicsos_workspace_paths", False):
 
@@ -140,13 +130,14 @@ def _patch_deepagents_workspace_paths() -> None:
                 prompt = "## Additional Guidelines\n\nFollow the active PhysicsOS system instructions."
             replacement = (
                 "### Current Working Directory\n\n"
-                "The filesystem backend is mapped to the virtual workspace path `/workspace`.\n\n"
+                "PhysicsOS uses one workspace path system. The real workspace root is available as `PHYSICSOS_WORKSPACE`; "
+                "the agent-visible alias for the same directory is `/workspace`.\n\n"
                 "### File System and Paths\n\n"
                 "**IMPORTANT - Path Handling:**\n"
-                "- Always use virtual POSIX paths under `/workspace`, for example `/workspace/scratch/result.png`\n"
-                "- Never use Windows drive paths such as `D:\\...`, `C:\\...`, or mixed `\\` separators in filesystem tools\n"
-                "- Never use host absolute paths such as `/Users/...` or `/home/...` in filesystem tools\n"
-                "- Shell commands execute from the real project root, but filesystem tools require `/workspace/...` paths\n\n"
+                "- Filesystem tools should use `/workspace/...`, for example `/workspace/scratch/result.png`\n"
+                "- Shell and Python run from `PHYSICSOS_WORKSPACE`; use cwd-relative paths like `scratch/result.png` or build paths from `os.environ['PHYSICSOS_WORKSPACE']`\n"
+                "- `/workspace/scratch/result.png`, `scratch/result.png`, and the native path under `PHYSICSOS_WORKSPACE` refer to the same file\n"
+                "- Avoid Windows drive paths in prompts unless you are printing diagnostics; use `/workspace/...` when showing paths to the agent\n\n"
             )
             start = prompt.find("### Current Working Directory")
             end = prompt.find("## Additional Guidelines", start)
@@ -165,7 +156,14 @@ def _patch_deepagents_workspace_paths() -> None:
         result = original_create_cli_agent(*args, **kwargs)
         agent, backend = result
         try:
+            workspace = Path(os.environ.get("PHYSICSOS_WORKSPACE") or runtime_paths().workspace)
+            os.environ["PHYSICSOS_WORKSPACE"] = str(workspace)
+            os.environ["PHYSICSOS_CWD"] = str(workspace)
             default_backend = backend.default
+            if hasattr(default_backend, "cwd"):
+                default_backend.cwd = workspace.resolve()
+            if hasattr(default_backend, "root_dir"):
+                default_backend.root_dir = workspace.resolve()
             default_backend.virtual_mode = True
             if "/workspace/" not in backend.routes:
                 backend.routes = {"/workspace/": default_backend, **backend.routes}
@@ -176,6 +174,45 @@ def _patch_deepagents_workspace_paths() -> None:
 
     create_cli_agent_with_workspace_paths._physicsos_workspace_paths = True  # type: ignore[attr-defined]
     cli_agent.create_cli_agent = create_cli_agent_with_workspace_paths
+
+
+def _physicsos_cli_system_prompt(existing: str | None) -> str:
+    prefix = _physicsos_agent_prompt()
+    if existing and PHYSICSOS_SYSTEM_PROMPT not in existing:
+        return prefix + "\n\n# DeepAgents CLI Base Instructions\n\n" + existing
+    return existing or prefix
+
+
+def _patch_deepagents_physicsos_agent_config() -> None:
+    """Attach PhysicsOS prompt and runtime subagents to DeepAgents CLI agents."""
+    try:
+        import deepagents_cli.agent as cli_agent
+    except ImportError:
+        return
+
+    original_create_deep_agent = cli_agent.create_deep_agent
+    if not getattr(original_create_deep_agent, "_physicsos_subagents", False):
+
+        def create_deep_agent_with_physicsos_subagents(*args: object, **kwargs: object):
+            existing = list(kwargs.get("subagents") or [])
+            names = {item.get("name") for item in existing if isinstance(item, dict)}
+            physicsos_subagents = [item for item in SUBAGENTS if item.get("name") not in names]
+            kwargs["subagents"] = [*existing, *physicsos_subagents] or None
+            return original_create_deep_agent(*args, **kwargs)
+
+        create_deep_agent_with_physicsos_subagents._physicsos_subagents = True  # type: ignore[attr-defined]
+        cli_agent.create_deep_agent = create_deep_agent_with_physicsos_subagents
+
+    original = cli_agent.create_cli_agent
+    if getattr(original, "_physicsos_agent_config", False):
+        return
+
+    def create_cli_agent_with_physicsos_config(*args: object, **kwargs: object):
+        kwargs["system_prompt"] = _physicsos_cli_system_prompt(kwargs.get("system_prompt"))  # type: ignore[arg-type]
+        return original(*args, **kwargs)
+
+    create_cli_agent_with_physicsos_config._physicsos_agent_config = True  # type: ignore[attr-defined]
+    cli_agent.create_cli_agent = create_cli_agent_with_physicsos_config
 
 
 def _patch_deepagents_physicsos_tools() -> None:
@@ -200,6 +237,8 @@ def _patch_deepagents_physicsos_tools() -> None:
             "try:\n"
             "    from physicsos.cli import _patch_deepagents_workspace_paths\n"
             "    _patch_deepagents_workspace_paths()\n"
+            "    from physicsos.cli import _patch_deepagents_physicsos_agent_config\n"
+            "    _patch_deepagents_physicsos_agent_config()\n"
             "except Exception:\n"
             "    pass\n"
         )
@@ -215,44 +254,62 @@ def _patch_deepagents_physicsos_tools() -> None:
             "    from deepagents_cli.config import settings\n"
             "    from deepagents_cli.tools import fetch_url, web_search\n\n"
             "    try:\n"
-            "        from physicsos.tools.registry import MAIN_AGENT_TOOLS\n"
+            "        from physicsos.tools.registry import DEEPAGENTS_MAIN_BRIDGE_TOOLS\n"
             "        from physicsos.events import wrap_tools_for_events\n"
             "    except Exception:\n"
-            "        MAIN_AGENT_TOOLS = []\n\n"
+            "        DEEPAGENTS_MAIN_BRIDGE_TOOLS = []\n\n"
             "        def wrap_tools_for_events(tools):\n"
             "            return tools\n\n"
-            "    tools: list[Any] = [fetch_url, *wrap_tools_for_events(MAIN_AGENT_TOOLS)]\n"
+            "    tools: list[Any] = [fetch_url, *wrap_tools_for_events(DEEPAGENTS_MAIN_BRIDGE_TOOLS)]\n"
         )
-        if old in source and "MAIN_AGENT_TOOLS" not in source:
+        if old in source and "DEEPAGENTS_MAIN_BRIDGE_TOOLS" not in source:
             source = source.replace(old, new)
-
-        marker = "    async_subagents = load_async_subagents() or None\n\n"
-        injection = (
-            "    try:\n"
-            "        from physicsos.tools.registry import SUBAGENT_TOOL_GROUPS\n"
-            "        from physicsos.events import wrap_tools_for_events\n"
-            "    except Exception:\n"
-            "        SUBAGENT_TOOL_GROUPS = {}\n\n"
-            "        def wrap_tools_for_events(tools):\n"
-            "            return tools\n\n"
-            "    import deepagents_cli.agent as cli_agent\n"
-            "    original_load_subagents = cli_agent.list_subagents\n\n"
-            "    def load_scoped_subagents(*args, **kwargs):\n"
-            "        subagents = original_load_subagents(*args, **kwargs)\n"
-            "        for subagent in subagents:\n"
-            "            tools_for_agent = SUBAGENT_TOOL_GROUPS.get(subagent.get(\"name\"))\n"
-            "            if tools_for_agent is not None:\n"
-            "                subagent[\"tools\"] = wrap_tools_for_events(tools_for_agent)\n"
-            "        return subagents\n\n"
-            "    cli_agent.list_subagents = load_scoped_subagents\n\n"
-        )
-        if marker in source and "load_scoped_subagents" not in source:
-            source = source.replace(marker, marker + injection)
 
         server_graph.write_text(source, encoding="utf-8")
 
     scaffold_workspace._physicsos_tools = True  # type: ignore[attr-defined]
     server_manager._scaffold_workspace = scaffold_workspace
+
+
+def _is_retryable_agent_error(exc: BaseException) -> bool:
+    name = exc.__class__.__name__
+    module = exc.__class__.__module__
+    text = f"{name}: {exc}".lower()
+    if name in {"APIConnectionError", "APIStatusError", "InternalServerError", "RateLimitError"}:
+        return True
+    if "openai" in module and any(token in text for token in ("connection", "internal error", "rate limit", "timeout")):
+        return True
+    return any(
+        token in text
+        for token in (
+            "apiconnectionerror",
+            "api connection",
+            "internal error occurred",
+            "connection error",
+            "connection reset",
+            "read timed out",
+            "temporarily unavailable",
+            "rate limit",
+            "too many requests",
+            "503",
+            "502",
+            "500",
+        )
+    )
+
+
+async def _retry_async_agent_call(call, *, max_attempts: int = 5, base_delay_seconds: float = 1.0):  # type: ignore[no-untyped-def]
+    attempt = 1
+    while True:
+        try:
+            return await call()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_agent_error(exc):
+                raise
+            await asyncio.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+            attempt += 1
 
 
 def _patch_deepagents_physicsos_tui_events() -> None:
@@ -278,7 +335,7 @@ def _patch_deepagents_physicsos_tui_events() -> None:
 
     custom_branch_marker = "                # Handle MESSAGES stream - for content and tool calls\n"
     custom_branch = (
-        "                # Handle CUSTOM stream - PhysicsOS typed workflow events\n"
+        "                # Handle CUSTOM stream - PhysicsOS events\n"
         "                elif current_stream_mode == \"custom\":\n"
         "                    try:\n"
         "                        from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events\n"
@@ -300,8 +357,15 @@ def _patch_deepagents_physicsos_tui_events() -> None:
     patched_source = patched_source.replace(custom_branch_marker, custom_branch + custom_branch_marker, 1)
     namespace = textual_adapter.__dict__
     exec(compile(textwrap.dedent(patched_source), "<physicsos_deepagents_tui_patch>", "exec"), namespace)
-    textual_adapter.execute_task_textual._physicsos_tui_events = True  # type: ignore[attr-defined]
-    textual_adapter.execute_task_textual._physicsos_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+    patched_execute_task_textual = textual_adapter.execute_task_textual
+
+    async def execute_task_textual_with_retry(*args: object, **kwargs: object):
+        return await _retry_async_agent_call(lambda: patched_execute_task_textual(*args, **kwargs))
+
+    execute_task_textual_with_retry._physicsos_tui_events = True  # type: ignore[attr-defined]
+    execute_task_textual_with_retry._physicsos_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+    execute_task_textual_with_retry._physicsos_retry_attempts = 5  # type: ignore[attr-defined]
+    textual_adapter.execute_task_textual = execute_task_textual_with_retry
 
 
 def _patch_deepagents_physicsos_noninteractive_events() -> None:
@@ -310,6 +374,25 @@ def _patch_deepagents_physicsos_noninteractive_events() -> None:
         import deepagents_cli.non_interactive as non_interactive
     except ImportError:
         return
+
+    write_text = non_interactive._write_text
+    if not getattr(write_text, "_physicsos_safe_stdout", False):
+
+        def write_text_safe(text: str) -> None:
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError:
+                # Some Windows non-interactive shells expose a stdout handle
+                # that Rich/DeepAgents can write to but fail to flush. Do not
+                # abort a completed PhysicsOS response for a console flush bug.
+                try:
+                    non_interactive.logger.debug("Ignored non-interactive stdout flush failure", exc_info=True)
+                except OSError:
+                    pass
+
+        write_text_safe._physicsos_safe_stdout = True  # type: ignore[attr-defined]
+        non_interactive._write_text = write_text_safe
 
     process_stream_chunk = non_interactive._process_stream_chunk
     if not getattr(process_stream_chunk, "_physicsos_noninteractive_events", False):
@@ -342,21 +425,29 @@ def _patch_deepagents_physicsos_noninteractive_events() -> None:
         non_interactive._process_stream_chunk = patched_process_stream_chunk
 
     stream_agent = non_interactive._stream_agent
-    if getattr(stream_agent, "_physicsos_noninteractive_stream_modes", False):
-        return
-    try:
-        source = inspect.getsource(stream_agent)
-    except (OSError, TypeError):
+    if not getattr(stream_agent, "_physicsos_noninteractive_stream_modes", False):
+        try:
+            source = inspect.getsource(stream_agent)
+        except (OSError, TypeError):
+            source = ""
+
+        old_stream_mode = 'stream_mode=["messages", "updates"],'
+        new_stream_mode = 'stream_mode=["messages", "updates", "custom"],'
+        if old_stream_mode in source:
+            patched_source = source.replace(old_stream_mode, new_stream_mode, 1)
+            namespace = non_interactive.__dict__
+            exec(compile(textwrap.dedent(patched_source), "<physicsos_deepagents_noninteractive_patch>", "exec"), namespace)
+
+    patched_stream_agent = non_interactive._stream_agent
+    if getattr(patched_stream_agent, "_physicsos_retry_attempts", None) == 5:
         return
 
-    old_stream_mode = 'stream_mode=["messages", "updates"],'
-    new_stream_mode = 'stream_mode=["messages", "updates", "custom"],'
-    if old_stream_mode not in source:
-        return
-    patched_source = source.replace(old_stream_mode, new_stream_mode, 1)
-    namespace = non_interactive.__dict__
-    exec(compile(textwrap.dedent(patched_source), "<physicsos_deepagents_noninteractive_patch>", "exec"), namespace)
-    non_interactive._stream_agent._physicsos_noninteractive_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+    async def stream_agent_with_retry(*args: object, **kwargs: object):
+        return await _retry_async_agent_call(lambda: patched_stream_agent(*args, **kwargs))
+
+    stream_agent_with_retry._physicsos_noninteractive_stream_modes = ("messages", "updates", "custom")  # type: ignore[attr-defined]
+    stream_agent_with_retry._physicsos_retry_attempts = 5  # type: ignore[attr-defined]
+    non_interactive._stream_agent = stream_agent_with_retry
 
 
 def _physicsos_agent_prompt() -> str:
@@ -365,28 +456,33 @@ def _physicsos_agent_prompt() -> str:
         + PHYSICSOS_SYSTEM_PROMPT
         + "\n\n"
         "You are running inside the official DeepAgents CLI/TUI as the PhysicsOS agent.\n"
-        "Use the built-in DeepAgents todo, filesystem, shell, subagent, MCP, and skills capabilities.\n"
-        "For end-to-end natural-language simulation requests, call `run_typed_physicsos_workflow` first.\n"
-        "Do not call DeepAgents `task` for taps-agent, geometry-mesh-agent, solver-agent, verification-agent, or postprocess-agent on the core simulation path; the typed workflow owns those stages and emits CLI-visible events.\n"
-        "Use direct subagent delegation only for ad hoc repair, review, explanation, or follow-up after the typed workflow returns retry/failure context.\n"
+        "Use the built-in DeepAgents todo, filesystem, shell, and skills capabilities. MCP is optional and should not define the local architecture.\n"
+        "For end-to-end natural-language simulation requests, act as `physicsos-main`: create a case workspace and reproduce the paper loop through DeepAgents subagents.\n"
+        "Default loop: analysis files -> TAPS derivation prompt -> derivation.md -> implementation_prompt.md -> case-local kernel.py -> Fig. 7 verification chain -> revise or report.\n"
+        "When maintaining case status, call `update_case_stage_status` only with exact stage names from the case manifest. Workspace creation is handled by `create_case_workspace`; never use `workspace` as a stage.\n"
+        "If material coefficients, constitutive laws, boundary values, geometry dimensions, TAPS settings, or verification goals are missing, ask the user or use configured search/knowledge tools before deriving the TAPS kernel.\n"
+        "For STL/CAD cases, prefer the immersed-boundary / IFE route: Gmsh preprocessing, Cartesian background grid, SDF or voxel geometry embedding, and geometry-coupled Galerkin weak form.\n"
         "For local PhysicsOS package state, use `physicsos paths`.\n"
         "For PhysicsOS Cloud device login, use `physicsos auth login`.\n"
         "For cloud runner jobs, use `physicsos runner ...` commands.\n"
-        "Prefer TAPS-first reasoning through the typed workflow, with solver fallback only after TAPS support, compilation, execution, or verification requires it.\n"
+        "Do not use the old typed LangGraph workflow route.\n"
         "Do not claim a high-trust physics solve unless residual, conservation, and verification evidence is available.\n"
     )
 
 
 def _ensure_deepagents_physicsos_config() -> None:
     agent_dir = Path.home() / ".deepagents" / "physicsos"
-    agents_dir = agent_dir / "agents"
     agent_dir.mkdir(parents=True, exist_ok=True)
-    (agent_dir / "AGENTS.md").write_text(_physicsos_agent_prompt(), encoding="utf-8")
-    for name, (description, prompt) in SUBAGENT_PROMPTS.items():
-        subagent_dir = agents_dir / name
-        subagent_dir.mkdir(parents=True, exist_ok=True)
-        content = f"---\nname: {name}\ndescription: {description}\n---\n\n{prompt}\n"
-        (subagent_dir / "AGENTS.md").write_text(content, encoding="utf-8")
+    agent_prompt = _physicsos_agent_prompt()
+    agent_path = agent_dir / "AGENTS.md"
+    try:
+        if agent_path.exists() and agent_path.read_text(encoding="utf-8") == agent_prompt:
+            return
+        agent_path.write_text(agent_prompt, encoding="utf-8")
+    except PermissionError:
+        # A locked or read-only DeepAgents config file should not block running
+        # the package-local PhysicsOS agent when the existing file is usable.
+        return
 
 
 def _deepagents_model_args(argv: list[str]) -> list[str]:
@@ -401,15 +497,33 @@ def _deepagents_model_params_args(argv: list[str]) -> list[str]:
     if "--model-params" in argv:
         return []
     config = load_config()
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or config.get("model", {}).get("base_url")
-    if not base_url:
+    model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
+    params: dict[str, object] = {}
+    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or model_config.get("base_url")
+    if base_url:
+        params["base_url"] = base_url
+    use_responses_api = os.getenv("PHYSICSOS_OPENAI_USE_RESPONSES_API")
+    if use_responses_api is None:
+        use_responses_api = os.getenv("PHYSICSOS_STRUCTURED_USE_RESPONSES_API")
+    if use_responses_api is None and "use_responses_api" in model_config:
+        params["use_responses_api"] = bool(model_config.get("use_responses_api"))
+    elif use_responses_api is not None:
+        params["use_responses_api"] = use_responses_api.strip().lower() in {"1", "true", "yes", "on"}
+    if not params:
         return []
-    return ["--model-params", json.dumps({"base_url": base_url})]
+    return ["--model-params", json.dumps(params)]
 
 
 def _prepare_deepagents_env() -> None:
-    os.environ.setdefault("PYTHONUTF8", "1")
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    temp_dir = runtime_paths().scratch / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    current_temp = str(os.getenv("TEMP") or os.getenv("TMP") or "")
+    if os.name == "nt" and "\\windows\\temp" in current_temp.lower():
+        os.environ["TEMP"] = str(temp_dir)
+        os.environ["TMP"] = str(temp_dir)
+        os.environ["TMPDIR"] = str(temp_dir)
     # DeepAgents CLI starts a local langgraph dev server. Its local filesystem
     # and shell tools perform synchronous I/O, which LangGraph otherwise rejects
     # as BlockingError when the agent writes or edits files.
@@ -423,9 +537,50 @@ def _prepare_deepagents_env() -> None:
                 pass
 
     config = load_config()
-    api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY") or config.get("model", {}).get("api_key")
-    if api_key and not os.getenv("OPENAI_API_KEY"):
+    model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
+    search_config = config.get("search", {}) if isinstance(config.get("search"), dict) else {}
+    api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY") or model_config.get("api_key")
+    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or model_config.get("base_url")
+    model = os.getenv("PHYSICSOS_OPENAI_MODEL") or model_config.get("name")
+    search_provider = os.getenv("PHYSICSOS_SEARCH_PROVIDER") or search_config.get("provider")
+    tavily_api_key = os.getenv("TAVILY_API_KEY") or os.getenv("PHYSICSOS_TAVILY_API_KEY") or search_config.get("tavily_api_key")
+    search_enabled = os.getenv("PHYSICSOS_SEARCH_ENABLED")
+    if search_enabled is None and "enabled" in search_config:
+        search_enabled = "true" if bool(search_config.get("enabled")) else "false"
+    search_max_results = os.getenv("PHYSICSOS_SEARCH_MAX_RESULTS") or search_config.get("max_results")
+    if api_key:
+        os.environ["PHYSICSOS_OPENAI_API_KEY"] = str(api_key)
+        os.environ["DEEPAGENTS_CLI_OPENAI_API_KEY"] = str(api_key)
         os.environ["OPENAI_API_KEY"] = str(api_key)
+    if base_url:
+        os.environ["PHYSICSOS_OPENAI_BASE_URL"] = str(base_url)
+        os.environ["OPENAI_BASE_URL"] = str(base_url)
+    if model:
+        os.environ["PHYSICSOS_OPENAI_MODEL"] = str(model)
+    workspace = runtime_paths().workspace
+    existing_workspace = os.environ.get("PHYSICSOS_WORKSPACE")
+    existing_auto_workspace = (
+        existing_workspace is not None
+        and os.environ.get("PHYSICSOS_WORKSPACE_SOURCE") == "physicsos_cli_auto"
+        and os.environ.get("PHYSICSOS_WORKSPACE_AUTO_VALUE") == existing_workspace
+    )
+    if existing_workspace and not existing_auto_workspace:
+        os.environ.setdefault("PHYSICSOS_WORKSPACE_SOURCE", "user")
+    else:
+        os.environ["PHYSICSOS_WORKSPACE"] = str(workspace)
+        os.environ["PHYSICSOS_WORKSPACE_SOURCE"] = "physicsos_cli_auto"
+        os.environ["PHYSICSOS_WORKSPACE_AUTO_VALUE"] = str(workspace)
+    os.environ["PHYSICSOS_AGENT_WORKSPACE"] = "/workspace"
+    os.environ["PHYSICSOS_CWD"] = os.environ["PHYSICSOS_WORKSPACE"]
+    if search_provider:
+        os.environ["PHYSICSOS_SEARCH_PROVIDER"] = str(search_provider)
+    if tavily_api_key:
+        os.environ["TAVILY_API_KEY"] = str(tavily_api_key)
+        os.environ["PHYSICSOS_TAVILY_API_KEY"] = str(tavily_api_key)
+    if search_enabled is not None:
+        os.environ["PHYSICSOS_SEARCH_ENABLED"] = str(search_enabled)
+    if search_max_results:
+        os.environ["PHYSICSOS_SEARCH_MAX_RESULTS"] = str(search_max_results)
 
 
 def _launch_deepagents_cli(argv: list[str]) -> int:
@@ -435,6 +590,7 @@ def _launch_deepagents_cli(argv: list[str]) -> int:
     _patch_deepagents_banner()
     _patch_deepagents_allow_blocking()
     _patch_deepagents_workspace_paths()
+    _patch_deepagents_physicsos_agent_config()
     _patch_deepagents_physicsos_tools()
     _patch_deepagents_physicsos_tui_events()
     _patch_deepagents_physicsos_noninteractive_events()
@@ -515,7 +671,7 @@ def _print_welcome() -> None:
         console.print(
             Panel(
                 Align.center(title),
-                subtitle="TAPS-first physics simulation agent",
+                subtitle="Capability-aware physics simulation agent",
                 border_style="cyan",
                 box=box.DOUBLE,
             )
@@ -539,7 +695,7 @@ def _print_welcome() -> None:
         return
 
     print(BANNER)
-    print("TAPS-first physics simulation agent")
+    print("Capability-aware physics simulation agent")
     print(f"Home:      {paths.home}")
     print(f"Workspace: {paths.workspace}")
     print()
@@ -690,16 +846,6 @@ def main(argv: list[str] | None = None) -> int:
     apply_labels.add_argument("--output")
     apply_labels.add_argument("--replace-existing", action="store_true")
 
-    workflow = sub.add_parser("workflow")
-    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
-    resume_geometry = workflow_sub.add_parser("resume-confirmed-geometry")
-    resume_geometry.add_argument("problem_json")
-    resume_geometry.add_argument("geometry_json")
-    resume_geometry.add_argument("--output")
-    resume_geometry.add_argument("--use-knowledge", action="store_true")
-    resume_geometry.add_argument("--taps-rank", type=int, default=8)
-    resume_geometry.add_argument("--taps-max-wall-time-seconds", type=float, default=120.0)
-
     runner = sub.add_parser("runner")
     runner_sub = runner.add_subparsers(dest="runner_command", required=True)
     submit = runner_sub.add_parser("submit")
@@ -759,35 +905,6 @@ def main(argv: list[str] | None = None) -> int:
                     "applied": result.applied,
                     "warnings": result.warnings,
                     "boundary_count": len(result.geometry.boundaries),
-                }
-            )
-            return 0
-
-    if args.command == "workflow":
-        if args.workflow_command == "resume-confirmed-geometry":
-            problem_path = Path(args.problem_json)
-            geometry_path = Path(args.geometry_json)
-            problem = PhysicsProblem.model_validate_json(problem_path.read_text(encoding="utf-8"))
-            geometry = GeometrySpec.model_validate_json(geometry_path.read_text(encoding="utf-8"))
-            resumed_problem = problem.model_copy(update={"geometry": geometry})
-            result = run_physicsos_workflow(
-                problem=resumed_problem,
-                use_knowledge=args.use_knowledge,
-                taps_rank=args.taps_rank,
-                taps_max_wall_time_seconds=args.taps_max_wall_time_seconds,
-            )
-            output_path = Path(args.output) if args.output else problem_path.with_name(f"{problem_path.stem}.workflow_result.json")
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
-            _print_json(
-                {
-                    "workflow_result": str(output_path),
-                    "run_id": result.run_id,
-                    "problem_id": result.problem.id,
-                    "geometry_id": result.problem.geometry.id,
-                    "trace": [step.model_dump(mode="json") for step in result.trace],
-                    "verification_status": result.verification.status if result.verification is not None else None,
-                    "recommended_next_action": result.verification.recommended_next_action if result.verification is not None else None,
                 }
             )
             return 0

@@ -5,14 +5,10 @@ from typing import Any, Literal
 from pydantic import Field
 
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
-from physicsos.schemas.contracts import ContractReviewReport, PhysicsProblemContract
-from physicsos.schemas.geometry import GeometryEncoding, GeometrySpec
 from physicsos.schemas.knowledge import KnowledgeContext
-from physicsos.schemas.mesh import MeshQualityReport, MeshSpec
 from physicsos.schemas.postprocess import PostprocessResult
-from physicsos.schemas.problem import PhysicsProblem
-from physicsos.schemas.solver import SolverDecision, SolverResult
-from physicsos.schemas.taps import NumericalSolvePlanOutput, TAPSCompilationPlan, TAPSProblem, TAPSResidualReport, TAPSSupportScore
+from physicsos.schemas.solver import SolverResult
+from physicsos.schemas.taps import TAPSGeometrySeparabilityAssessment, TAPSProblem, TAPSResidualReport, TAPSSupportScore
 from physicsos.schemas.verification import VerificationReport
 from physicsos.tools.memory_tools import CaseMemoryContext, StoreCaseResultOutput
 
@@ -22,17 +18,18 @@ AgentStatus = Literal[
     "complete",
     "needs_user_input",
     "needs_knowledge",
-    "fallback_required",
+    "needs_geometry_embedding",
+    "needs_verification",
     "failed",
 ]
 
 
 class AgentHandoff(StrictBaseModel):
-    """Machine-readable handoff envelope between PhysicsOS core agents."""
+    """Machine-readable handoff envelope between paper-style PhysicsOS agents."""
 
     agent_name: str
     status: AgentStatus
-    problem_id: str
+    case_id: str
     summary: str
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -40,34 +37,22 @@ class AgentHandoff(StrictBaseModel):
     recommended_next_action: str | None = None
 
 
-class ValidationRetryContext(StrictBaseModel):
-    agent_name: str = "validate_physics_problem"
-    stage: str = "problem_validation"
-    attempt: int
-    problem: PhysicsProblem
-    input_context: dict[str, Any] = Field(default_factory=dict)
-    errors: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    retry_instruction: str
-
-
-class GeometryMeshAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
-    requested_encodings: list[str] = Field(default_factory=list)
-    target_backends: list[str] = Field(default_factory=list)
-    case_memory_context: CaseMemoryContext | None = None
-
-
-class GeometryMeshAgentOutput(StrictBaseModel):
+class AnalysisFileAgentOutput(StrictBaseModel):
     handoff: AgentHandoff
-    geometry: GeometrySpec
-    mesh: MeshSpec | None = None
-    encodings: list[GeometryEncoding] = Field(default_factory=list)
-    quality: MeshQualityReport | None = None
+    problem_statement: ArtifactRef | None = None
+    problem_json: ArtifactRef | None = None
+    open_questions: ArtifactRef | None = None
+
+
+class GeometryEmbeddingAgentOutput(StrictBaseModel):
+    handoff: AgentHandoff
+    embedding: ArtifactRef | None = None
+    embedding_notes: ArtifactRef | None = None
+    assessment: TAPSGeometrySeparabilityAssessment | None = None
 
 
 class KnowledgeAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
+    case_id: str
     query: str
     local_top_k: int = 4
     arxiv_max_results: int = 0
@@ -80,57 +65,27 @@ class KnowledgeAgentOutput(StrictBaseModel):
     context: KnowledgeContext
 
 
-class TAPSAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
-    problem_contract: PhysicsProblemContract | None = None
-    knowledge_context: KnowledgeContext | None = None
-    case_memory_context: CaseMemoryContext | None = None
-    tensor_rank: int = 8
-    max_wall_time_seconds: float = 120.0
-
-
-class TAPSAgentOutput(StrictBaseModel):
+class TAPSDerivationAgentOutput(StrictBaseModel):
     handoff: AgentHandoff
-    support: TAPSSupportScore
-    compilation_plan: TAPSCompilationPlan | None = None
+    derivation_prompt: ArtifactRef | None = None
+    derivation: ArtifactRef | None = None
+    implementation_notes: ArtifactRef | None = None
+    support: TAPSSupportScore | None = None
+
+
+class TAPSImplementationAgentOutput(StrictBaseModel):
+    handoff: AgentHandoff
     taps_problem: TAPSProblem | None = None
-    numerical_plan: NumericalSolvePlanOutput | None = None
-    contract_review: ContractReviewReport | None = None
+    kernel: ArtifactRef | None = None
+    execution_plan: ArtifactRef | None = None
+    static_review: ArtifactRef | None = None
     result: SolverResult | None = None
-    residual: TAPSResidualReport | None = None
-
-
-class SolverAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
-    taps_handoff: AgentHandoff | None = None
-    case_memory_context: CaseMemoryContext | None = None
-    force_full_solver: bool = False
-
-
-class SolverAgentOutput(StrictBaseModel):
-    handoff: AgentHandoff
-    decision: SolverDecision | None = None
-    result: SolverResult
-
-
-class VerificationAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
-    result: SolverResult
-    taps_problem: TAPSProblem | None = None
-    case_memory_context: CaseMemoryContext | None = None
 
 
 class VerificationAgentOutput(StrictBaseModel):
     handoff: AgentHandoff
-    report: VerificationReport
+    report: VerificationReport | None = None
     taps_residual: TAPSResidualReport | None = None
-
-
-class PostprocessAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
-    result: SolverResult
-    verification: VerificationReport
-    case_memory_context: CaseMemoryContext | None = None
 
 
 class PostprocessAgentOutput(StrictBaseModel):
@@ -139,7 +94,7 @@ class PostprocessAgentOutput(StrictBaseModel):
 
 
 class CaseMemoryAgentInput(StrictBaseModel):
-    problem: PhysicsProblem
+    case_id: str
     result: SolverResult
     verification: VerificationReport
     postprocess: PostprocessResult
@@ -151,16 +106,15 @@ class CaseMemoryAgentOutput(StrictBaseModel):
     stored: StoreCaseResultOutput
 
 
-class PhysicsOSWorkflowState(StrictBaseModel):
-    problem: PhysicsProblem
-    run_id: str | None = None
-    problem_contract: PhysicsProblemContract | None = None
-    case_memory_context: CaseMemoryContext | None = None
-    geometry: GeometryMeshAgentOutput | None = None
+class PhysicsOSCaseState(StrictBaseModel):
+    case_id: str
+    current_stage: str | None = None
+    analysis: AnalysisFileAgentOutput | None = None
+    geometry: GeometryEmbeddingAgentOutput | None = None
     knowledge: KnowledgeAgentOutput | None = None
-    taps: TAPSAgentOutput | None = None
-    solver: SolverAgentOutput | None = None
+    derivation: TAPSDerivationAgentOutput | None = None
+    implementation: TAPSImplementationAgentOutput | None = None
     verification: VerificationAgentOutput | None = None
     postprocess: PostprocessAgentOutput | None = None
     case_memory: CaseMemoryAgentOutput | None = None
-    validation_attempts: list[ValidationRetryContext] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)

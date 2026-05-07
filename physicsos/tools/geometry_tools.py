@@ -12,9 +12,24 @@ from pydantic import Field
 from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent
 from physicsos.backends.geometry_mesh import generate_mesh_backend, import_geometry_backend
 from physicsos.config import project_root
+from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
 from physicsos.schemas.contracts import PhysicsProblemContract
-from physicsos.schemas.geometry import BoundaryRegionSpec, BoundaryRole, GeometryEncoding, GeometryEntity, GeometryQualityReport, GeometrySource, GeometrySpec, GeometryTransform, RegionSpec
+from physicsos.schemas.geometry import (
+    BoundaryRegionSpec,
+    BoundaryRole,
+    GeometryEncoding,
+    GeometryEntity,
+    GeometryMeshContract,
+    GeometryNumericalEncoding,
+    GeometryQualityReport,
+    GeometrySemanticContract,
+    GeometrySemanticRegion,
+    GeometrySource,
+    GeometrySpec,
+    GeometryTransform,
+    RegionSpec,
+)
 from physicsos.schemas.knowledge import KnowledgeContext
 from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
 from physicsos.schemas.operators import PhysicsDomain, PhysicsSpec
@@ -51,7 +66,20 @@ class RepairGeometryOutput(StrictBaseModel):
 
 def repair_geometry(input: RepairGeometryInput) -> RepairGeometryOutput:
     """Repair invalid, non-manifold, open, or self-intersecting geometry."""
-    geometry = input.geometry.model_copy(update={"quality": GeometryQualityReport(passes=True)})
+    transforms = [
+        *input.geometry.transforms,
+        GeometryTransform(kind="repair", description="No-op scaffold repair; geometry remains not_repaired and requires confirmation."),
+    ]
+    geometry = input.geometry.model_copy(
+        update={
+            "quality": GeometryQualityReport(
+                passes=False,
+                unresolved_regions=["not_repaired"],
+                issues=["No-op scaffold repair did not modify geometry."],
+            ),
+            "transforms": transforms,
+        }
+    )
     return RepairGeometryOutput(geometry=geometry, changes=["No-op scaffold repair."])
 
 
@@ -86,6 +114,252 @@ class GeometryMeshPlanOutput(StrictBaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class BuildGeometryMeshContractInput(StrictBaseModel):
+    geometry: GeometrySpec
+    mesh: MeshSpec | None = None
+    mesh_export_manifest: ArtifactRef | None = None
+    labeling_artifact: ArtifactRef | None = None
+    boundary_confidence_threshold: float = 0.7
+
+
+class BuildGeometryMeshContractOutput(StrictBaseModel):
+    contract: GeometryMeshContract
+
+
+class MeshSemanticsGateInput(StrictBaseModel):
+    geometry: GeometrySpec
+    contract: GeometryMeshContract
+    mesh: MeshSpec | None = None
+    require_user_dimensions_for_generated: bool = True
+    require_physical_groups_for_mesh: bool = True
+    boundary_confidence_threshold: float = 0.7
+
+
+class MeshSemanticsGateOutput(StrictBaseModel):
+    status: Literal["accepted", "needs_user_input", "needs_review"]
+    passes: bool
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    required_actions: list[str] = Field(default_factory=list)
+
+
+def _semantic_source(geometry: GeometrySpec) -> str:
+    if geometry.source.kind in {"cad_step", "cad_iges", "mesh_file"}:
+        return "cad_physical_group"
+    if geometry.source.kind == "generated":
+        return "generated"
+    return "unknown"
+
+
+def build_geometry_mesh_contract(input: BuildGeometryMeshContractInput) -> BuildGeometryMeshContractOutput:
+    """Build the semantic and numerical contract consumed by TAPS formulation.
+
+    This contract is intentionally stricter than GeometrySpec. Ambiguous
+    boundary labels remain unresolved instead of being silently defaulted.
+    """
+    geometry = input.geometry
+    applied_label_ids: list[str] = []
+    label_warnings: list[str] = []
+    if input.labeling_artifact is not None:
+        applied = apply_boundary_labeling_artifact(
+            ApplyBoundaryLabelingArtifactInput(
+                geometry=geometry,
+                labeling_artifact=input.labeling_artifact,
+                replace_existing=True,
+            )
+        )
+        geometry = applied.geometry
+        applied_label_ids = applied.applied
+        label_warnings = applied.warnings
+    warnings: list[str] = []
+    warnings.extend(label_warnings)
+    domains = [
+        GeometrySemanticRegion(
+            id=region.id,
+            label=region.label,
+            kind="domain" if region.kind in {"fluid", "solid", "material", "periodic_cell"} else "subdomain",
+            entity_ids=region.entity_ids,
+            confidence=1.0 if region.entity_ids else 0.75,
+            source=_semantic_source(geometry),  # type: ignore[arg-type]
+            metadata={"region_kind": region.kind},
+        )
+        for region in geometry.regions
+    ]
+    if not domains and geometry.dimension > 0:
+        domains.append(
+            GeometrySemanticRegion(
+                id="region:domain",
+                label="domain",
+                kind="domain",
+                confidence=0.6 if geometry.source.kind == "generated" else 0.3,
+                source=_semantic_source(geometry),  # type: ignore[arg-type]
+            )
+        )
+        warnings.append("GeometrySpec has no explicit domain region; created low-confidence region:domain binding.")
+
+    boundaries = [
+        GeometrySemanticRegion(
+            id=boundary.id,
+            label=boundary.label,
+            kind="boundary",
+            role=boundary.role,
+            entity_ids=boundary.entity_ids,
+            confidence=boundary.confidence,
+            source=_semantic_source(geometry),  # type: ignore[arg-type]
+            metadata={"boundary_kind": boundary.kind},
+        )
+        for boundary in geometry.boundaries
+    ]
+    unresolved: list[str] = []
+    if geometry.dimension > 0 and not boundaries:
+        unresolved.append("boundaries")
+        if input.labeling_artifact is None:
+            warnings.append("Geometry has no boundary semantic labels.")
+        else:
+            warnings.append("Boundary labeling artifact has no confirmed labels; human confirmation is still required.")
+    for boundary in boundaries:
+        if boundary.confidence < input.boundary_confidence_threshold:
+            unresolved.append(boundary.id)
+        if boundary.role is None and boundary.label.lower() not in {"inlet", "outlet", "wall", "symmetry", "farfield"}:
+            unresolved.append(f"{boundary.id}:role")
+
+    confidences = [region.confidence for region in [*domains, *boundaries]]
+    semantic = GeometrySemanticContract(
+        geometry_id=geometry.id,
+        dimension=geometry.dimension,
+        coordinate_system=geometry.coordinate_system,
+        domains=domains,
+        boundaries=boundaries,
+        unresolved_bindings=sorted(set(unresolved)),
+        min_confidence=min(confidences) if confidences else 0.0,
+        provenance={
+            "source_kind": geometry.source.kind,
+            "human_in_the_loop": bool(input.labeling_artifact is not None and applied_label_ids),
+            "confirmed_boundary_count": len(applied_label_ids),
+        },
+    )
+
+    numerical_encodings: list[GeometryNumericalEncoding] = []
+    for encoding in geometry.encodings:
+        axis_names: list[str] = []
+        metadata: dict[str, str | float | int | bool] = {"source": "GeometrySpec.encodings"}
+        if encoding.kind == "structured_axes":
+            try:
+                payload = json.loads(resolve_workspace_path(encoding.uri, workspace=project_root()).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            raw_axes = payload.get("axis_names")
+            if isinstance(raw_axes, list):
+                axis_names = [str(axis) for axis in raw_axes]
+            confidence = payload.get("confidence")
+            if isinstance(confidence, (float, int)):
+                metadata["confidence"] = float(confidence)
+        numerical_encodings.append(
+            GeometryNumericalEncoding(
+                kind=encoding.kind if encoding.kind != "surface_point_cloud" and encoding.kind != "volume_point_cloud" else "mesh_graph",  # type: ignore[arg-type]
+                uri=encoding.uri,
+                target_backend=encoding.target_backend,
+                axis_names=axis_names,
+                resolution=encoding.resolution,
+                metadata=metadata,
+            )
+        )
+    if input.mesh is not None:
+        numerical_encodings.append(
+            GeometryNumericalEncoding(
+                kind="structured_axes" if input.mesh.kind == "structured" else "mesh_graph",
+                target_backend="fem",
+                quality={
+                    "passes": input.mesh.quality.passes,
+                    **({"node_count": input.mesh.topology.node_count} if input.mesh.topology.node_count is not None else {}),
+                    **({"cell_count": input.mesh.topology.cell_count} if input.mesh.topology.cell_count is not None else {}),
+                },
+                metadata={"mesh_id": input.mesh.id, "mesh_kind": input.mesh.kind},
+            )
+        )
+    if geometry.dimension == 1 and not numerical_encodings:
+        numerical_encodings.append(
+            GeometryNumericalEncoding(kind="structured_axes", axis_names=["x"], target_backend="taps", metadata={"source": "1d_geometry_default"})
+        )
+
+    return BuildGeometryMeshContractOutput(
+        contract=GeometryMeshContract(
+            semantic=semantic,
+            numerical_encodings=numerical_encodings,
+            mesh_export_manifest=input.mesh_export_manifest,
+            warnings=warnings,
+        )
+    )
+
+
+def mesh_semantics_gate(input: MeshSemanticsGateInput) -> MeshSemanticsGateOutput:
+    """Gate geometry/mesh semantics before formulation or backend export."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    required_actions: list[str] = []
+    contract = input.contract
+    geometry = input.geometry
+
+    if contract.semantic.unresolved_bindings:
+        errors.append("Geometry semantic contract has unresolved bindings: " + ", ".join(contract.semantic.unresolved_bindings))
+        required_actions.append("confirm_boundary_and_region_semantics")
+    if contract.semantic.min_confidence < input.boundary_confidence_threshold:
+        errors.append(
+            f"Geometry semantic confidence {contract.semantic.min_confidence:.3g} is below threshold {input.boundary_confidence_threshold:.3g}."
+        )
+        required_actions.append("raise_semantic_confidence_or_confirm_labels")
+    low_confidence_boundaries = [
+        boundary.id for boundary in contract.semantic.boundaries if boundary.confidence < input.boundary_confidence_threshold
+    ]
+    if low_confidence_boundaries:
+        errors.append("Boundary labels below confidence threshold: " + ", ".join(low_confidence_boundaries))
+        required_actions.append("confirm_low_confidence_boundaries")
+
+    if input.require_user_dimensions_for_generated and geometry.source.kind == "generated" and geometry.dimension > 0:
+        has_dimension_metadata = any(
+            key in entity.metadata
+            for entity in geometry.entities
+            for key in {"length", "width", "height", "radius", "diameter", "extent", "primitive", "dimensions"}
+        )
+        has_parametric_encoding = any(encoding.kind == "parametric_shape_vector" for encoding in geometry.encodings)
+        if not has_dimension_metadata and not has_parametric_encoding:
+            errors.append("Generated geometry lacks explicit primitive/dimension metadata from the user request.")
+            required_actions.append("bind_generated_geometry_dimensions")
+
+    no_op_repairs = [
+        transform.description
+        for transform in geometry.transforms
+        if transform.kind == "repair" and ("no-op" in transform.description.lower() or "scaffold" in transform.description.lower())
+    ]
+    if no_op_repairs:
+        errors.append("Geometry repair contains no-op/scaffold repair markers and cannot be treated as repaired.")
+        required_actions.append("perform_real_geometry_repair_or_mark_not_repaired")
+
+    mesh_or_graph_available = input.mesh is not None or any(encoding.kind == "mesh_graph" for encoding in geometry.encodings)
+    physical_group_available = any(
+        boundary.source in {"cad_physical_group", "mesh_tag"} or boundary.metadata.get("gmsh_physical_tag") is not None
+        for boundary in contract.semantic.boundaries
+    )
+    if input.require_physical_groups_for_mesh and mesh_or_graph_available and geometry.dimension > 1 and not physical_group_available:
+        warnings.append("Mesh has no CAD/mesh physical boundary groups; backend export should require user-confirmed labels.")
+        required_actions.append("confirm_or_export_physical_boundary_groups")
+
+    status: Literal["accepted", "needs_user_input", "needs_review"]
+    if errors:
+        status = "needs_user_input"
+    elif warnings:
+        status = "needs_review"
+    else:
+        status = "accepted"
+    return MeshSemanticsGateOutput(
+        status=status,
+        passes=status == "accepted",
+        errors=sorted(set(errors)),
+        warnings=sorted(set(warnings)),
+        required_actions=sorted(set(required_actions)),
+    )
+
+
 GEOMETRY_MESH_PLAN_SYSTEM_PROMPT = """You are the PhysicsOS geometry-mesh planning agent.
 Return only a JSON object matching GeometryMeshPlanOutput.
 
@@ -94,7 +368,12 @@ Task:
 - Infer region and boundary semantics, mesh policy, backend targets, and required encodings.
 - Do not claim that a mesh exists or directly write mesh files.
 - Mark require_boundary_confirmation=true for imported/CAD/mesh geometries with ambiguous or low-confidence solver-critical boundary labels.
-- Prefer mesh_graph encodings for 2D/3D TAPS/FEM workflows.
+- For simple generated/text geometries with explicit bounds, prefer structured_axes:
+  - 1D rod/line/interval -> requested_encodings includes "structured_axes" with x.
+  - 2D rectangle/square -> requested_encodings includes "structured_axes" with x,y.
+  - 3D box/cuboid/block -> requested_encodings includes "structured_axes" with x,y,z.
+- Prefer mesh_graph encodings for unstructured FEM/FVM workflows, imported meshes, CAD, or genuinely arbitrary 2D/3D geometry.
+- It is valid to request both structured_axes and mesh_graph when a structured geometry may also need FEM comparison.
 """
 
 
@@ -102,10 +381,12 @@ def plan_geometry_mesh(input: GeometryMeshPlanInput) -> GeometryMeshPlanOutput:
     """Deterministic geometry/mesh planning fallback."""
     geometry = input.problem.geometry
     encodings = list(input.requested_encodings)
-    if geometry.dimension > 1 and "mesh_graph" not in encodings:
+    imported_geometry = geometry.source.kind in {"cad_step", "cad_iges", "stl", "mesh_file"}
+    if _can_generate_structured_axes(geometry) and "structured_axes" not in encodings:
+        encodings.append("structured_axes")
+    if geometry.dimension > 1 and imported_geometry and "mesh_graph" not in encodings:
         encodings.append("mesh_graph")
     boundary_confidence = min((boundary.confidence for boundary in geometry.boundaries), default=1.0)
-    imported_geometry = geometry.source.kind in {"cad_step", "cad_iges", "stl", "mesh_file"}
     require_confirmation = imported_geometry and (not geometry.boundaries or boundary_confidence < 0.7)
     mesh_policy = MeshPolicy(
         strategy="unstructured" if geometry.dimension > 1 else "structured",
@@ -118,7 +399,7 @@ def plan_geometry_mesh(input: GeometryMeshPlanInput) -> GeometryMeshPlanOutput:
         requested_encodings=encodings,
         target_backends=input.target_backends,
         require_boundary_confirmation=require_confirmation,
-        assumptions=["Deterministic geometry-mesh fallback selected conservative mesh and encoding defaults."],
+        assumptions=["Geometry-mesh planner selected conservative mesh and encoding defaults."],
         warnings=["Imported geometry needs confirmed boundary labels before solver export."] if require_confirmation else [],
     )
 
@@ -139,17 +420,87 @@ def plan_geometry_mesh_structured(
         config=config,
     )
     if result.output is not None:
-        return result.output
-    fallback = plan_geometry_mesh(input)
-    return fallback.model_copy(
-        update={
-            "assumptions": [
-                *fallback.assumptions,
-                "Structured LLM geometry-mesh planning failed validation; deterministic fallback was used.",
-                result.error or "Structured geometry-mesh planner returned no validated output.",
-            ]
-        }
+        output = result.output
+        encodings = list(output.requested_encodings)
+        if _can_generate_structured_axes(input.problem.geometry) and "structured_axes" not in encodings:
+            encodings.insert(0, "structured_axes")
+            return output.model_copy(
+                update={
+                    "requested_encodings": encodings,
+                    "assumptions": [
+                        *output.assumptions,
+                        "Added structured_axes for simple explicit geometry so TAPS can use a high-confidence tensor-product geometry contract.",
+                    ],
+                }
+            )
+        return output
+    raise RuntimeError(result.error or "Structured geometry-mesh planner returned no validated output.")
+
+
+def _can_generate_structured_axes(geometry: GeometrySpec) -> bool:
+    if geometry.dimension not in {1, 2, 3}:
+        return False
+    if geometry.source.kind in {"cad_step", "cad_iges", "stl", "mesh_file"}:
+        return False
+    text = " ".join(
+        str(value).lower()
+        for value in [
+            geometry.id,
+            *(entity.label or "" for entity in geometry.entities),
+            *(region.label for region in geometry.regions),
+        ]
     )
+    if geometry.dimension == 1:
+        return True
+    if geometry.dimension == 2:
+        return any(word in text for word in {"square", "rectangle", "rectangular", "plate", "unit", "box", "domain"})
+    return any(word in text for word in {"box", "cuboid", "block", "rectangular", "domain"})
+
+
+def _axis_names_for_dimension(dimension: int) -> list[str]:
+    return ["x", "y", "z"][: max(0, min(dimension, 3))]
+
+
+def _axis_bounds_from_geometry(geometry: GeometrySpec) -> dict[str, list[float]]:
+    axes = _axis_names_for_dimension(geometry.dimension)
+    bounds = {axis: [0.0, 1.0] for axis in axes}
+    for entity in geometry.entities:
+        metadata = entity.metadata
+        if geometry.dimension == 1 and "length" in metadata:
+            try:
+                bounds["x"] = [0.0, float(metadata["length"])]
+            except (TypeError, ValueError):
+                pass
+        for axis in axes:
+            min_key = f"{axis}_min"
+            max_key = f"{axis}_max"
+            if min_key in metadata and max_key in metadata:
+                try:
+                    bounds[axis] = [float(metadata[min_key]), float(metadata[max_key])]
+                except (TypeError, ValueError):
+                    pass
+    return bounds
+
+
+def _structured_axes_payload(geometry: GeometrySpec, resolution: list[int]) -> dict[str, object]:
+    axis_names = _axis_names_for_dimension(geometry.dimension)
+    bounds = _axis_bounds_from_geometry(geometry)
+    if not resolution:
+        resolution = [64 for _ in axis_names]
+    if len(resolution) < len(axis_names):
+        resolution = [*resolution, *[resolution[-1] if resolution else 64 for _ in range(len(axis_names) - len(resolution))]]
+    return {
+        "type": "structured_axes",
+        "geometry_id": geometry.id,
+        "dimension": geometry.dimension,
+        "axis_names": axis_names,
+        "bounds": bounds,
+        "resolution": resolution[: len(axis_names)],
+        "coordinate_system": geometry.coordinate_system.model_dump(mode="json"),
+        "boundary_roles": {boundary.role: boundary.id for boundary in geometry.boundaries if boundary.role is not None},
+        "confidence": 0.95 if geometry.source.kind in {"generated", "text"} and axis_names else 0.75,
+        "description": "Structured tensor-product axes inferred from explicit simple geometry.",
+    }
 
 
 def _default_boundary_kind(label: str, physics_domain: PhysicsDomain) -> str:
@@ -298,6 +649,16 @@ class BoundaryLabelCandidate(StrictBaseModel):
     requires_confirmation: bool = True
 
 
+class RegionLabelCandidate(StrictBaseModel):
+    target_ids: list[str] = Field(default_factory=list)
+    region_id: str
+    label: str
+    kind: Literal["fluid", "solid", "void", "material", "interface", "periodic_cell", "custom"] = "custom"
+    confidence: float = 0.0
+    reason: str | None = None
+    requires_confirmation: bool = True
+
+
 class ConfirmedBoundaryLabel(StrictBaseModel):
     target_ids: list[str] = Field(default_factory=list)
     boundary_id: str
@@ -312,13 +673,119 @@ class CreateBoundaryLabelingArtifactInput(StrictBaseModel):
     geometry: GeometrySpec
     geometry_encoding: GeometryEncoding | None = None
     include_weak_suggestions: bool = True
+    boundary_candidates: list[BoundaryLabelCandidate] = Field(default_factory=list)
+    region_candidates: list[RegionLabelCandidate] = Field(default_factory=list)
 
 
 class CreateBoundaryLabelingArtifactOutput(StrictBaseModel):
     artifact: ArtifactRef
     selectable_groups: list[dict[str, object]] = Field(default_factory=list)
     suggestions: list[BoundaryLabelCandidate] = Field(default_factory=list)
+    region_suggestions: list[RegionLabelCandidate] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class GenerateBoundaryRegionCandidatesInput(StrictBaseModel):
+    geometry: GeometrySpec
+    physics_domain: PhysicsDomain
+    problem: PhysicsProblem | None = None
+    geometry_encoding: GeometryEncoding | None = None
+
+
+class GenerateBoundaryRegionCandidatesOutput(StrictBaseModel):
+    boundary_candidates: list[BoundaryLabelCandidate] = Field(default_factory=list)
+    region_candidates: list[RegionLabelCandidate] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _candidate_from_boundary(boundary: BoundaryRegionSpec) -> BoundaryLabelCandidate:
+    kind = boundary.kind
+    if kind == "surface":
+        if boundary.role in {"inlet", "outlet", "wall", "symmetry", "farfield", "interface", "periodic"}:
+            kind = boundary.role
+        else:
+            kind = "surface"
+    confidence = min(boundary.confidence, 0.95)
+    if boundary.role is not None:
+        confidence = max(confidence, 0.85)
+    return BoundaryLabelCandidate(
+        target_ids=boundary.entity_ids or [boundary.id],
+        boundary_id=boundary.id,
+        label=boundary.label,
+        kind=kind,  # type: ignore[arg-type]
+        role=boundary.role,
+        confidence=confidence,
+        reason="Candidate derived from GeometrySpec boundary metadata.",
+        requires_confirmation=True,
+    )
+
+
+def generate_boundary_region_candidates(input: GenerateBoundaryRegionCandidatesInput) -> GenerateBoundaryRegionCandidatesOutput:
+    """Generate typed boundary/region label candidates for human review.
+
+    This deterministic fallback is intentionally conservative. LLM-backed
+    candidate generation should return the same output schema and still require
+    human confirmation before labels enter GeometryMeshContract.
+    """
+    geometry = input.geometry
+    boundary_candidates = [_candidate_from_boundary(boundary) for boundary in geometry.boundaries]
+    region_candidates = [
+        RegionLabelCandidate(
+            target_ids=region.entity_ids or [region.id],
+            region_id=region.id,
+            label=region.label,
+            kind=region.kind,
+            confidence=0.9 if region.entity_ids else 0.75,
+            reason="Candidate derived from GeometrySpec region metadata.",
+            requires_confirmation=True,
+        )
+        for region in geometry.regions
+    ]
+    graph_payload = _mesh_graph_payload(geometry, input.geometry_encoding)
+    if graph_payload is not None:
+        for raw_group in graph_payload.get("physical_boundary_groups", []):
+            if not isinstance(raw_group, dict):
+                continue
+            name = str(raw_group.get("name") or "boundary")
+            dimension = int(raw_group.get("dimension") or (2 if raw_group.get("face_ids") else 1))
+            weak = _weak_kind_from_group_name(name, dimension)
+            if weak is None:
+                continue
+            kind, confidence, reason = weak
+            tag = raw_group.get("tag", name)
+            boundary_candidates.append(
+                BoundaryLabelCandidate(
+                    target_ids=[f"mesh_graph:physical:{tag}"],
+                    boundary_id=f"boundary:{name}",
+                    label=name,
+                    kind=kind,  # type: ignore[arg-type]
+                    role=kind if kind in {"inlet", "outlet", "wall", "symmetry", "farfield", "interface", "periodic"} else None,  # type: ignore[arg-type]
+                    confidence=confidence,
+                    reason=reason,
+                    requires_confirmation=True,
+                )
+            )
+    if not region_candidates and geometry.dimension > 0:
+        region_kind = "fluid" if input.physics_domain == "fluid" else "solid" if input.physics_domain in {"thermal", "solid"} else "custom"
+        region_candidates.append(
+            RegionLabelCandidate(
+                target_ids=["region:domain"],
+                region_id="region:domain",
+                label="domain",
+                kind=region_kind,  # type: ignore[arg-type]
+                confidence=0.6 if geometry.source.kind == "generated" else 0.35,
+                reason="Fallback domain candidate; confirm before solver use.",
+                requires_confirmation=True,
+            )
+        )
+    warnings = []
+    if not boundary_candidates:
+        warnings.append("No boundary candidates could be inferred; use the viewer to create labels manually.")
+    return GenerateBoundaryRegionCandidatesOutput(
+        boundary_candidates=boundary_candidates,
+        region_candidates=region_candidates,
+        warnings=warnings,
+    )
 
 
 def _weak_kind_from_group_name(name: str, dimension: int) -> tuple[str, float, str] | None:
@@ -353,7 +820,8 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
     graph_payload = _mesh_graph_payload(input.geometry, input.geometry_encoding)
     selectable_groups: list[dict[str, object]] = []
     warnings: list[str] = []
-    suggestions: list[BoundaryLabelCandidate] = []
+    suggestions: list[BoundaryLabelCandidate] = list(input.boundary_candidates)
+    region_suggestions: list[RegionLabelCandidate] = list(input.region_candidates)
 
     if graph_payload is not None:
         for raw_group in graph_payload.get("physical_boundary_groups", []):
@@ -439,7 +907,9 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
         ),
         "selectable_groups": selectable_groups,
         "suggested_boundary_labels": [suggestion.model_dump() for suggestion in suggestions],
+        "suggested_region_labels": [suggestion.model_dump() for suggestion in region_suggestions],
         "confirmed_boundary_labels": [],
+        "confirmed_region_labels": [],
         "warnings": warnings,
     }
     path = output_dir / "boundary_labeling_artifact.json"
@@ -454,6 +924,7 @@ def create_boundary_labeling_artifact(input: CreateBoundaryLabelingArtifactInput
         artifact=artifact,
         selectable_groups=selectable_groups,
         suggestions=suggestions,
+        region_suggestions=region_suggestions,
         warnings=warnings,
     )
 
@@ -563,6 +1034,8 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
     pre, textarea {{ box-sizing: border-box; width: 100%; min-height: 260px; overflow: auto; border: 1px solid rgba(255,255,255,.1); border-radius: 20px; background: rgba(2,6,23,.78); color: #cbd5e1; padding: 14px; font-size: 12px; line-height: 1.55; }}
     .controls {{ display: grid; gap: 12px; margin-top: 12px; }}
     .two {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .three {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }}
+    .muted {{ color: #94a3b8; font-size: 12px; line-height: 1.5; }}
   </style>
 </head>
 <body>
@@ -583,14 +1056,26 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
       <section>
         <h2>Selectable groups</h2>
         <div class="groups" id="groups"></div>
+        <h2>Candidate labels</h2>
+        <div class="groups" id="candidates"></div>
         <div class="controls">
           <label>Label <input id="label" value="boundary" /></label>
-          <label>Kind
-            <select id="kind">
-              <option>inlet</option><option>outlet</option><option>wall</option><option>symmetry</option><option>periodic</option><option>interface</option><option>farfield</option><option selected>surface</option><option>custom</option>
-            </select>
-          </label>
+          <div class="three">
+            <label>Kind
+              <select id="kind">
+                <option>inlet</option><option>outlet</option><option>wall</option><option>symmetry</option><option>periodic</option><option>interface</option><option>farfield</option><option selected>surface</option><option>custom</option>
+              </select>
+            </label>
+            <label>Role
+              <select id="role">
+                <option value="">none</option><option>x_min</option><option>x_max</option><option>y_min</option><option>y_max</option><option>z_min</option><option>z_max</option><option>inlet</option><option>outlet</option><option>wall</option><option>symmetry</option><option>farfield</option><option>interface</option><option>periodic</option><option>custom</option>
+              </select>
+            </label>
+            <label>Confidence <input id="confidence" type="number" min="0" max="1" step="0.05" value="1" /></label>
+          </div>
           <button class="primary" id="confirm">Confirm selected group</button>
+          <button id="download" type="button">Download confirmed JSON</button>
+          <div class="muted">Browser pages cannot safely overwrite workspace files directly. Download the confirmed JSON, then use it as the labeling artifact input.</div>
         </div>
       </section>
     </div>
@@ -614,6 +1099,8 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
     const pitch = document.getElementById('pitch');
     const label = document.getElementById('label');
     const kind = document.getElementById('kind');
+    const role = document.getElementById('role');
+    const confidence = document.getElementById('confidence');
 
     function inferKind(name) {{
       const s = String(name || '').toLowerCase();
@@ -643,7 +1130,10 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
       const group = artifact.selectable_groups.find(g => g.id === id);
       label.value = group?.name || 'boundary';
       kind.value = inferKind(group?.name);
+      role.value = '';
+      confidence.value = 1;
       renderGroups();
+      renderCandidates();
       render();
     }}
     function renderGroups() {{
@@ -654,6 +1144,36 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
         button.className = 'group' + (group.id === selectedId ? ' active' : '');
         button.innerHTML = `<strong>${{group.name}}</strong><br/><small>${{group.id}}</small><br/><small>faces ${{group.face_ids?.length || 0}} · edges ${{group.edge_ids?.length || 0}}</small>`;
         button.onclick = () => selectGroup(group.id);
+        root.appendChild(button);
+      }}
+    }}
+    function applyCandidate(candidate) {{
+      if (candidate.target_ids?.length) selectedId = candidate.target_ids[0];
+      label.value = candidate.label || 'boundary';
+      kind.value = candidate.kind || inferKind(candidate.label);
+      role.value = candidate.role || '';
+      confidence.value = candidate.confidence ?? 1;
+      renderGroups();
+      renderCandidates();
+      render();
+    }}
+    function renderCandidates() {{
+      const root = document.getElementById('candidates');
+      root.innerHTML = '';
+      const candidates = artifact.suggested_boundary_labels || [];
+      if (!candidates.length) {{
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = 'No candidates are embedded in this artifact.';
+        root.appendChild(empty);
+        return;
+      }}
+      for (const candidate of candidates) {{
+        const button = document.createElement('button');
+        const active = candidate.target_ids?.includes(selectedId);
+        button.className = 'group' + (active ? ' active' : '');
+        button.innerHTML = `<strong>${{candidate.label}}</strong><br/><small>${{candidate.kind}} · ${{candidate.role || 'no role'}} · confidence ${{candidate.confidence}}</small><br/><small>${{candidate.reason || 'candidate'}}</small>`;
+        button.onclick = () => applyCandidate(candidate);
         root.appendChild(button);
       }}
     }}
@@ -690,13 +1210,23 @@ def _geometry_labeler_html(title: str, artifact_json: str) -> str:
     }}
     document.getElementById('confirm').onclick = () => {{
       if (!selectedId) return;
-      const next = {{ target_ids: [selectedId], boundary_id: `boundary:${{label.value}}`, label: label.value, kind: kind.value, confidence: 1, confirmed_by: 'user' }};
+      const next = {{ target_ids: [selectedId], boundary_id: `boundary:${{label.value}}`, label: label.value, kind: kind.value, role: role.value || null, confidence: Number(confidence.value || 1), confirmed_by: 'user' }};
       confirmed = confirmed.filter(item => !item.target_ids.includes(selectedId)).concat([next]);
       renderOutput();
     }};
+    document.getElementById('download').onclick = () => {{
+      const content = JSON.stringify({{ ...artifact, confirmed_boundary_labels: confirmed }}, null, 2);
+      const blob = new Blob([content], {{ type: 'application/json' }});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'boundary_labeling_artifact.confirmed.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    }};
     yaw.oninput = render; pitch.oninput = render;
     if (selectedId) selectGroup(selectedId);
-    renderGroups(); render(); renderOutput();
+    renderGroups(); renderCandidates(); render(); renderOutput();
   </script>
 </body>
 </html>
@@ -714,7 +1244,7 @@ def create_geometry_labeler_viewer(input: CreateGeometryLabelerViewerInput) -> C
         )
     if payload.get("schema_version") != "physicsos.boundary_labeling.v1":
         warnings.append(f"Unexpected labeling artifact schema: {payload.get('schema_version')}")
-    source_path = Path(input.labeling_artifact.uri)
+    source_path = resolve_workspace_path(input.labeling_artifact.uri, workspace=project_root())
     output_dir = source_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     viewer_path = output_dir / "geometry_labeler_viewer.html"
@@ -836,9 +1366,12 @@ def generate_geometry_encoding(input: GenerateGeometryEncodingInput) -> Generate
     encodings: list[GeometryEncoding] = []
     artifacts: list[ArtifactRef] = []
     for index, kind in enumerate(input.encodings):
-        resolution = input.resolutions[index] if index < len(input.resolutions) else [32, 32]
+        resolution = input.resolutions[index] if index < len(input.resolutions) else ([64] * max(1, input.geometry.dimension) if kind == "structured_axes" else [32, 32])
         path = output_dir / f"{kind}.json"
-        if kind == "occupancy_mask":
+        if kind == "structured_axes":
+            payload = _structured_axes_payload(input.geometry, resolution)
+            resolution = payload["resolution"]  # type: ignore[assignment]
+        elif kind == "occupancy_mask":
             nx = resolution[0] if resolution else 32
             ny = resolution[1] if len(resolution) > 1 else nx
             has_hole = any("hole" in entity.label.lower() for entity in input.geometry.entities if entity.label) or any(
@@ -1130,7 +1663,7 @@ class ExportBackendMeshOutput(StrictBaseModel):
 
 
 def _read_json_artifact(uri: str) -> dict[str, object] | None:
-    path = Path(uri)
+    path = resolve_workspace_path(uri, workspace=project_root())
     if not path.exists():
         return None
     try:
@@ -1250,6 +1783,31 @@ def export_backend_mesh(input: ExportBackendMeshInput) -> ExportBackendMeshOutpu
             "local_tool_invocation": False,
         },
         "boundary_exports": boundary_exports,
+        "facet_tag_manifest": {
+            "enabled": input.backend in {"fenicsx", "mfem"},
+            "source": "gmsh:physical facet data via mesh_graph physical_boundary_groups",
+            "tags": [
+                {
+                    "name": item.get("source_name") or item.get("backend_name"),
+                    "value": item.get("backend_id"),
+                    "region_id": item.get("region_id"),
+                    "solver_native": item.get("solver_native", {}),
+                }
+                for item in boundary_exports
+            ],
+        },
+        "patch_marker_manifest": {
+            "enabled": input.backend in {"openfoam", "su2"},
+            "source": "physical boundary groups mapped to solver-native patch/marker names",
+            "patches": [
+                {
+                    "name": item.get("backend_name"),
+                    "region_id": item.get("region_id"),
+                    "solver_native": item.get("solver_native", {}),
+                }
+                for item in boundary_exports
+            ],
+        },
         "regions": [region.model_dump() for region in input.mesh.regions],
         "warnings": warnings,
     }
@@ -1503,9 +2061,12 @@ for _tool, _input, _output in [
     (import_geometry, ImportGeometryInput, ImportGeometryOutput),
     (repair_geometry, RepairGeometryInput, RepairGeometryOutput),
     (label_regions, LabelRegionsInput, LabelRegionsOutput),
+    (build_geometry_mesh_contract, BuildGeometryMeshContractInput, BuildGeometryMeshContractOutput),
+    (mesh_semantics_gate, MeshSemanticsGateInput, MeshSemanticsGateOutput),
     (plan_geometry_mesh, GeometryMeshPlanInput, GeometryMeshPlanOutput),
     (plan_geometry_mesh_structured, GeometryMeshPlanInput, GeometryMeshPlanOutput),
     (apply_boundary_labels, ApplyBoundaryLabelsInput, ApplyBoundaryLabelsOutput),
+    (generate_boundary_region_candidates, GenerateBoundaryRegionCandidatesInput, GenerateBoundaryRegionCandidatesOutput),
     (create_boundary_labeling_artifact, CreateBoundaryLabelingArtifactInput, CreateBoundaryLabelingArtifactOutput),
     (apply_boundary_labeling_artifact, ApplyBoundaryLabelingArtifactInput, ApplyBoundaryLabelingArtifactOutput),
     (create_geometry_labeler_viewer, CreateGeometryLabelerViewerInput, CreateGeometryLabelerViewerOutput),
