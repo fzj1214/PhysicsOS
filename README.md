@@ -47,6 +47,12 @@ solver execution is not hidden behind the agent.
 
 ## Install
 
+To install:
+
+```bash
+pip install physicsos
+```
+
 From this checkout:
 
 ```bash
@@ -69,8 +75,8 @@ Set model credentials with environment variables:
 
 ```powershell
 $env:PHYSICSOS_OPENAI_API_KEY="..."
-$env:PHYSICSOS_OPENAI_BASE_URL="https://api.example.com/v1"
-$env:PHYSICSOS_OPENAI_MODEL="gpt-5.4"
+$env:PHYSICSOS_OPENAI_BASE_URL="..."
+$env:PHYSICSOS_OPENAI_MODEL="..."
 ```
 
 If your provider uses the OpenAI Responses API:
@@ -85,10 +91,10 @@ file for one-off runs.
 ```json
 {
   "model": {
-    "provider": "openai",
-    "name": "gpt-5.4",
+    "provider": "...",
+    "name": "...",
     "api_key": "",
-    "base_url": "https://api.example.com/v1",
+    "base_url": "...",
     "use_responses_api": false
   },
   "cloud": {
