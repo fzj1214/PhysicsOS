@@ -34,7 +34,7 @@ physicsos = "physicsos.cli:main"
 [project.urls]
 Homepage = "https://github.com/fzj1214/PhysicsOS"
 Repository = "https://github.com/fzj1214/PhysicsOS"
-Documentation = "https://github.com/fzj1214/PhysicsOS/blob/main/ARCHITECTURE.md"
+Documentation = "https://github.com/fzj1214/PhysicsOS#readme"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

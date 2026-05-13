@@ -30,6 +30,8 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Generated runtime artifacts
+cases/
+.tmp-build/
 scratch/
 sessions/
 *.msh
@@ -54,6 +56,10 @@ data/knowledge/papers/
 # Local-only config and generated knowledge/memory stores
 configs/*.local.json
 data/case_memory.jsonl
+
+# Root-level planning/design notes are local-only. Keep GitHub focused on README.md.
+/*.md
+!/README.md
 
 # OS/editor files
 .DS_Store
