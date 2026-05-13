@@ -1,6 +1,6 @@
 [project]
 name = "physicsos"
-version = "0.1.20"
+version = "0.1.24"
 description = "AI-native physics simulation OS with TAPS-first physics IR, solver planning, and cloud runner tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,9 @@ dependencies = [
   "rich>=13.7",
   "gmsh>=4.13",
   "meshio>=5.3",
+  "pymatgen>=2025.6",
+  "seekpath>=2.1",
+  "spglib>=2.5",
 ]
 keywords = ["physics", "simulation", "pde", "fem", "agents", "neural-operator"]
 classifiers = [

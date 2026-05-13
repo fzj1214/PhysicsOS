@@ -42,6 +42,80 @@ def _artifact(path: Path, kind: str, description: str | None = None) -> Artifact
     )
 
 
+def _ensure_workspace_path_shim(case_dir: Path) -> Path:
+    shim_dir = case_dir / ".physicsos_runtime"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim_path = shim_dir / "sitecustomize.py"
+    shim_path.write_text(
+        r'''
+from __future__ import annotations
+
+import builtins
+import os
+from pathlib import Path, PosixPath, PurePosixPath, WindowsPath
+
+_WORKSPACE = os.environ.get("PHYSICSOS_WORKSPACE")
+_PREFIX = "/workspace"
+
+
+def _translate(value):
+    if not _WORKSPACE:
+        return value
+    text = os.fspath(value)
+    normalized = text.replace("\\", "/")
+    if normalized == _PREFIX:
+        return _WORKSPACE
+    if normalized.startswith(_PREFIX + "/"):
+        suffix = normalized[len(_PREFIX) + 1 :]
+        return str(Path(_WORKSPACE).joinpath(*PurePosixPath(suffix).parts))
+    return value
+
+
+_original_open = builtins.open
+
+
+def open(file, *args, **kwargs):
+    if isinstance(file, (str, os.PathLike)):
+        file = _translate(file)
+    return _original_open(file, *args, **kwargs)
+
+
+builtins.open = open
+
+
+_original_path_new = Path.__new__
+
+
+def _path_new(cls, *args, **kwargs):
+    if args and isinstance(args[0], (str, os.PathLike)):
+        args = (_translate(args[0]), *args[1:])
+    return _original_path_new(cls, *args, **kwargs)
+
+
+Path.__new__ = staticmethod(_path_new)
+PosixPath.__new__ = staticmethod(_path_new)
+WindowsPath.__new__ = staticmethod(_path_new)
+
+
+_original_path_open = Path.open
+
+
+def _path_open(self, *args, **kwargs):
+    translated = _translate(self)
+    if translated is not self:
+        return _original_open(translated, *args, **kwargs)
+    return _original_path_open(self, *args, **kwargs)
+
+
+Path.open = _path_open
+PosixPath.open = _path_open
+WindowsPath.open = _path_open
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return shim_dir
+
+
 def _read_json(path_or_uri: str | Path) -> dict[str, object]:
     path = resolve_workspace_path(path_or_uri, workspace=_workspace())
     return json.loads(path.read_text(encoding="utf-8"))
@@ -680,6 +754,9 @@ def review_generated_taps_kernel(input: ReviewGeneratedTAPSKernelInput) -> Revie
     taps_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = resolve_workspace_path(input.kernel_uri or f"/workspace/cases/{input.case_id}/taps/kernel.py", workspace=_workspace())
     spec_path = resolve_workspace_path(input.review_spec_uri or f"/workspace/cases/{input.case_id}/taps/kernel_review_spec.json", workspace=_workspace())
+    dft_spec_path = _case_dir(input.case_id) / "taps" / "ks_dft_kernel_review_spec.json"
+    if input.review_spec_uri is None and not spec_path.exists() and dft_spec_path.exists():
+        spec_path = dft_spec_path
     text = kernel_path.read_text(encoding="utf-8") if kernel_path.exists() else ""
     missing: list[str] = []
     warnings: list[str] = []
@@ -819,8 +896,11 @@ def execute_taps_kernel(input: ExecuteTAPSKernelInput) -> ExecuteTAPSKernelOutpu
     taps_dir = case_dir / "taps"
     taps_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = resolve_workspace_path(input.kernel_uri or f"/workspace/cases/{input.case_id}/taps/kernel.py", workspace=_workspace())
+    shim_dir = _ensure_workspace_path_shim(case_dir)
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
+    env["PHYSICSOS_WORKSPACE"] = str(_workspace())
+    env["PYTHONPATH"] = str(shim_dir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     started = perf_counter()
     try:
         completed = subprocess.run(
@@ -838,6 +918,7 @@ def execute_taps_kernel(input: ExecuteTAPSKernelInput) -> ExecuteTAPSKernelOutpu
     log_payload = {
         "schema_version": "physicsos.taps_kernel_execution_log.v1",
         "kernel": to_agent_path(kernel_path, workspace=_workspace()),
+        "workspace_path_shim": to_agent_path(shim_dir / "sitecustomize.py", workspace=_workspace()),
         "returncode": completed.returncode,
         "timed_out": timed_out,
         "wall_time_seconds": perf_counter() - started,

@@ -17,19 +17,64 @@ from physicsos.cloud.auth import start_device_login
 from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
-from physicsos.config import load_config, runtime_paths
+from physicsos.config import config_path, load_config, runtime_paths, save_config
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import GeometrySpec
 from physicsos.tools.geometry_tools import ApplyBoundaryLabelingArtifactInput, apply_boundary_labeling_artifact
+from physicsos.tools.pseudopotential_tools import (
+    IndexVaspPawPbeLibraryInput,
+    SelectPseudopotentialsForStructureInput,
+    index_vasp_paw_pbe_library,
+    select_pseudopotentials_for_structure,
+)
 
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "legacy-repl"}
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl"}
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _quote_shell_path(path: Path) -> str:
+    value = str(path)
+    if os.name == "nt":
+        return '"' + value.replace('"', '\\"') + '"'
+    return shlex.quote(value)
+
+
+def _translate_workspace_paths_for_shell(command: str, workspace: str | Path) -> str:
+    """Translate agent-facing /workspace paths inside shell commands."""
+    root = Path(workspace).resolve()
+    marker = "/workspace"
+    result: list[str] = []
+    index = 0
+    length = len(command)
+    while index < length:
+        found = command.find(marker, index)
+        if found == -1:
+            result.append(command[index:])
+            break
+        before = command[found - 1] if found > 0 else ""
+        after_index = found + len(marker)
+        after = command[after_index] if after_index < length else ""
+        if before not in {"", " ", "\t", "\n", "\r", "\"", "'", "=", "(", "[", "{"} or after not in {"", "/", "\\", " ", "\t", "\n", "\r", "\"", "'", ")", "]", "}"}:
+            result.append(command[index : after_index])
+            index = after_index
+            continue
+
+        end = after_index
+        while end < length and command[end] not in " \t\r\n\"'`|&;<>()[]{}":
+            end += 1
+        raw_path = command[found:end]
+        suffix = raw_path.removeprefix(marker).lstrip("/\\")
+        native_path = root / Path(*suffix.replace("\\", "/").split("/")) if suffix else root
+        result.append(command[index:found])
+        result.append(_quote_shell_path(native_path))
+        index = end
+    return "".join(result)
 
 
 def _physicsos_banner() -> str:
@@ -119,6 +164,17 @@ def _patch_deepagents_workspace_paths() -> None:
             exec(compile(textwrap.dedent(source.replace(old, new, 1)), "<physicsos_deepagents_shell_utf8_patch>", "exec"), namespace)
             namespace["execute"]._physicsos_utf8_shell = True  # type: ignore[attr-defined]
             LocalShellBackend.execute = namespace["execute"]
+
+    if LocalShellBackend is not None and not getattr(LocalShellBackend.execute, "_physicsos_workspace_shell_paths", False):
+        original_execute = LocalShellBackend.execute
+
+        def execute_with_workspace_shell_paths(self, command: str, *, timeout: int | None = None):  # type: ignore[no-untyped-def]
+            workspace = os.environ.get("PHYSICSOS_WORKSPACE") or str(getattr(self, "cwd", runtime_paths().workspace))
+            translated = _translate_workspace_paths_for_shell(command, workspace)
+            return original_execute(self, translated, timeout=timeout)
+
+        execute_with_workspace_shell_paths._physicsos_workspace_shell_paths = True  # type: ignore[attr-defined]
+        LocalShellBackend.execute = execute_with_workspace_shell_paths
 
     original_get_system_prompt = cli_agent.get_system_prompt
     if not getattr(original_get_system_prompt, "_physicsos_workspace_paths", False):
@@ -557,7 +613,7 @@ def _prepare_deepagents_env() -> None:
         os.environ["OPENAI_BASE_URL"] = str(base_url)
     if model:
         os.environ["PHYSICSOS_OPENAI_MODEL"] = str(model)
-    workspace = runtime_paths().workspace
+    workspace = Path.cwd()
     existing_workspace = os.environ.get("PHYSICSOS_WORKSPACE")
     existing_auto_workspace = (
         existing_workspace is not None
@@ -652,6 +708,59 @@ def _paths_payload() -> dict[str, str]:
         "scratch": str(paths.scratch),
         "case_memory": str(paths.case_memory),
         "knowledge_base": str(paths.knowledge_base),
+    }
+
+
+def _pseudopotential_config_payload() -> dict[str, object]:
+    config = load_config(create=True)
+    section = config.get("pseudopotentials", {})
+    if not isinstance(section, dict):
+        section = {}
+    default_library_id = section.get("default_library_id")
+    env_root = os.environ.get("PHYSICSOS_PSEUDOPOTENTIAL_DIR")
+    return {
+        "config_json": str(config_path()),
+        "env_override": {
+            "PHYSICSOS_PSEUDOPOTENTIAL_DIR": env_root,
+            "active": bool(env_root),
+        },
+        "default_library_id": default_library_id,
+        "libraries": section.get("libraries", {}),
+        "resolution_order": [
+            "tool input library_root",
+            "PHYSICSOS_PSEUDOPOTENTIAL_DIR",
+            "~/.physicsos/config.json pseudopotentials.libraries.<id>.root",
+        ],
+        "legal_note": "PhysicsOS stores POTCAR metadata, hashes, paths, and provenance only; it does not copy or redistribute POTCAR contents.",
+    }
+
+
+def _set_pseudopotential_root(*, library_id: str, library_type: str, root: str, description: str | None = None, make_default: bool = True) -> dict[str, object]:
+    config = load_config(create=True)
+    section = config.setdefault("pseudopotentials", {})
+    if not isinstance(section, dict):
+        section = {}
+        config["pseudopotentials"] = section
+    libraries = section.setdefault("libraries", {})
+    if not isinstance(libraries, dict):
+        libraries = {}
+        section["libraries"] = libraries
+    entry = libraries.setdefault(library_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        libraries[library_id] = entry
+    entry["type"] = library_type
+    entry["root"] = str(Path(root).expanduser())
+    entry["description"] = description or entry.get("description") or "Local pseudopotential library. Stores metadata/provenance only in case artifacts."
+    if make_default:
+        section["default_library_id"] = library_id
+    saved = save_config(config)
+    return {
+        "config_json": str(saved),
+        "library_id": library_id,
+        "type": library_type,
+        "root": entry["root"],
+        "default_library_id": section.get("default_library_id"),
     }
 
 
@@ -838,6 +947,31 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("paths")
     sub.add_parser("legacy-repl")
 
+    pseudopotentials = sub.add_parser("pseudopotentials", aliases=["pp"])
+    pp_sub = pseudopotentials.add_subparsers(dest="pseudopotentials_command", required=True)
+    pp_sub.add_parser("config")
+    pp_set_root = pp_sub.add_parser("set-root")
+    pp_set_root.add_argument("root")
+    pp_set_root.add_argument("--library-id", default="vasp-paw-pbe")
+    pp_set_root.add_argument("--type", default="vasp_paw_pbe")
+    pp_set_root.add_argument("--description")
+    pp_set_root.add_argument("--no-default", action="store_true")
+    pp_index = pp_sub.add_parser("index")
+    pp_index.add_argument("--case-id", default="pseudopotential-index")
+    pp_index.add_argument("--library-id")
+    pp_index.add_argument("--root")
+    pp_index.add_argument("--max-entries", type=int)
+    pp_select = pp_sub.add_parser("select")
+    pp_select.add_argument("--case-id", required=True)
+    pp_select.add_argument("--structure-ref", required=True)
+    pp_select.add_argument("--index-ref")
+    pp_select.add_argument("--library-id")
+    pp_select.add_argument("--root")
+    pp_select.add_argument("--preference", choices=["standard", "pv", "sv", "any"], default="standard")
+    pp_select.add_argument("--variant", action="append", default=[], help="Element=Variant override, for example Si=Si_GW.")
+    pp_select.add_argument("--allow-gw", action="store_true")
+    pp_select.add_argument("--allow-hard-soft", action="store_true")
+
     geometry = sub.add_parser("geometry")
     geometry_sub = geometry.add_subparsers(dest="geometry_command", required=True)
     apply_labels = geometry_sub.add_parser("apply-boundary-labels")
@@ -882,6 +1016,83 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "paths":
         _print_json(_paths_payload())
         return 0
+
+    if args.command in {"pseudopotentials", "pp"}:
+        if args.pseudopotentials_command == "config":
+            _print_json(_pseudopotential_config_payload())
+            return 0
+        if args.pseudopotentials_command == "set-root":
+            _print_json(
+                _set_pseudopotential_root(
+                    library_id=args.library_id,
+                    library_type=args.type,
+                    root=args.root,
+                    description=args.description,
+                    make_default=not args.no_default,
+                )
+            )
+            return 0
+        if args.pseudopotentials_command == "index":
+            result = index_vasp_paw_pbe_library(
+                IndexVaspPawPbeLibraryInput(
+                    case_id=args.case_id,
+                    library_root=args.root,
+                    library_id=args.library_id,
+                    max_entries=args.max_entries,
+                )
+            )
+            if result.errors:
+                _print_json({"errors": result.errors, "warnings": result.warnings})
+                return 1
+            _print_json(
+                {
+                    "artifact": result.artifact.model_dump() if result.artifact else None,
+                    "entry_count": result.data.get("entry_count"),
+                    "elements": result.data.get("elements"),
+                    "library_id": result.data.get("library_id"),
+                    "library_root": result.data.get("library_root"),
+                    "library_root_source": result.data.get("library_root_source"),
+                    "warnings": result.warnings,
+                    "legal_note": result.data.get("legal_note"),
+                }
+            )
+            return 0
+        if args.pseudopotentials_command == "select":
+            overrides: dict[str, str] = {}
+            for raw in args.variant:
+                if "=" not in raw:
+                    parser.error("--variant must use Element=Variant form")
+                element, variant = raw.split("=", 1)
+                if not element or not variant:
+                    parser.error("--variant must use Element=Variant form")
+                overrides[element] = variant
+            result = select_pseudopotentials_for_structure(
+                SelectPseudopotentialsForStructureInput(
+                    case_id=args.case_id,
+                    structure_ref=args.structure_ref,
+                    index_ref=args.index_ref,
+                    library_root=args.root,
+                    library_id=args.library_id,
+                    preference=args.preference,
+                    variant_overrides=overrides,
+                    allow_gw=args.allow_gw,
+                    allow_hard_soft=args.allow_hard_soft,
+                )
+            )
+            if result.errors:
+                _print_json({"errors": result.errors, "warnings": result.warnings})
+                return 1
+            _print_json(
+                {
+                    "artifact": result.artifact.model_dump() if result.artifact else None,
+                    "artifacts": {key: artifact.model_dump() for key, artifact in result.artifacts.items()},
+                    "total_valence_electrons": result.data.get("total_valence_electrons"),
+                    "recommended_encut_eV": result.data.get("recommended_encut_eV"),
+                    "selected": result.data.get("selected"),
+                    "warnings": result.warnings,
+                }
+            )
+            return 0
 
     if args.command == "geometry":
         if args.geometry_command == "apply-boundary-labels":

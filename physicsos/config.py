@@ -30,21 +30,11 @@ def physicsos_home() -> Path:
 def project_root() -> Path:
     workspace_override = os.environ.get("PHYSICSOS_WORKSPACE")
     if workspace_override:
-        auto_value = os.environ.get("PHYSICSOS_WORKSPACE_AUTO_VALUE")
-        is_auto_workspace = (
-            os.environ.get("PHYSICSOS_WORKSPACE_SOURCE") == "physicsos_cli_auto"
-            and auto_value is not None
-            and Path(workspace_override).expanduser() == Path(auto_value).expanduser()
-        )
-        if is_auto_workspace and os.environ.get("PHYSICSOS_HOME"):
-            return physicsos_home()
         return Path(workspace_override).expanduser()
-    if os.environ.get("PHYSICSOS_HOME"):
-        return physicsos_home()
     package_parent = Path(__file__).resolve().parents[1]
     if (package_parent / "pyproject.toml").exists() and (package_parent / "physicsos").is_dir():
         return package_parent
-    return physicsos_home()
+    return Path.cwd()
 
 
 def runtime_paths() -> RuntimePaths:
@@ -88,6 +78,16 @@ def default_config() -> dict[str, Any]:
             "scratch": "scratch",
             "case_memory": "data/case_memory.jsonl",
             "knowledge_base": "data/knowledge/physicsos_knowledge.sqlite",
+        },
+        "pseudopotentials": {
+            "default_library_id": "vasp-paw-pbe",
+            "libraries": {
+                "vasp-paw-pbe": {
+                    "type": "vasp_paw_pbe",
+                    "root": "",
+                    "description": "Local VASP PAW PBE POTCAR library. Stores metadata/provenance only in case artifacts.",
+                }
+            },
         },
         "ui": {
             "launcher": "deepagents-cli",

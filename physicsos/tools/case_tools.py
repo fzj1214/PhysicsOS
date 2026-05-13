@@ -33,6 +33,14 @@ REFERENCE_FILENAMES = [
     "ibm_ife_geometry_embedding.md",
 ]
 
+KS_DFT_REFERENCE_FILENAMES = [
+    "materials_tool_contract.md",
+    "ks_dft_formula_notes.md",
+    "ks_tensor_basis_notes.md",
+    "chefsi_notes.md",
+    "lrdm_scf_notes.md",
+]
+
 
 class CreateCaseWorkspaceInput(StrictBaseModel):
     case_id: str | None = None
@@ -317,6 +325,7 @@ def _read_manifest(manifest_path: Path, case_id: str) -> dict[str, object]:
 class LoadTAPSCaseReferencesInput(StrictBaseModel):
     case_id: str
     include_geometry_embedding: bool = True
+    include_ks_dft: bool = False
 
 
 class LoadTAPSCaseReferencesOutput(StrictBaseModel):
@@ -338,6 +347,8 @@ def load_taps_case_references(input: LoadTAPSCaseReferencesInput) -> LoadTAPSCas
     filenames = list(REFERENCE_FILENAMES)
     if not input.include_geometry_embedding:
         filenames.remove("ibm_ife_geometry_embedding.md")
+    if input.include_ks_dft:
+        filenames.extend(KS_DFT_REFERENCE_FILENAMES)
 
     artifacts: list[ArtifactRef] = []
     warnings: list[str] = []
@@ -469,6 +480,7 @@ class BuildPaperContextWindowInput(StrictBaseModel):
     case_id: str
     user_prompt: str | None = None
     include_geometry_embedding: bool = True
+    include_ks_dft_materials: bool = False
 
 
 class BuildPaperContextWindowOutput(StrictBaseModel):
@@ -505,6 +517,8 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
     ]
     if input.include_geometry_embedding:
         references.append(case_dir / "references" / "ibm_ife_geometry_embedding.md")
+    if input.include_ks_dft_materials:
+        references.extend(case_dir / "references" / filename for filename in KS_DFT_REFERENCE_FILENAMES)
 
     sections = [
         _context_artifact("analysis files", case_dir / "problem" / "problem_statement.md", "Current PDE/problem statement prepared from user inputs."),
@@ -518,6 +532,25 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
                 _context_artifact("analysis files", case_dir / "geometry" / "taps_geometry_context.md", "Geometry analysis-file input containing phi, chi, normals, samples, and cut-cell guidance."),
                 _context_artifact("analysis files", case_dir / "geometry" / "taps_geometry_handoff.md", "Geometry handoff describing how derivation, implementation, and verification agents should consume STL/CAD embedding artifacts."),
                 _context_artifact("analysis files", case_dir / "geometry" / "sdf_quality.json", "SDF/voxelization quality report; required before trusting fallback geometry artifacts."),
+            ]
+        )
+    if input.include_ks_dft_materials:
+        sections.extend(
+            [
+                _context_artifact("analysis files", case_dir / "materials" / "ks_dft_material_context.md", "Material-tool contract for KS-DFT-TAPS derivation; fixes standardized structure, reciprocal lattice, symmetry, and k-point artifacts."),
+                _context_artifact("analysis files", case_dir / "materials" / "ks_dft_material_context.json", "Machine-readable KS-DFT material context."),
+                _context_artifact("analysis files", case_dir / "materials" / "structure_standardized.json", "pymatgen-standardized structure; the only structure source for KS-DFT-TAPS derivation."),
+                _context_artifact("analysis files", case_dir / "materials" / "symmetry_dataset.json", "spglib/pymatgen symmetry dataset; do not recompute in prompt."),
+                _context_artifact("analysis files", case_dir / "materials" / "reciprocal_lattice.json", "Reciprocal lattice with explicit convention."),
+                _context_artifact("analysis files", case_dir / "materials" / "kmesh.json", "Uniform k-point mesh policy from deterministic materials tools."),
+                _context_artifact("analysis files", case_dir / "materials" / "irreducible_kpoints.json", "Irreducible k-points and weights from spglib."),
+                _context_artifact("analysis files", case_dir / "materials" / "kpath_seekpath.json", "SeekPath high-symmetry line path for post-SCF band path use."),
+                _context_artifact("analysis files", case_dir / "materials" / "molecule.json", "Molecule/cluster Cartesian coordinates with explicit charge and multiplicity."),
+                _context_artifact("analysis files", case_dir / "materials" / "ks_dft_molecular_context.md", "Molecular KS-DFT context with open-boundary/vacuum-box policy gates."),
+                _context_artifact("analysis files", case_dir / "materials" / "ks_dft_molecular_context.json", "Machine-readable molecular KS-DFT context."),
+                _context_artifact("analysis files", case_dir / "taps" / "molecular_taps_scaling_policy.json", "LLM-selectable large-molecule TAPS scaling strategy contract."),
+                _context_artifact("analysis files", case_dir / "problem" / "ks_dft_problem.json", "KS-DFT-TAPS problem specification."),
+                _context_artifact("analysis files", case_dir / "problem" / "ks_dft_open_questions.md", "Missing KS-DFT assumptions and material inputs."),
             ]
         )
     sections.extend(
@@ -592,6 +625,23 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
                 "For STL/CAD cases, geometry embedding is an analysis-file extension before TAPS derivation: STL or generated primitive -> Gmsh preprocessing -> Cartesian background grid -> SDF/occupancy/boundary samples/normals/cut cells -> SDF quality report -> geometry notes -> geometry handoff. Gmsh is not used as the PDE solver.",
                 "",
                 "The geometry handoff is intentionally strong: it tells the derivation agent how geometry enters the weak form, the implementation agent which artifacts to load and validate, and the verification agent which geometry evidence to report. It still remains inside the paper-style TAPS prompt-engineering loop.",
+                "",
+            ]
+        )
+    if input.include_ks_dft_materials:
+        lines.extend(
+            [
+                "KS-DFT-TAPS Materials Extension",
+                "",
+                "For KS-DFT-TAPS cases, materials preprocessing is a deterministic tool layer before derivation. For crystals, use pymatgen/seekpath/spglib artifacts for structure, symmetry, reciprocal lattice, irreducible k-points, and high-symmetry paths. For molecules/clusters, use `molecule.json`, `ks_dft_molecular_context.json`, and `molecular_taps_scaling_policy.json` for charge, multiplicity, boundary policy, and large-system strategy selection. The derivation agent must not invent or recompute those quantities.",
+                "",
+                "Required KS-DFT hard rules:",
+                "- Read `/workspace/cases/{}/materials/ks_dft_material_context.md` for crystal cases or `/workspace/cases/{}/materials/ks_dft_molecular_context.md` for molecule/cluster cases before deriving.".format(input.case_id, input.case_id),
+                "- For crystals, use `structure_standardized.json` as the only structure source.",
+                "- For crystals, use `kmesh.json` and `irreducible_kpoints.json` for Brillouin-zone integration.",
+                "- For crystals, use `kpath_seekpath.json` only for line-mode band path after SCF verification.",
+                "- For molecules/clusters, do not silently reuse crystal kmesh/kpath logic; finalize open-boundary or explicit vacuum-box policy first.",
+                "- If required material artifacts are missing, request `materials-preprocess-agent`.",
                 "",
             ]
         )

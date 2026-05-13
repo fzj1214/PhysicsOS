@@ -125,6 +125,7 @@ Responsibilities:
 - Delegate work to subagents.
 - Retry derivation or implementation when verification fails.
 - Never call the old typed LangGraph workflow.
+- Expose only paper-route bridge tools to the main agent: case creation, stage status, reference loading, context-window building, and derivation-prompt building.
 
 ### analysis-file-agent
 
@@ -142,6 +143,8 @@ Responsibilities:
 /cases/<case_id>/problem/open_questions.md
 ```
 
+Domain tools: stage status plus optional local knowledge/case-memory lookup. Use DeepAgents filesystem tools for reading and writing problem artifacts.
+
 ### geometry-embedding-agent
 
 Role: PhysicsOS extension for CAD/STL geometry.
@@ -158,6 +161,7 @@ Responsibilities:
 - Write geometry notes for the derivation prompt.
 - Write a geometry handoff that tells the derivation, implementation, and verification agents how to consume STL/CAD embedding artifacts inside the paper-style TAPS loop.
 - Do not solve the PDE.
+- Domain tools: only the STL/Gmsh/background-grid/SDF/voxel/embedding tools plus optional local knowledge lookup. Legacy mesh-backend/export/labeling workflow tools are not part of this subagent surface.
 
 Outputs:
 
@@ -190,6 +194,7 @@ Responsibilities:
 - Explicitly derive the weak form, C-HiDeNN-TD approximation, and every subspace iteration.
 - For STL geometry, show how `phi(x)`, `chi(x)`, boundary samples, normals, and cut cells enter coefficient or boundary matrices.
 - Read `/geometry/taps_geometry_handoff.md` when present so geometry coupling is propagated into the derivation rather than left as generic notes.
+- Domain tools: derivation-prompt builder, local knowledge context, geometry-readiness assessment, derivation summary, and paper-route TAPS problem manifest. Use DeepAgents filesystem tools for derivation files.
 
 Outputs:
 
@@ -211,6 +216,7 @@ Responsibilities:
 - Read `/geometry/taps_geometry_handoff.md` when present and load/validate the listed geometry artifacts case-locally.
 - Write executable code only for the current case.
 - If derivation or physics inputs are missing, fail clearly instead of inventing a result.
+- Domain tools: prompt package/scaffold generation, static check, case-local spec review, and execution of generated `kernel.py`. Do not expose support estimators, backend bundle tools, or old runtime-extension helpers to this subagent.
 
 Outputs:
 
@@ -246,6 +252,7 @@ Responsibilities:
 - For geometry cases, report which geometry artifacts are present and whether boundary/SDF evidence exists; do not treat preprocessing as numerical verification.
 - Plot results.
 - Report whether code should be accepted or revised.
+- Domain tools: only the Fig. 7 chain plus stage status. Additional residual/conservation/OOD helper tools are not exposed in the DeepAgents subagent surface unless they become part of a paper-derived verification prompt.
 
 Outputs:
 
@@ -267,6 +274,7 @@ Responsibilities:
 
 - Plot final fields and convergence/residual figures.
 - Write assumptions, evidence, warnings, and recommendations.
+- Domain tools: KPI extraction, visualization generation, and report writing. Planning should be handled in the agent prompt/files, not by a deterministic postprocess planner tool.
 
 ## 6. Geometry Extension
 
@@ -396,3 +404,5 @@ The handoff must explicitly cover:
 [done] Add a strong geometry handoff so STL/CAD embedding artifacts are propagated into derivation, implementation, and verification responsibilities while staying inside the paper-style TAPS prompt-engineering loop.
 
 [done] Add visible case-stage status maintenance through `update_case_stage_status`, keeping `[done]/[todo]` markers in `execution_plan.md` without reintroducing a workflow engine.
+
+[done] Prune DeepAgents subagent PhysicsOS tool surfaces to the minimum paper-route responsibilities while retaining DeepAgents native filesystem/shell tools through middleware.
