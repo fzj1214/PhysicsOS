@@ -7,6 +7,7 @@
 *.crt
 
 # Python caches and build outputs
+.venv/
 __pycache__/
 *.py[cod]
 *.pyo

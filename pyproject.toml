@@ -1,6 +1,6 @@
 [project]
 name = "physicsos"
-version = "0.1.24"
+version = "0.1.27"
 description = "AI-native physics simulation OS with TAPS-first physics IR, solver planning, and cloud runner tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,7 +8,8 @@ dependencies = [
   "pydantic>=2.7",
   "numpy>=1.26",
   "deepagents",
-  "deepagents-cli>=0.0.46",
+  # The CLI integration patches private APIs from this release.
+  "deepagents-cli==0.0.46",
   "langgraph",
   "langchain-openai",
   "rich>=13.7",
@@ -56,3 +57,6 @@ testpaths = ["tests"]
 [tool.setuptools.packages.find]
 include = ["physicsos*"]
 exclude = ["runners*", "data*", "models*", "configs*", "scratch*", "docs*", "scripts*", "tests*", "examples*"]
+
+[tool.setuptools.package-data]
+physicsos = ["references/*.md"]

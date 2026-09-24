@@ -98,20 +98,36 @@ integration.
 Install from PyPI:
 
 ```bash
-pip install physicsos
+python -m pip install --upgrade physicsos
+physicsos
 ```
 
-Install from this checkout:
+Use Python 3.12 or newer. If your system Python is managed by the OS, create and
+activate a virtual environment first (`python3.12 -m venv .venv`, then
+`source .venv/bin/activate` on macOS/Linux, or `.venv\Scripts\Activate.ps1` in
+PowerShell).
+
+Install the current code from this checkout:
 
 ```bash
-pip install -e .
+python -m pip install .
+physicsos --version
+physicsos
 ```
 
-For development utilities:
+For development utilities and installation regression tests:
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
+python -m pytest
 ```
+
+`physicsos` is installed into the same Python environment as pip. If the shell
+cannot find the command, activate that environment or use `python -m physicsos`.
+The DeepAgents CLI version is pinned because PhysicsOS integrates with its
+internal TUI/server interfaces; installing a different version separately can
+break startup. Its automatic update checks are disabled inside PhysicsOS; upgrade
+PhysicsOS itself with pip. TAPS and KS-DFT reference files are bundled in the Python package.
 
 Requirements:
 
@@ -121,6 +137,14 @@ Requirements:
 - Optional PhysicsOS Cloud / foamvm account for remote runner commands
 
 ### Configure A Model
+
+macOS/Linux:
+
+```bash
+export PHYSICSOS_OPENAI_API_KEY="..."
+export PHYSICSOS_OPENAI_BASE_URL="https://api.example.com/v1"
+export PHYSICSOS_OPENAI_MODEL="gpt-5.4"
+```
 
 PowerShell:
 
@@ -137,7 +161,10 @@ $env:PHYSICSOS_OPENAI_USE_RESPONSES_API="true"
 ```
 
 PhysicsOS also writes a local config file under the active PhysicsOS home directory.
-Environment variables override config values for one-off runs.
+Environment variables override config values for one-off runs. You can also put
+the `PHYSICSOS_*` settings in a `.env` file in the directory where you launch
+`physicsos`; existing environment variables take precedence. A model API key is
+needed for agent requests, but not for `physicsos paths` or `physicsos --help`.
 
 ```json
 {
@@ -164,8 +191,10 @@ physicsos
 Run a single request:
 
 ```bash
-physicsos --message "derive and verify a 1D steady heat conduction TAPS case"
+physicsos --non-interactive "derive and verify a 1D steady heat conduction TAPS case"
 ```
+
+Use `--message` instead to start the interactive UI with an initial request.
 
 Resume a previous interactive session:
 
@@ -234,17 +263,19 @@ implementation notes, generated kernels, and verification outputs.
 
 ### Runtime Data
 
-Set `PHYSICSOS_HOME` to control where runtime state is stored. Without it, installed
-usage stores data under `~/.physicsos/`; source-checkout usage keeps development state in
-the repository workspace.
+Set `PHYSICSOS_HOME` to control where configuration is stored (default:
+`~/.physicsos/`). Installed usage writes case artifacts and runtime data to the
+current workspace; set `PHYSICSOS_WORKSPACE` to use another directory. Source-checkout
+local commands default to the repository workspace; the interactive agent uses the
+directory where it was launched.
 
 ```text
 config        ~/.physicsos/config.json
-sessions      ~/.physicsos/sessions/
-history       ~/.physicsos/history.jsonl
-scratch       ~/.physicsos/scratch/
-case memory   ~/.physicsos/data/case_memory.jsonl
-knowledge DB  ~/.physicsos/data/knowledge/physicsos_knowledge.sqlite
+sessions      <workspace>/sessions/
+history       <workspace>/history.jsonl
+scratch       <workspace>/scratch/
+case memory   <workspace>/data/case_memory.jsonl
+knowledge DB  <workspace>/data/knowledge/physicsos_knowledge.sqlite
 ```
 
 Print the exact active paths:
@@ -319,20 +350,34 @@ TAPS 推导
 从 PyPI 安装：
 
 ```bash
-pip install physicsos
+python -m pip install --upgrade physicsos
+physicsos
 ```
 
-从当前源码目录安装：
+需要 Python 3.12 或更新版本。如果系统 Python 不允许直接安装包，先运行
+`python3.12 -m venv .venv` 创建虚拟环境，然后在 macOS/Linux 上运行
+`source .venv/bin/activate`，或在 PowerShell 中运行 `.venv\Scripts\Activate.ps1`。
+
+从当前源码目录安装最新代码：
 
 ```bash
-pip install -e .
+python -m pip install .
+physicsos --version
+physicsos
 ```
 
-开发工具：
+开发工具与安装回归测试：
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
+python -m pytest
 ```
+
+命令安装在 pip 所属的 Python 环境中。如果提示找不到 `physicsos`，请先激活
+对应环境，或者运行 `python -m physicsos`。PhysicsOS 依赖 DeepAgents CLI 的内部
+TUI/服务端接口，因此固定了兼容版本；单独升级 DeepAgents CLI 可能导致启动失败。
+PhysicsOS 启动时禁用内嵌 CLI 的自动更新检查，后续请通过 pip 升级 PhysicsOS。
+TAPS 和 KS-DFT 参考文件已包含在 Python 安装包中。
 
 需要：
 
@@ -342,6 +387,14 @@ pip install -e ".[dev]"
 - 如需远端运行，准备 PhysicsOS Cloud / foamvm 账号
 
 ### 配置模型
+
+macOS/Linux：
+
+```bash
+export PHYSICSOS_OPENAI_API_KEY="..."
+export PHYSICSOS_OPENAI_BASE_URL="https://api.example.com/v1"
+export PHYSICSOS_OPENAI_MODEL="gpt-5.4"
+```
 
 PowerShell:
 
@@ -357,6 +410,10 @@ $env:PHYSICSOS_OPENAI_MODEL="gpt-5.4"
 $env:PHYSICSOS_OPENAI_USE_RESPONSES_API="true"
 ```
 
+也可以在启动 `physicsos` 的目录放置 `.env` 文件，填写上述 `PHYSICSOS_*` 配置。
+已有环境变量优先于 `.env`，两者都优先于 `~/.physicsos/config.json`。
+Agent 请求需要模型 API Key；`physicsos paths`、`physicsos --help` 不需要。
+
 ### 启动
 
 ```bash
@@ -366,8 +423,10 @@ physicsos
 单次请求：
 
 ```bash
-physicsos --message "为一维稳态热传导问题推导并验证 TAPS case"
+physicsos --non-interactive "为一维稳态热传导问题推导并验证 TAPS case"
 ```
+
+如果要打开交互界面并自动提交首条请求，请使用 `--message`。
 
 恢复会话：
 
@@ -413,4 +472,3 @@ physicsos pseudopotentials select --case-id si-case --structure-ref cases/si/str
 ### 当前状态
 
 PhysicsOS 仍处于 alpha 阶段。它适合研究、原型、方法验证和可审计的 AI-CAE 工作流实验。它不是认证工程软件，也不会绕过人工检查。这里的核心价值不是“自动给出一个神奇答案”，而是把推导、实现、验证和假设完整摊开，让用户能看见每一步。
-

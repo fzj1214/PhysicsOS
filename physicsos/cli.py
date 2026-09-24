@@ -17,7 +17,7 @@ from physicsos.cloud.auth import start_device_login
 from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
-from physicsos.config import config_path, load_config, runtime_paths, save_config
+from physicsos.config import config_path, load_config, load_env_file, runtime_paths, save_config
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import GeometrySpec
@@ -571,8 +571,12 @@ def _deepagents_model_params_args(argv: list[str]) -> list[str]:
 
 
 def _prepare_deepagents_env() -> None:
+    # Read PhysicsOS-prefixed settings before DeepAgents snapshots its environment.
+    load_env_file()
     os.environ["PYTHONUTF8"] = "1"
     os.environ["PYTHONIOENCODING"] = "utf-8"
+    # Upgrading the embedded CLI independently would break our pinned integration.
+    os.environ["DEEPAGENTS_CLI_NO_UPDATE_CHECK"] = "1"
     temp_dir = runtime_paths().scratch / "tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
     current_temp = str(os.getenv("TEMP") or os.getenv("TMP") or "")
@@ -931,6 +935,11 @@ def _interactive(agent: object | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    if argv in (["-v"], ["--version"]):
+        from physicsos import __version__
+
+        print(f"physicsos {__version__}")
+        return 0
     if not argv or argv[0] not in LOCAL_COMMANDS:
         return _launch_deepagents_cli(argv)
 

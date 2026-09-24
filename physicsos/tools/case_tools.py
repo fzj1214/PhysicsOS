@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
-from shutil import copyfile
 from typing import Literal
 
 from pydantic import Field
@@ -334,8 +335,8 @@ class LoadTAPSCaseReferencesOutput(StrictBaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def _reference_source_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "docs" / "knowledge_seed" / "references"
+def _reference_source_dir() -> Traversable:
+    return files("physicsos").joinpath("references")
 
 
 def load_taps_case_references(input: LoadTAPSCaseReferencesInput) -> LoadTAPSCaseReferencesOutput:
@@ -355,8 +356,8 @@ def load_taps_case_references(input: LoadTAPSCaseReferencesInput) -> LoadTAPSCas
     for filename in filenames:
         source = source_dir / filename
         target = references_dir / filename
-        if source.exists():
-            copyfile(source, target)
+        if source.is_file():
+            target.write_bytes(source.read_bytes())
         else:
             warnings.append(f"Reference source is missing: {source}")
             target.write_text(f"# {filename}\n\nReference source missing in this installation.\n", encoding="utf-8")
