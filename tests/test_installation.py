@@ -72,7 +72,35 @@ def test_installed_help_uses_compatible_deepagents(
     result = run(console_script(installed_package), "--help", cwd=tmp_path, env=installed_env)
     assert "--model" in result.stdout
     assert "--resume" in result.stdout
+    assert "physicsos config" in result.stdout
+    assert "/settings" in result.stdout
     assert "Traceback" not in result.stderr
+    # Exercise the embedded CLI too; the root help now belongs to PhysicsOS.
+    run(console_script(installed_package), "--model=openai:gpt-5.4", "--help", cwd=tmp_path, env=installed_env)
+
+
+def test_unconfigured_noninteractive_launch_explains_how_to_configure(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [console_script(installed_package), "--non-interactive", "hello"],
+        cwd=tmp_path, env=installed_env, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 2
+    assert "physicsos config" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_installed_config_status_does_not_expose_api_key(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    key = "config-status-test-secret"
+    result = run(
+        console_script(installed_package), "config", "--show", cwd=tmp_path,
+        env={**installed_env, "OPENAI_API_KEY": key},
+    )
+    assert json.loads(result.stdout)["api_key_configured"] is True
+    assert key not in result.stdout + result.stderr
 
 
 def test_installed_paths_use_callers_workspace(

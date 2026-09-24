@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
@@ -60,7 +61,7 @@ def default_config() -> dict[str, Any]:
             "provider": "openai",
             "name": "gpt-5.4",
             "api_key": "",
-            "base_url": "https://api.tu-zi.com/v1",
+            "base_url": "https://api.openai.com/v1",
             "use_responses_api": False,
         },
         "cloud": {
@@ -155,7 +156,17 @@ def load_config(path: str | Path | None = None, *, create: bool = True) -> dict[
 def save_config(config: dict[str, Any], path: str | Path | None = None) -> Path:
     target = Path(path).expanduser() if path is not None else config_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(_merge_defaults(config, default_config()), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Config contains credentials: write privately and replace atomically.
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(_merge_defaults(config, default_config()), handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return target
 
 

@@ -104,7 +104,7 @@ def create_openai_structured_client() -> StructuredLLMClient:
     api_key = os.environ.get("PHYSICSOS_OPENAI_API_KEY") or str(model_config.get("api_key") or "")
     if not api_key:
         raise RuntimeError("Set PHYSICSOS_OPENAI_API_KEY or model.api_key in ~/.physicsos/config.json.")
-    base_url = os.environ.get("PHYSICSOS_OPENAI_BASE_URL") or str(model_config.get("base_url") or "https://api.tu-zi.com/v1")
+    base_url = os.environ.get("PHYSICSOS_OPENAI_BASE_URL") or str(model_config.get("base_url") or "https://api.openai.com/v1")
     default_model = os.environ.get("PHYSICSOS_CORE_AGENT_MODEL") or os.environ.get("PHYSICSOS_OPENAI_MODEL") or str(model_config.get("name") or "gpt-5.4")
     use_responses_api = str(os.environ.get("PHYSICSOS_STRUCTURED_USE_RESPONSES_API", False)).strip().lower() in {"1", "true", "yes", "on"}
     timeout_seconds = float(os.environ.get("PHYSICSOS_OPENAI_TIMEOUT_SECONDS", model_config.get("timeout_seconds", 40.0)))

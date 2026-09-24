@@ -1,6 +1,6 @@
 [project]
 name = "physicsos"
-version = "0.1.27"
+version = "0.1.28"
 description = "AI-native physics simulation OS with TAPS-first physics IR, solver planning, and cloud runner tooling."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,6 +13,8 @@ dependencies = [
   "langgraph",
   "langchain-openai",
   "rich>=13.7",
+  "textual>=8,<9",
+  "httpx>=0.28,<1",
   "gmsh>=4.13",
   "meshio>=5.3",
   "pymatgen>=2025.6",

@@ -18,6 +18,7 @@ from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
 from physicsos.config import config_path, load_config, load_env_file, runtime_paths, save_config
+from physicsos.model_config import model_settings, uses_openai_model
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import GeometrySpec
@@ -32,7 +33,7 @@ from physicsos.tools.pseudopotential_tools import (
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl"}
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl", "config", "settings", "setup"}
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -542,7 +543,7 @@ def _ensure_deepagents_physicsos_config() -> None:
 
 
 def _deepagents_model_args(argv: list[str]) -> list[str]:
-    if any(arg in {"-M", "--model", "--default-model", "--clear-default-model"} for arg in argv):
+    if any(arg in {"-M", "--model", "--default-model", "--clear-default-model"} or arg.startswith("--model=") for arg in argv):
         return []
     config = load_config()
     model = os.getenv("PHYSICSOS_OPENAI_MODEL") or config.get("model", {}).get("name") or "gpt-5.4"
@@ -550,24 +551,9 @@ def _deepagents_model_args(argv: list[str]) -> list[str]:
 
 
 def _deepagents_model_params_args(argv: list[str]) -> list[str]:
-    if "--model-params" in argv:
+    if any(arg == "--model-params" or arg.startswith("--model-params=") for arg in argv):
         return []
-    config = load_config()
-    model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    params: dict[str, object] = {}
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or model_config.get("base_url")
-    if base_url:
-        params["base_url"] = base_url
-    use_responses_api = os.getenv("PHYSICSOS_OPENAI_USE_RESPONSES_API")
-    if use_responses_api is None:
-        use_responses_api = os.getenv("PHYSICSOS_STRUCTURED_USE_RESPONSES_API")
-    if use_responses_api is None and "use_responses_api" in model_config:
-        params["use_responses_api"] = bool(model_config.get("use_responses_api"))
-    elif use_responses_api is not None:
-        params["use_responses_api"] = use_responses_api.strip().lower() in {"1", "true", "yes", "on"}
-    if not params:
-        return []
-    return ["--model-params", json.dumps(params)]
+    return ["--model-params", json.dumps(model_settings().params)]
 
 
 def _prepare_deepagents_env() -> None:
@@ -597,11 +583,11 @@ def _prepare_deepagents_env() -> None:
                 pass
 
     config = load_config()
-    model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
     search_config = config.get("search", {}) if isinstance(config.get("search"), dict) else {}
-    api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY") or model_config.get("api_key")
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or model_config.get("base_url")
-    model = os.getenv("PHYSICSOS_OPENAI_MODEL") or model_config.get("name")
+    active_model = model_settings()
+    api_key = active_model.api_key
+    base_url = active_model.base_url
+    model = active_model.name
     search_provider = os.getenv("PHYSICSOS_SEARCH_PROVIDER") or search_config.get("provider")
     tavily_api_key = os.getenv("TAVILY_API_KEY") or os.getenv("PHYSICSOS_TAVILY_API_KEY") or search_config.get("tavily_api_key")
     search_enabled = os.getenv("PHYSICSOS_SEARCH_ENABLED")
@@ -644,6 +630,18 @@ def _prepare_deepagents_env() -> None:
 
 
 def _launch_deepagents_cli(argv: list[str]) -> int:
+    load_env_file()
+    info_flags = {"-h", "--help", "-v", "--version", "--default-model", "--clear-default-model", "--update", "--auto-update"}
+    session = not argv or (argv[0].startswith("-") and not any(arg in info_flags for arg in argv))
+    explicit_model = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("--model=")), None)
+    for flag in ("--model", "-M"):
+        if flag in argv and argv.index(flag) + 1 < len(argv):
+            explicit_model = argv[argv.index(flag) + 1]
+    uses_openai = uses_openai_model(explicit_model)
+    unattended = not sys.stdin.isatty() or any(arg in {"-n", "--non-interactive", "--stdin", "--acp"} or arg.startswith("--non-interactive=") for arg in argv)
+    if session and uses_openai and unattended and not model_settings().api_key.strip():
+        print("尚未配置模型 API Key。请先在终端运行 `physicsos config`，或设置 PHYSICSOS_OPENAI_API_KEY / OPENAI_API_KEY。", file=sys.stderr)
+        return 2
     if not any(arg in {"-h", "--help", "-v", "--version"} for arg in argv):
         _ensure_deepagents_physicsos_config()
     _prepare_deepagents_env()
@@ -654,6 +652,9 @@ def _launch_deepagents_cli(argv: list[str]) -> int:
     _patch_deepagents_physicsos_tools()
     _patch_deepagents_physicsos_tui_events()
     _patch_deepagents_physicsos_noninteractive_events()
+    from physicsos.tui import install_settings_ui
+
+    install_settings_ui()
     try:
         from deepagents_cli import cli_main
     except ImportError as exc:
@@ -939,6 +940,46 @@ def main(argv: list[str] | None = None) -> int:
         from physicsos import __version__
 
         print(f"physicsos {__version__}")
+        return 0
+    if argv in (["--help"], ["-h"]):
+        print("""PhysicsOS — 物理仿真工作区
+
+启动：physicsos
+首次运行会引导配置模型、API 地址和 API Key。
+首页点击「模型设置」、按 F2 或输入 /settings 可随时修改。
+
+命令：
+  physicsos config         打开模型设置（无需先启动服务）
+  physicsos config --show  查看配置状态，不显示 API Key
+  physicsos paths          查看配置与工作区位置
+  physicsos auth login     登录云端 runner
+  physicsos runner --help  查看云端任务命令
+
+选项：
+  --model PROVIDER:MODEL   指定本次使用的模型
+  --message TEXT           打开界面并提交首条请求
+  --non-interactive TEXT   执行单次请求后退出
+  --resume [ID]            恢复会话
+  --version               查看版本
+
+支持 PHYSICSOS_OPENAI_API_KEY、OPENAI_API_KEY 和当前目录的 .env。
+完整说明：https://github.com/fzj1214/PhysicsOS#readme""")
+        return 0
+    if argv and argv[0] in {"config", "settings", "setup"}:
+        parser = argparse.ArgumentParser(prog=f"physicsos {argv[0]}", description="配置模型、API 地址和 API Key")
+        parser.add_argument("--show", action="store_true", help="显示配置状态，不显示 API Key")
+        args = parser.parse_args(argv[1:])
+        load_env_file()
+        if args.show:
+            model = model_settings()
+            _print_json({"model": model.name, **model.params, "api_key_configured": bool(model.api_key.strip()), "config_file": str(config_path())})
+            return 0
+        if not sys.stdin.isatty():
+            print("请在交互终端运行 `physicsos config`；查看配置可使用 `physicsos config --show`。", file=sys.stderr)
+            return 2
+        from physicsos.settings import ModelSettingsApp
+
+        ModelSettingsApp().run()
         return 0
     if not argv or argv[0] not in LOCAL_COMMANDS:
         return _launch_deepagents_cli(argv)

@@ -7,4 +7,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("physicsos")
 except PackageNotFoundError:
-    __version__ = "0.1.27"
+    __version__ = "0.1.28"

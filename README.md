@@ -138,6 +138,32 @@ Requirements:
 
 ### Configure A Model
 
+On the first interactive launch, PhysicsOS opens a setup screen before starting
+the agent if no API key is configured. Choose OpenAI, DeepSeek, or a custom
+OpenAI-compatible service, enter its API base URL and API key, and select or type
+the model ID. Choose Chat Completions or Responses as required by your provider.
+Save to continue into the agent.
+
+The home screen always has a **模型设置 / F2** button. Press **F2**, enter
+`/settings` (or bare `/model`), or run `physicsos config` from the shell to reopen
+the same screen. It also works after a server startup failure. Saving applies the
+new configuration and reconnects the local backend while retaining the conversation.
+"检测连接" checks the provider's `/models` endpoint and populates the model list;
+providers without that endpoint can be configured manually.
+
+```bash
+physicsos config          # Open model, endpoint, API key, and API type settings
+physicsos config --show   # Show current configuration status without exposing keys
+```
+
+API keys are hidden while typing. Configurations are stored in
+`~/.physicsos/config.json` (or `PHYSICSOS_CONFIG`), with owner-only permissions on
+Unix. New configurations default to the official OpenAI endpoint; existing custom
+endpoints are preserved. `OPENAI_API_KEY` and `OPENAI_BASE_URL` are also supported.
+Non-interactive runs without a key exit with a configuration instruction.
+
+Environment variables remain available for scripts and one-off runs:
+
 macOS/Linux:
 
 ```bash
@@ -387,6 +413,25 @@ TAPS 和 KS-DFT 参考文件已包含在 Python 安装包中。
 - 如需远端运行，准备 PhysicsOS Cloud / foamvm 账号
 
 ### 配置模型
+
+首次运行 `physicsos` 时，如果还没有配置 API Key，会先打开配置向导，再启动 Agent。
+选择 OpenAI、DeepSeek 或自定义 OpenAI-compatible 服务，填写 API 地址和 Key，
+选择或直接输入模型 ID，并按服务商要求选择 Chat Completions 或 Responses，保存后即可继续。
+
+首页顶部固定显示 **模型设置 / F2** 按钮，也可以按 **F2**、输入 `/settings` 或不带参数的
+`/model` 打开设置。即使后台服务启动失败，设置仍然可用。保存后自动重新连接，并保留当前会话。
+“检测连接”会读取服务商的 `/models` 接口并填充模型列表；不支持该接口的服务也可手动填写。
+
+```bash
+physicsos config          # 独立打开模型、API 地址、Key 和 API 类型设置
+physicsos config --show   # 查看配置状态，不显示 Key
+```
+
+Key 输入时隐藏，保存到 `~/.physicsos/config.json`（或 `PHYSICSOS_CONFIG` 指定的位置），
+Unix 上仅当前用户可读写。新配置默认使用 OpenAI 官方地址，已有自定义地址保持有效。
+也支持 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。无 Key 的非交互请求会给出配置提示并退出。
+
+脚本或单次运行仍可使用环境变量：
 
 macOS/Linux：
 
