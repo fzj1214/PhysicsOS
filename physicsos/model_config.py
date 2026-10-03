@@ -76,3 +76,90 @@ def apply_model_environment(model: ModelSettings) -> None:
         os.environ[name] = model.base_url
     os.environ["PHYSICSOS_OPENAI_MODEL"] = model.name
     os.environ["PHYSICSOS_OPENAI_USE_RESPONSES_API"] = str(model.use_responses_api).lower()
+
+
+@dataclass(frozen=True)
+class DeepSearchSettings:
+    """Configuration for the DeepSearch literature-synthesis model.
+
+    DeepSearch often runs on a different provider or endpoint than the main
+    agent model, so it carries its own key and base URL. Leaving the key blank
+    falls back to the main model credentials.
+    """
+
+    enabled: bool = True
+    name: str = "gemini-2.5-pro-deepsearch"
+    base_url: str = ""
+    api_key: str = field(default="", repr=False)
+    reuse_main_model: bool = True
+
+    def validate(self, *, main: ModelSettings | None = None) -> None:
+        if not self.enabled:
+            return
+        if not self.name.strip():
+            raise ValueError("请填写 DeepSearch 模型名称 / Model ID。")
+        if self.base_url.strip():
+            url = urlsplit(self.base_url)
+            if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password or url.query or url.fragment:
+                raise ValueError("DeepSearch API 地址应为 http(s)://主机/v1。")
+        if self.reuse_main_model:
+            return
+        # A key for the main endpoint must not be silently sent to a different one.
+        inherits_main_endpoint = not self.base_url.strip() or (main is not None and self.base_url.strip() == main.base_url)
+        if not self.api_key.strip() and not (inherits_main_endpoint and main and main.api_key.strip()):
+            raise ValueError("DeepSearch 指向其他服务时，请单独填写它的 API Key。")
+
+
+def main_model_settings() -> ModelSettings:
+    """The main agent model, ignoring DeepSearch-specific overrides."""
+    return model_settings()
+
+
+def resolve_deepsearch(model: DeepSearchSettings | None = None, main: ModelSettings | None = None) -> DeepSearchSettings:
+    """Merge saved DeepSearch settings with environment overrides and main-model fallback."""
+    config = load_config(create=False).get("deepsearch", {})
+    saved = model or DeepSearchSettings(
+        enabled=bool(config.get("enabled", True)),
+        name=str(config.get("name") or "gemini-2.5-pro-deepsearch"),
+        base_url=str(config.get("base_url") or ""),
+        api_key=str(config.get("api_key") or ""),
+        reuse_main_model=bool(config.get("reuse_main_model", True)),
+    )
+    main = main or model_settings()
+    env_key = os.getenv("PHYSICSOS_DEEPSEARCH_API_KEY")
+    env_url = os.getenv("PHYSICSOS_DEEPSEARCH_BASE_URL")
+    env_model = os.getenv("PHYSICSOS_DEEPSEARCH_MODEL")
+    # Only inherit the main endpoint when the user asked to share it, or when no
+    # separate endpoint was configured at all.
+    shares_main = saved.reuse_main_model or not saved.base_url.strip()
+    resolved = DeepSearchSettings(
+        enabled=saved.enabled,
+        name=env_model or saved.name or main.name,
+        base_url=(env_url or saved.base_url or (main.base_url if shares_main else "")).rstrip("/"),
+        api_key=env_key or saved.api_key or (main.api_key if shares_main else ""),
+        reuse_main_model=saved.reuse_main_model,
+    )
+    return resolved
+
+
+def deepsearch_settings() -> DeepSearchSettings:
+    return resolve_deepsearch()
+
+
+def save_deepsearch_settings(deepsearch: DeepSearchSettings, main: ModelSettings | None = None) -> None:
+    deepsearch.validate(main=main)
+    config = load_config(create=False)
+    config.setdefault("deepsearch", {}).update(
+        enabled=deepsearch.enabled, name=deepsearch.name, base_url=deepsearch.base_url,
+        api_key=deepsearch.api_key, reuse_main_model=deepsearch.reuse_main_model,
+    )
+    save_config(config)
+
+
+def apply_deepsearch_environment(deepsearch: DeepSearchSettings) -> None:
+    """Publish DeepSearch credentials to this process for the knowledge tools."""
+    os.environ["PHYSICSOS_DEEPSEARCH_MODEL"] = deepsearch.name
+    if deepsearch.base_url:
+        os.environ["PHYSICSOS_DEEPSEARCH_BASE_URL"] = deepsearch.base_url
+    if deepsearch.api_key:
+        os.environ["PHYSICSOS_DEEPSEARCH_API_KEY"] = deepsearch.api_key

@@ -103,11 +103,14 @@ def run_deepsearch(input: DeepSearchInput) -> DeepSearchOutput:
     except ImportError as exc:
         raise RuntimeError("openai package is required for run_deepsearch.") from exc
 
-    api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY")
+    from physicsos.model_config import deepsearch_settings
+
+    settings = deepsearch_settings()
+    api_key = settings.api_key or os.getenv("PHYSICSOS_OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("Set PHYSICSOS_OPENAI_API_KEY before using run_deepsearch.")
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    model = input.model or os.getenv("PHYSICSOS_DEEPSEARCH_MODEL", "gemini-2.5-pro-deepsearch")
+        raise RuntimeError("请在「模型设置」中配置 DeepSearch API Key（或主模型 Key）。")
+    base_url = settings.base_url or os.getenv("PHYSICSOS_OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    model = input.model or settings.name
     client = OpenAI(api_key=api_key, base_url=base_url)
     try:
         response = client.chat.completions.create(

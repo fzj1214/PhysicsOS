@@ -431,6 +431,24 @@ Key 输入时隐藏，保存到 `~/.physicsos/config.json`（或 `PHYSICSOS_CONF
 Unix 上仅当前用户可读写。新配置默认使用 OpenAI 官方地址，已有自定义地址保持有效。
 也支持 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。无 Key 的非交互请求会给出配置提示并退出。
 
+#### 检索模型 / DeepSearch
+
+knowledge-agent 的文献检索与综述使用单独的 DeepSearch 模型，可以在同一个设置面板里配置，
+与主模型使用不同服务商。默认「与主模型相同」，此时沿用主模型的地址和 Key；
+切换为「使用独立服务」后可单独填写模型 ID、API 地址和 Key，配置保存在
+`config.json` 的 `deepsearch` 段。
+
+指向其他服务时必须单独填写 DeepSearch 的 Key——主模型的 Key 不会被发送到不同端点。
+留空 Key 修改其他字段时会沿用已保存的 Key。对应的环境变量为
+`PHYSICSOS_DEEPSEARCH_MODEL`、`PHYSICSOS_DEEPSEARCH_BASE_URL` 和
+`PHYSICSOS_DEEPSEARCH_API_KEY`，启动时优先于保存的配置。
+
+`physicsos config --show` 会一并显示 DeepSearch 的模型、地址和 Key 配置状态（不显示 Key 本身）。
+服务商返回的拒绝或错误文本会被识别为失败并写入 `error` 字段，不会当作有效综述结果。
+
+本地知识库用于本地文献检索，首次安装后可用 `physicsos seed-kb` 写入参考资料；
+未初始化时本地检索结果为空，arXiv 检索不受影响。
+
 脚本或单次运行仍可使用环境变量：
 
 macOS/Linux：

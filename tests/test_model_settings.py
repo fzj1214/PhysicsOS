@@ -11,7 +11,15 @@ import pytest
 from textual.widgets import Button, Input, Select, Static
 
 from physicsos.config import config_path, default_config, load_config, save_config
-from physicsos.model_config import ModelSettings, apply_model_environment, model_settings, save_model_settings
+from physicsos.model_config import (
+    DeepSearchSettings,
+    ModelSettings,
+    apply_model_environment,
+    deepsearch_settings,
+    model_settings,
+    save_deepsearch_settings,
+    save_model_settings,
+)
 from physicsos.settings import ModelSettingsApp, ModelSettingsScreen
 
 
@@ -240,3 +248,76 @@ def test_changed_key_restarts_backend_even_when_model_name_is_unchanged(monkeypa
             assert "new-key" not in json.dumps(app._server_proc.overrides)
             assert not app._connecting
     asyncio.run(scenario())
+
+
+def test_deepsearch_defaults_to_reusing_the_main_model():
+    save_model_settings(ModelSettings("main-model", "https://main.invalid/v1", "main-key"))
+    deepsearch = deepsearch_settings()
+    assert deepsearch.reuse_main_model
+    assert deepsearch.base_url == "https://main.invalid/v1"
+    assert deepsearch.api_key == "main-key"
+    assert deepsearch.name == "gemini-2.5-pro-deepsearch"
+
+
+def test_settings_screen_saves_independent_deepsearch_endpoint():
+    async def scenario():
+        app = ModelSettingsApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = app.screen
+            screen.query_one("#base-url", Input).value = "https://main.invalid/v1"
+            screen.query_one("#model-name", Input).value = "main-model"
+            screen.query_one("#api-key", Input).value = "main-key"
+            screen.query_one("#deepsearch-reuse", Select).value = False
+            screen.query_one("#deepsearch-name", Input).value = "ds-model"
+            screen.query_one("#deepsearch-url", Input).value = "https://ds.invalid/v1"
+            screen.query_one("#deepsearch-key", Input).value = "ds-key"
+            await pilot.click("#save-settings")
+        assert app.return_value.name == "main-model"
+        saved = deepsearch_settings()
+        assert not saved.reuse_main_model
+        assert saved.name == "ds-model"
+        assert saved.base_url == "https://ds.invalid/v1"
+        assert saved.api_key == "ds-key"
+        assert "ds-key" not in repr(saved)
+    asyncio.run(scenario())
+
+
+def test_deepsearch_key_field_is_masked_and_separate_mode_requires_a_key():
+    save_model_settings(ModelSettings("main-model", "https://main.invalid/v1", "main-key"))
+    async def scenario():
+        app = ModelSettingsApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = app.screen
+            assert screen.query_one("#deepsearch-key", Input).password
+            screen.query_one("#deepsearch-reuse", Select).value = False
+            screen.query_one("#deepsearch-url", Input).value = "https://ds.invalid/v1"
+            screen.query_one("#deepsearch-key", Input).value = ""
+            await pilot.click("#save-settings")
+            assert isinstance(app.screen, ModelSettingsScreen)
+            assert "API Key" in str(screen.query_one("#settings-status", Static).content)
+            await pilot.press("escape")
+    asyncio.run(scenario())
+
+
+def test_deepsearch_environment_overrides_saved_settings(monkeypatch):
+    save_deepsearch_settings(DeepSearchSettings(name="saved-ds", base_url="https://saved.invalid/v1", api_key="saved-ds-key", reuse_main_model=False))
+    assert deepsearch_settings().name == "saved-ds"
+    monkeypatch.setenv("PHYSICSOS_DEEPSEARCH_MODEL", "env-ds")
+    monkeypatch.setenv("PHYSICSOS_DEEPSEARCH_BASE_URL", "https://env.invalid/v1")
+    monkeypatch.setenv("PHYSICSOS_DEEPSEARCH_API_KEY", "env-ds-key")
+    resolved = deepsearch_settings()
+    assert resolved.name == "env-ds"
+    assert resolved.base_url == "https://env.invalid/v1"
+    assert resolved.api_key == "env-ds-key"
+
+
+def test_deepsearch_save_preserves_main_model_and_other_settings():
+    save_model_settings(ModelSettings("main-model", "https://main.invalid/v1", "main-key"))
+    config = load_config()
+    config["cloud"]["access_token"] = "keep-me"
+    save_config(config)
+    save_deepsearch_settings(DeepSearchSettings(name="ds-model", base_url="https://ds.invalid/v1", api_key="ds-key", reuse_main_model=False))
+    assert model_settings().name == "main-model"
+    assert load_config()["cloud"]["access_token"] == "keep-me"
+    if os.name != "nt":
+        assert stat.S_IMODE(config_path().stat().st_mode) == 0o600

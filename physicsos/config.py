@@ -64,6 +64,13 @@ def default_config() -> dict[str, Any]:
             "base_url": "https://api.openai.com/v1",
             "use_responses_api": False,
         },
+        "deepsearch": {
+            "enabled": True,
+            "name": "gemini-2.5-pro-deepsearch",
+            "api_key": "",
+            "base_url": "",
+            "reuse_main_model": True,
+        },
         "cloud": {
             "runner_url": "https://foamvm.vercel.app",
             "access_token": "",

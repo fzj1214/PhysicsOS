@@ -15,7 +15,14 @@ import deepagents_cli.app as cli_app
 from deepagents_cli.widgets.messages import AppMessage
 from deepagents_cli.widgets.welcome import WelcomeBanner
 
-from physicsos.model_config import ModelSettings, apply_model_environment, model_settings, uses_openai_model
+from physicsos.model_config import (
+    ModelSettings,
+    apply_deepsearch_environment,
+    apply_model_environment,
+    deepsearch_settings,
+    model_settings,
+    uses_openai_model,
+)
 from physicsos.settings import ModelSettingsScreen
 
 
@@ -41,6 +48,7 @@ class PhysicsOSApp(cli_app.DeepAgentsApp):
         from deepagents_cli.model_config import clear_caches
 
         apply_model_environment(model)
+        apply_deepsearch_environment(deepsearch_settings())
         settings.reload_from_environment()
         clear_caches()
         if self._server_kwargs is not None:

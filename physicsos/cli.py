@@ -18,7 +18,7 @@ from physicsos.cloud.foamvm_client import FoamVMClient
 from physicsos.agents.main import create_physicsos_agent
 from physicsos.agents.openai_compatible import create_openai_compatible_model
 from physicsos.config import config_path, load_config, load_env_file, runtime_paths, save_config
-from physicsos.model_config import model_settings, uses_openai_model
+from physicsos.model_config import deepsearch_settings, model_settings, uses_openai_model
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
 from physicsos.schemas.geometry import GeometrySpec
@@ -973,7 +973,17 @@ def main(argv: list[str] | None = None) -> int:
         load_env_file()
         if args.show:
             model = model_settings()
-            _print_json({"model": model.name, **model.params, "api_key_configured": bool(model.api_key.strip()), "config_file": str(config_path())})
+            deepsearch = deepsearch_settings()
+            _print_json({
+                "model": model.name, **model.params, "api_key_configured": bool(model.api_key.strip()),
+                "deepsearch": {
+                    "model": deepsearch.name,
+                    "base_url": deepsearch.base_url or "(继承主模型)",
+                    "reuse_main_model": deepsearch.reuse_main_model,
+                    "api_key_configured": bool(deepsearch.api_key.strip()),
+                },
+                "config_file": str(config_path()),
+            })
             return 0
         if not sys.stdin.isatty():
             print("请在交互终端运行 `physicsos config`；查看配置可使用 `physicsos config --show`。", file=sys.stderr)
