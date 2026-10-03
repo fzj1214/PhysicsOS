@@ -108,5 +108,6 @@ SUBAGENTS: list[dict] = [
         "description": "Retrieves local TAPS references, matrix definitions, verification patterns, and source-grounded notes.",
         "system_prompt": "Use the local knowledge/reference tools to support the paper-style TAPS workflow. Do not invent citations.",
         "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["knowledge-agent"],
+        "max_tool_calls": 12,
     },
 ]

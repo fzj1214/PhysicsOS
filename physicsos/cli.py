@@ -33,7 +33,7 @@ from physicsos.tools.pseudopotential_tools import (
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl", "config", "settings", "setup"}
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl", "config", "settings", "setup", "seed-kb"}
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -952,6 +952,7 @@ def main(argv: list[str] | None = None) -> int:
   physicsos config         打开模型设置（无需先启动服务）
   physicsos config --show  查看配置状态，不显示 API Key
   physicsos paths          查看配置与工作区位置
+  physicsos seed-kb        初始化本地知识库（首次安装后建议运行）
   physicsos auth login     登录云端 runner
   physicsos runner --help  查看云端任务命令
 
@@ -996,6 +997,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("account")
     sub.add_parser("paths")
     sub.add_parser("legacy-repl")
+
+    seed_kb_parser = sub.add_parser("seed-kb", help="Seed the local knowledge base with computational physics references")
+    seed_kb_parser.add_argument("--max-results", type=int, default=6, help="Max arXiv results per query")
+    seed_kb_parser.add_argument("--skip-deepsearch", action="store_true", help="Skip DeepSearch reports")
+    seed_kb_parser.add_argument("--skip-pdfs", action="store_true", help="Skip curated PDF downloads")
+    seed_kb_parser.add_argument("--db", help="Knowledge base path override")
 
     pseudopotentials = sub.add_parser("pseudopotentials", aliases=["pp"])
     pp_sub = pseudopotentials.add_subparsers(dest="pseudopotentials_command", required=True)
@@ -1065,6 +1072,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "paths":
         _print_json(_paths_payload())
+        return 0
+
+    if args.command == "seed-kb":
+        from scripts.seed_computational_physics_knowledge import main as seed_main
+        seed_argv = []
+        if args.max_results != 6:
+            seed_argv.extend(["--max-results", str(args.max_results)])
+        if args.skip_deepsearch:
+            seed_argv.append("--skip-deepsearch")
+        if args.skip_pdfs:
+            seed_argv.append("--skip-pdfs")
+        if args.db:
+            seed_argv.extend(["--db", args.db])
+        sys.argv = ["seed-kb"] + seed_argv
+        seed_main()
         return 0
 
     if args.command in {"pseudopotentials", "pp"}:

@@ -42,12 +42,7 @@ CURATED_PDF_URLS = {
 }
 
 LOCAL_DOCS = [
-    "ARCHITECTURE.md",
-    "taps.md",
-    "physicsOS.md",
-    "QUICKSTART.md",
     "docs/knowledge_seed/core_formulas.md",
-    "scratch/taps_paper_text.txt",
 ]
 
 DEEPSEARCH_TOPICS = [

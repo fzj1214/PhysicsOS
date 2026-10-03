@@ -25,11 +25,23 @@ class ArxivSearchInput(StrictBaseModel):
 class ArxivSearchOutput(StrictBaseModel):
     papers: list[ArxivPaper] = Field(default_factory=list)
 
+    def __str__(self) -> str:
+        """Return compact JSON instead of pydantic repr to save context."""
+        import json
+        return json.dumps([p.model_dump(exclude_none=True) for p in self.papers], ensure_ascii=False)
+
 
 def search_arxiv(input: ArxivSearchInput) -> ArxivSearchOutput:
     """Search arXiv through the official Atom API."""
     if input.max_results <= 0:
         return ArxivSearchOutput()
+    # Validate sort parameters against arXiv API requirements
+    valid_sort_by = {"relevance", "lastUpdatedDate", "submittedDate"}
+    valid_sort_order = {"ascending", "descending"}
+    if input.sort_by not in valid_sort_by:
+        raise ValueError(f"sort_by must be one of {valid_sort_by}, got: {input.sort_by}")
+    if input.sort_order not in valid_sort_order:
+        raise ValueError(f"sort_order must be one of {valid_sort_order}, got: {input.sort_order}")
     params = {
         "search_query": input.query,
         "start": "0",
@@ -38,8 +50,11 @@ def search_arxiv(input: ArxivSearchInput) -> ArxivSearchOutput:
         "sortOrder": input.sort_order,
     }
     url = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as response:
-        root = ET.fromstring(response.read())
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            root = ET.fromstring(response.read())
+    except (URLError, TimeoutError, ET.ParseError) as exc:
+        raise RuntimeError(f"arXiv API request failed: {exc}") from exc
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     papers: list[ArxivPaper] = []
     for entry in root.findall("atom:entry", ns):
@@ -91,8 +106,8 @@ def run_deepsearch(input: DeepSearchInput) -> DeepSearchOutput:
     api_key = os.getenv("PHYSICSOS_OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Set PHYSICSOS_OPENAI_API_KEY before using run_deepsearch.")
-    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL", "https://api.tu-zi.com/v1")
-    model = input.model or os.getenv("PHYSICSOS_DEEPSEARCH_MODEL", "gemini-3-pro-deepsearch-async")
+    base_url = os.getenv("PHYSICSOS_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model = input.model or os.getenv("PHYSICSOS_DEEPSEARCH_MODEL", "gemini-2.5-pro-deepsearch")
     client = OpenAI(api_key=api_key, base_url=base_url)
     try:
         response = client.chat.completions.create(
@@ -110,7 +125,18 @@ def run_deepsearch(input: DeepSearchInput) -> DeepSearchOutput:
                 error=f"{type(exc).__name__}: {exc}",
             )
         )
-    return DeepSearchOutput(report=DeepSearchReport(query=input.query, model=model, content=response.choices[0].message.content or ""))
+    content = response.choices[0].message.content or ""
+    # Detect provider-level refusal/error disguised as success
+    error = None
+    if any(phrase in content.lower() for phrase in (
+        "i encountered an error",
+        "i'm having a hard time",
+        "can i help you with something else",
+        "could you try again",
+    )):
+        error = f"Provider returned refusal or error message: {content[:200]}"
+        content = ""
+    return DeepSearchOutput(report=DeepSearchReport(query=input.query, model=model, content=content, error=error))
 
 
 class IngestKnowledgeDocumentInput(StrictBaseModel):
