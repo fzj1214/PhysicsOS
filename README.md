@@ -53,6 +53,7 @@ into a file, a tool call, or an explicit open question.
 | Area | Capability |
 | --- | --- |
 | PDE/TAPS | Builds paper-style TAPS derivation prompts, derivation files, case-local kernels, implementation notes, and verification reports. |
+| Verification | Independent verification framework with conservation checks, convergence studies, capability assessment, and failure diagnosis. Epistemic humility: system recognizes when it doesn't know. |
 | Geometry | Converts STL/CAD or simple generated primitives into Gmsh/SDF/voxel/background-grid artifacts, boundary samples, normals, and cut-cell metadata. |
 | Materials | Uses `pymatgen`, `spglib`, and `seekpath` for structure parsing, standardization, symmetry, reciprocal lattices, k-meshes, irreducible k-points, supercells, and high-symmetry paths. |
 | KS-DFT-TAPS | Prepares Kohn-Sham TAPS problem context, tensor-basis notes, SCF assumptions, band/DOS provenance checks, and verification contracts. |
@@ -70,8 +71,8 @@ analysis files
   problem statement, structured inputs, open questions
         |
         v
-context window
-  local references, tool outputs, templates, geometry/materials notes
+context window + capability assessment
+  similar cases, confidence score (UNKNOWN/LOW/MEDIUM/HIGH)
         |
         v
 TAPS derivation
@@ -82,11 +83,16 @@ case-local implementation
   generated kernel.py, execution plan, runtime metadata
         |
         v
-verification
-  exact/manufactured solution, convergence, physics checks, plots, reports
+independent verification ⭐
+  conservation checks, convergence study, stability analysis
+  → VERIFIED | FAILED | UNCERTAIN
         |
         v
-revise or package runner artifacts
+[if FAILED] → failure diagnosis → learning → retry
+[if VERIFIED] → postprocess
+        |
+        v
+plots, reports, case memory update
 ```
 
 DeepAgents is the interactive harness. PhysicsOS is the domain layer: prompts, tools,
