@@ -297,7 +297,7 @@ class FailureAnalyzer:
         record = FailureRecord(
             case_uuid=problem.id,
             problem=problem,
-            generated_code=result.script or "",
+            generated_code="",  # SolverResult no longer has script field
             failure_mode=failure_mode,
             severity="high" if verification.confidence == ConfidenceScore.HIGH else "medium",
             diagnostic=diagnostic,

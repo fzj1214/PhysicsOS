@@ -217,8 +217,16 @@ class ConvergenceChecker(Verifier):
                 details={"reason": "No residual data available"}
             )
 
-        # Check if residual decreased monotonically
-        residual_values = list(result.residuals.values())
+        # Filter residual keys - only use those ending in "_imbalance" or "_error" or "_residual"
+        residual_keys = [k for k in result.residuals.keys()
+                        if any(suffix in k.lower() for suffix in ['imbalance', 'error', 'residual'])]
+
+        if not residual_keys:
+            # Fall back to all values if no specific residual keys found
+            residual_values = [abs(v) for v in result.residuals.values() if isinstance(v, (int, float))]
+        else:
+            residual_values = [abs(result.residuals[k]) for k in residual_keys if isinstance(result.residuals[k], (int, float))]
+
         if not residual_values:
             return ConvergenceReport(
                 mesh_sizes=[],
@@ -231,7 +239,7 @@ class ConvergenceChecker(Verifier):
             )
 
         # Simple check: final residual should be small
-        final_residual = max(abs(v) for v in residual_values)
+        final_residual = max(residual_values)
         passed = final_residual < 1e-6
 
         return ConvergenceReport(
@@ -244,6 +252,7 @@ class ConvergenceChecker(Verifier):
             details={
                 "method": "residual_check",
                 "final_residual": final_residual,
+                "checked_keys": residual_keys if residual_keys else list(result.residuals.keys()),
                 "note": "Full mesh convergence study recommended"
             }
         )

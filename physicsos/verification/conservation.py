@@ -10,7 +10,9 @@ import time
 from typing import Any
 
 import numpy as np
+from pydantic import Field
 
+from physicsos.schemas.common import StrictBaseModel
 from physicsos.schemas.problem import PhysicsProblem
 from physicsos.schemas.solver import SolverResult
 from physicsos.verification.base import (
