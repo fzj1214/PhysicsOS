@@ -27,12 +27,17 @@ class MeshQualityReport(StrictBaseModel):
     boundary_layer_quality: dict[str, float] = Field(default_factory=dict)
     passes: bool = True
     issues: list[str] = Field(default_factory=list)
+    checked_dimension: int | None = None
+    checked_cell_types: list[str] = Field(default_factory=list)
+    checked_element_orders: list[int] = Field(default_factory=list)
+    checked_elements: int = 0
+    method: str | None = None
 
 
 class MeshPolicy(StrictBaseModel):
     strategy: Literal["auto", "structured", "unstructured", "boundary_layer", "adaptive", "solver_native"] = "auto"
-    target_element_size: float | None = None
-    element_order: int = 1
+    target_element_size: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    element_order: int = Field(default=1, ge=1)
     boundary_layer: bool = False
     refinement_regions: list[str] = Field(default_factory=list)
 

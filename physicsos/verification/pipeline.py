@@ -98,8 +98,11 @@ class VerificationPipeline:
         elif uncertain > 0:
             overall_status = VerificationStatus.UNCERTAIN
             failure_mode = None
-        else:
+        elif passed > 0:
             overall_status = VerificationStatus.VERIFIED
+            failure_mode = None
+        else:
+            overall_status = VerificationStatus.UNCERTAIN
             failure_mode = None
 
         total_compute_time = time.time() - start
@@ -147,12 +150,13 @@ class SelfDiagnostic:
     Used for epistemic humility: the system must recognize when it doesn't know something.
     """
 
-    def __init__(self, knowledge_base: Any = None):
+    def __init__(self, knowledge_base: Any = None, scope: Any = None):
         """
         Args:
             knowledge_base: Reference to the case memory / model catalog
         """
         self.kb = knowledge_base
+        self.scope = scope
 
     def assess_capability(
         self,
@@ -184,6 +188,15 @@ class SelfDiagnostic:
                 total_similar_cases=0,
             )
 
+        if self.scope is not None and hasattr(self.kb, "assess"):
+            from physicsos.schemas.rsi import AssessCapabilityInput
+            estimate = self.kb.assess(AssessCapabilityInput(scope=self.scope))
+            return CapabilityAssessment(confidence=estimate.confidence,
+                                        reasoning=f"{estimate.independent_problems} independent problems; 95% verification-success interval {estimate.success_interval}",
+                                        recommendation=estimate.recommendation,
+                                        success_rate=estimate.success_rate,
+                                        total_similar_cases=estimate.independent_problems)
+
         # Query knowledge base for similar cases
         similar_cases = self._find_similar_cases(problem)
 
@@ -210,13 +223,15 @@ class SelfDiagnostic:
         success_rate = verified_count / total
 
         # Determine confidence
-        if success_rate > 0.9:
+        from physicsos.rsi.calibration import wilson_interval
+        lower = wilson_interval(verified_count, total)[0]
+        if total >= 20 and lower >= .8:
             confidence = ConfidenceScore.HIGH
             recommendation = (
                 f"This problem is similar to {total} previously solved cases "
                 f"({success_rate:.0%} success rate). Proceeding with high confidence."
             )
-        elif success_rate >= 0.6:
+        elif total >= 5 and lower >= .5:
             confidence = ConfidenceScore.MEDIUM
             recommendation = (
                 f"This problem shares features with {total} previous cases "
@@ -247,13 +262,17 @@ class SelfDiagnostic:
         )
 
     def _find_similar_cases(self, problem: PhysicsProblem) -> list[dict[str, Any]]:
-        """
-        Query knowledge base for similar problems.
-
-        Placeholder: actual implementation would use the search_case_memory tool.
-        """
-        # Stub: would call search_case_memory
-        return []
+        """Read actual runtime history; one case's repeated runs count once."""
+        if not hasattr(self.kb, "history"):
+            return []
+        from physicsos.schemas.case_runtime import SearchRuntimeHistoryInput
+        history = self.kb.history(SearchRuntimeHistoryInput(physics_domain=problem.domain,
+                                                          dimension=problem.geometry.dimension, top_k=100))
+        unique = {}
+        for attempt in history.attempts:
+            unique.setdefault(attempt["case_id"], {"id": attempt["case_id"],
+                                                  "verification_status": attempt["verification"]["overall_status"]})
+        return list(unique.values())
 
 
 class FailureAnalyzer:

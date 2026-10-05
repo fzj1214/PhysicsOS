@@ -7,6 +7,7 @@ from physicsos.agents.prompts import (
     KS_DFT_TAPS_DERIVATION_AGENT_PROMPT,
     KS_DFT_TAPS_IMPLEMENTATION_AGENT_PROMPT,
     KS_DFT_VERIFICATION_AGENT_PROMPT,
+    KNOWLEDGE_AGENT_PROMPT,
     MATERIALS_PREPROCESS_AGENT_PROMPT,
     POSTPROCESS_AGENT_PROMPT,
     TAPS_DERIVATION_AGENT_PROMPT,
@@ -106,7 +107,7 @@ SUBAGENTS: list[dict] = [
     {
         "name": "knowledge-agent",
         "description": "Retrieves local TAPS references, matrix definitions, verification patterns, and source-grounded notes.",
-        "system_prompt": "Use the local knowledge/reference tools to support the paper-style TAPS workflow. Do not invent citations.",
+        "system_prompt": KNOWLEDGE_AGENT_PROMPT,
         "tools": DEEPAGENTS_SUBAGENT_TOOL_GROUPS["knowledge-agent"],
         "max_tool_calls": 12,
     },

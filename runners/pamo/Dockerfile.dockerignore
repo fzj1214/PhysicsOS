@@ -1,0 +1,17 @@
+# Dockerfile-specific exclusions leave other runner build contexts unchanged.
+.git
+.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+.env
+.env.*
+cases
+scratch
+sessions
+data
+models
+build
+dist
+*.egg-info
+runners/foamvm

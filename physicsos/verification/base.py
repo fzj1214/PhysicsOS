@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from physicsos.schemas.common import StrictBaseModel
 from physicsos.schemas.problem import PhysicsProblem
@@ -56,11 +56,13 @@ class VerificationResult(StrictBaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now())
     compute_time: float = 0.0                   # Seconds
 
-    def __post_init__(self):
+    @model_validator(mode="after")
+    def validate_diagnostic(self):
         """Alignment constraint: FAILED status must include actionable diagnostic."""
         if self.status == VerificationStatus.FAILED:
-            assert self.message, "Failed verification must include diagnostic message"
-            assert self.details, "Failed verification must include diagnostic details"
+            if not self.message or not self.details:
+                raise ValueError("Failed verification must include a diagnostic and details.")
+        return self
 
 
 class AggregateVerificationReport(StrictBaseModel):
@@ -92,11 +94,13 @@ class AggregateVerificationReport(StrictBaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now())
     total_compute_time: float = 0.0
 
-    def __post_init__(self):
+    @model_validator(mode="after")
+    def validate_status(self):
         """Alignment constraint: overall_status is VERIFIED only if all checks passed."""
         if self.overall_status == VerificationStatus.VERIFIED:
-            assert self.failed_checks == 0, "Cannot have VERIFIED status with failed checks"
-            assert self.uncertain_checks == 0, "Cannot have VERIFIED status with uncertain checks"
+            if self.passed_checks <= 0 or self.failed_checks or self.uncertain_checks or not self.individual_results:
+                raise ValueError("VERIFIED requires actual passed checks and no failed or uncertain checks.")
+        return self
 
 
 class Verifier(ABC):

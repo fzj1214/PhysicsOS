@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -89,6 +90,13 @@ def _run_backend_subprocess(payload: dict[str, Any], timeout_seconds: float = 12
 
 def _run_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
     action = payload.get("action")
+    if action == "mesh_quality":
+        from physicsos.backends.mesh_quality import assess_mesh_main
+        quality = assess_mesh_main(MeshSpec.model_validate(payload["mesh"]))
+        return {"ok": True, "quality": quality.model_dump(mode="json")}
+    if action == "bind_whole_boundary":
+        _bind_whole_boundary_main(Path(payload["path"]), payload["role"], payload["dimension"])
+        return {"ok": True}
     if action == "import_geometry":
         geometry, artifacts = _import_geometry_backend_main(
             GeometrySource.model_validate(payload["source"]),
@@ -105,6 +113,8 @@ def _run_backend_payload(payload: dict[str, Any]) -> dict[str, Any]:
             target_backends=list(payload.get("target_backends") or []),
             target_element_size=payload.get("target_element_size"),
             element_order=int(payload.get("element_order") or 1),
+            output_dir=payload.get("output_dir"),
+            mesh_dimension=payload.get("mesh_dimension"),
         )
         return {
             "ok": True,
@@ -307,17 +317,24 @@ def _import_geometry_backend_main(source: GeometrySource, target_units: str = "S
     return geometry, artifacts
 
 
-def _build_generated_geometry(gmsh: Any, dimension: int, element_size: float | None) -> None:
+def _build_generated_geometry(gmsh: Any, dimension: int, element_size: float | None, geometry: GeometrySpec) -> None:
     lc = element_size or 0.1
+    parameters = {key: value for entity in geometry.entities for key, value in entity.metadata.items()}
+    def length(name: str) -> float:
+        value = parameters.get(name)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Generated geometry requires an explicit positive {name}.")
+        return float(value)
     if dimension == 1:
         p1 = gmsh.model.occ.addPoint(0.0, 0.0, 0.0, lc)
-        p2 = gmsh.model.occ.addPoint(1.0, 0.0, 0.0, lc)
+        p2 = gmsh.model.occ.addPoint(length("length"), 0.0, 0.0, lc)
         line = gmsh.model.occ.addLine(p1, p2)
         gmsh.model.occ.synchronize()
         tag = gmsh.model.addPhysicalGroup(1, [line])
         gmsh.model.setPhysicalName(1, tag, "domain")
     elif dimension == 2:
-        surface = gmsh.model.occ.addRectangle(0.0, 0.0, 0.0, 1.0, 1.0)
+        extent_x, extent_y = length("length"), length("width")
+        surface = gmsh.model.occ.addRectangle(0.0, 0.0, 0.0, extent_x, extent_y)
         gmsh.model.occ.synchronize()
         domain_tag = gmsh.model.addPhysicalGroup(2, [surface])
         gmsh.model.setPhysicalName(2, domain_tag, "domain")
@@ -331,11 +348,11 @@ def _build_generated_geometry(gmsh: Any, dimension: int, element_size: float | N
             midpoint_y = 0.5 * (ymin + ymax)
             if abs(midpoint_x) <= 1e-8:
                 grouped_curves["x_min"].append(tag)
-            elif abs(midpoint_x - 1.0) <= 1e-8:
+            elif abs(midpoint_x - extent_x) <= 1e-8:
                 grouped_curves["x_max"].append(tag)
             elif abs(midpoint_y) <= 1e-8:
                 grouped_curves["y_min"].append(tag)
-            elif abs(midpoint_y - 1.0) <= 1e-8:
+            elif abs(midpoint_y - extent_y) <= 1e-8:
                 grouped_curves["y_max"].append(tag)
         for name, curve_tags in grouped_curves.items():
             if not curve_tags:
@@ -343,10 +360,110 @@ def _build_generated_geometry(gmsh: Any, dimension: int, element_size: float | N
             physical_tag = gmsh.model.addPhysicalGroup(1, curve_tags)
             gmsh.model.setPhysicalName(1, physical_tag, name)
     else:
-        volume = gmsh.model.occ.addBox(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+        primitive = parameters.get("primitive", "box")
+        if primitive == "sphere":
+            volume = gmsh.model.occ.addSphere(0, 0, 0, length("radius"))
+        elif primitive == "cylinder":
+            volume = gmsh.model.occ.addCylinder(0, 0, 0, 0, 0, length("height"), length("radius"))
+        elif primitive == "box":
+            volume = gmsh.model.occ.addBox(0, 0, 0, length("length"), length("width"), length("height"))
+        else:
+            raise ValueError("Provide a concrete CAD/mesh asset for this generated primitive.")
         gmsh.model.occ.synchronize()
         tag = gmsh.model.addPhysicalGroup(3, [volume])
         gmsh.model.setPhysicalName(3, tag, "domain")
+        if primitive == "box":
+            extents = [length("length"), length("width"), length("height")]
+            for dim, face in gmsh.model.getBoundary([(3, volume)], oriented=False):
+                bounds = gmsh.model.getBoundingBox(dim, face)
+                for axis, name in enumerate("xyz"):
+                    midpoint = (bounds[axis] + bounds[axis + 3]) / 2
+                    role = f"{name}_min" if abs(midpoint) < 1e-8 else f"{name}_max" if abs(midpoint - extents[axis]) < 1e-8 else None
+                    if role:
+                        physical = gmsh.model.addPhysicalGroup(2, [face])
+                        gmsh.model.setPhysicalName(2, physical, role)
+                        break
+
+
+def _surface_volume(gmsh: Any, path: Path, target_element_size: float | None = None) -> None:
+    """Build volumes from closed surface components, retaining nested cavities."""
+    import numpy as np
+    import trimesh
+    from physicsos.backends.surface_mesh import read_mesh_surface, surface_metrics, write_surface_stl
+    vertices, faces = read_mesh_surface(path)
+    metrics = surface_metrics(vertices, faces)
+    if not metrics["watertight"] or not metrics["manifold"]:
+        raise ValueError("Volume meshing requires a closed manifold surface; repair the asset first.")
+    source = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    components = list(source.split(only_watertight=False))
+    if path.suffix.lower() == ".stl":
+        gmsh.merge(str(path))
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as temporary:
+            component_path = Path(temporary.name)
+        try:
+            write_surface_stl(component_path, vertices, faces)
+            gmsh.merge(str(component_path))
+        finally:
+            component_path.unlink(missing_ok=True)
+    # Preserve the checked surface mesh instead of forcing global UV
+    # parametrization, which can fail indefinitely on tiny closed soups.
+    if target_element_size is not None:
+        edges = vertices[faces[:, [1, 2, 0]]] - vertices[faces]
+        maximum = float(np.linalg.norm(edges, axis=2).max())
+        levels = max(0, math.ceil(math.log2(maximum / target_element_size)))
+        if levels > 8 or len(faces) * 4 ** levels > 2000000:
+            raise ValueError("Requested surface refinement exceeds the preparation budget.")
+        for _ in range(levels):
+            gmsh.model.mesh.refine()
+    gmsh.model.mesh.createTopology(makeSimplyConnected=False, exportDiscrete=True)
+    groups = [[] for _ in components]
+    for _, tag in gmsh.model.getEntities(2):
+        _, coordinates, _ = gmsh.model.mesh.getNodes(2, tag, includeBoundary=True)
+        if not len(coordinates):
+            raise ValueError("A surface patch has no coordinates for component binding.")
+        point = np.asarray(coordinates).reshape(-1, 3)[0]
+        distances = [float(trimesh.proximity.closest_point(component, np.asarray([point]))[1][0]) for component in components]
+        component_id = int(np.argmin(distances))
+        groups[component_id].append(tag)
+    loop_tags = [gmsh.model.geo.addSurfaceLoop(tags) for tags in groups]
+    # Containment is evaluated on original closed components, never their boxes.
+    parents = []
+    for i, component in enumerate(components):
+        candidates = [j for j, other in enumerate(components) if i != j and abs(other.volume) > abs(component.volume) and bool(other.contains(np.asarray([component.vertices[0]]))[0])]
+        parents.append(min(candidates, key=lambda j: abs(components[j].volume)) if candidates else None)
+    def depth(index):
+        seen = set()
+        while parents[index] is not None:
+            if index in seen:
+                raise ValueError("Surface containment is cyclic.")
+            seen.add(index)
+            index = parents[index]
+        return len(seen)
+    for i in range(len(components)):
+        if depth(i) % 2 == 0:
+            holes = [loop_tags[j] for j in range(len(components)) if parents[j] == i]
+            gmsh.model.geo.addVolume([loop_tags[i], *holes])
+    gmsh.model.geo.synchronize()
+
+
+def _attach_physical_groups(gmsh: Any, geometry: GeometrySpec) -> None:
+    bindings = [*geometry.regions, *geometry.boundaries] if geometry.source.kind in {"cad_step", "cad_iges", "generated"} or (geometry.source.uri or "").endswith(".geo") else []
+    for region in bindings:
+        selected = [entity for entity in geometry.entities if entity.id in region.entity_ids and "gmsh_tag" in entity.metadata]
+        dimensions = {int(entity.metadata["gmsh_dim"]) for entity in selected}
+        for dimension in dimensions:
+            tags = [int(entity.metadata["gmsh_tag"]) for entity in selected if int(entity.metadata["gmsh_dim"]) == dimension]
+            existing = [(dim, tag) for dim, tag in gmsh.model.getPhysicalGroups(dimension) if gmsh.model.getPhysicalName(dim, tag) == region.label]
+            if tags and not existing:
+                physical = gmsh.model.addPhysicalGroup(dimension, tags)
+                gmsh.model.setPhysicalName(dimension, physical, region.label)
+    for dimension, name in [(geometry.dimension, "domain"), (geometry.dimension - 1, "boundary")]:
+        covered = {int(entity) for dim, tag in gmsh.model.getPhysicalGroups(dimension) for entity in gmsh.model.getEntitiesForPhysicalGroup(dim, tag)}
+        missing = [tag for _, tag in gmsh.model.getEntities(dimension) if tag not in covered]
+        if missing:
+            physical = gmsh.model.addPhysicalGroup(dimension, missing)
+            gmsh.model.setPhysicalName(dimension, physical, name)
 
 
 def _mesh_counts_from_gmsh(gmsh: Any) -> tuple[MeshTopology, ElementStats]:
@@ -390,6 +507,8 @@ def generate_mesh_backend(
     target_backends: list[str],
     target_element_size: float | None,
     element_order: int = 1,
+    output_dir: str | Path | None = None,
+    mesh_dimension: int | None = None,
 ) -> tuple[MeshSpec, list[ArtifactRef]]:
     if _gmsh_requires_subprocess():
         result = _run_backend_subprocess(
@@ -399,6 +518,8 @@ def generate_mesh_backend(
                 "target_backends": target_backends,
                 "target_element_size": target_element_size,
                 "element_order": element_order,
+                "output_dir": str(output_dir) if output_dir is not None else None,
+                "mesh_dimension": mesh_dimension,
             }
         )
         if result.get("ok"):
@@ -421,6 +542,8 @@ def generate_mesh_backend(
         target_backends=target_backends,
         target_element_size=target_element_size,
         element_order=element_order,
+        output_dir=output_dir,
+        mesh_dimension=mesh_dimension,
     )
 
 
@@ -429,9 +552,12 @@ def _generate_mesh_backend_main(
     target_backends: list[str],
     target_element_size: float | None,
     element_order: int = 1,
+    output_dir: str | Path | None = None,
+    mesh_dimension: int | None = None,
 ) -> tuple[MeshSpec, list[ArtifactRef]]:
     """Generate a solver-neutral mesh with gmsh and optionally convert it with meshio."""
     artifacts: list[ArtifactRef] = []
+    mesh_dimension = geometry.dimension if mesh_dimension is None else mesh_dimension
     gmsh = _import_optional("gmsh")
     if gmsh is None:
         mesh = MeshSpec(
@@ -448,7 +574,8 @@ def _generate_mesh_backend_main(
         )
         return mesh, artifacts
 
-    output_dir = _workspace(geometry.id)
+    output_dir = Path(output_dir) if output_dir is not None else _workspace(geometry.id)
+    output_dir.mkdir(parents=True, exist_ok=True)
     msh_path = output_dir / "mesh.msh"
     source_path = _source_path(geometry.source)
     gmsh.initialize()
@@ -456,19 +583,27 @@ def _generate_mesh_backend_main(
         gmsh.option.setNumber("General.Terminal", 0)
         gmsh.model.add(_safe(geometry.id))
         if geometry.source.kind == "generated" or source_path is None:
-            _build_generated_geometry(gmsh, geometry.dimension, target_element_size)
+            if geometry.source.kind != "generated":
+                raise ValueError("A concrete source asset is required for meshing.")
+            _build_generated_geometry(gmsh, geometry.dimension, target_element_size, geometry)
         elif source_path.exists():
-            gmsh.open(str(source_path))
+            if geometry.dimension == 3 and geometry.source.kind in {"stl", "mesh_file"} and source_path.suffix.lower() != ".geo":
+                _surface_volume(gmsh, source_path, target_element_size)
+            else:
+                gmsh.open(str(source_path))
         else:
             raise FileNotFoundError(f"Geometry source path not found: {geometry.source.uri}")
+        _attach_physical_groups(gmsh, geometry)
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
         if target_element_size is not None:
             gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target_element_size)
             gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target_element_size)
-        gmsh.model.mesh.generate(geometry.dimension)
+        gmsh.model.mesh.generate(mesh_dimension)
         if element_order > 1:
             gmsh.model.mesh.setOrder(element_order)
         gmsh.write(str(msh_path))
         topology, elements = _mesh_counts_from_gmsh(gmsh)
+        _, regions, boundaries, _ = _gmsh_entities(gmsh)
     finally:
         gmsh.finalize()
 
@@ -480,13 +615,40 @@ def _generate_mesh_backend_main(
     mesh = MeshSpec(
         id=f"mesh:{geometry.id}",
         kind="unstructured",
-        dimension=geometry.dimension,
+        dimension=mesh_dimension,
         topology=topology,
         elements=elements,
-        regions=geometry.regions,
-        boundaries=geometry.boundaries,
+        regions=regions,
+        boundaries=boundaries,
         quality=MeshQualityReport(passes=elements.total is not None and elements.total > 0),
         files=artifacts,
         solver_compatibility=target_backends,
     )
     return mesh, artifacts
+
+
+def bind_whole_boundary(path: Path, role: str, dimension: int) -> None:
+    if _gmsh_requires_subprocess():
+        result = _run_backend_subprocess({"action": "bind_whole_boundary", "path": str(path), "role": role, "dimension": dimension})
+        if not result.get("ok"):
+            raise ValueError(result.get("error", "Could not bind physical boundary groups."))
+    else:
+        _bind_whole_boundary_main(path, role, dimension)
+
+
+def _bind_whole_boundary_main(path: Path, role: str, dimension: int) -> None:
+    import gmsh
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.open(str(path))
+        tags = [tag for _, tag in gmsh.model.getEntities(dimension - 1)]
+        if not tags:
+            raise ValueError("No boundary entities are available for the declared whole-boundary role.")
+        gmsh.model.removePhysicalGroups(gmsh.model.getPhysicalGroups(dimension - 1))
+        physical = gmsh.model.addPhysicalGroup(dimension - 1, tags)
+        gmsh.model.setPhysicalName(dimension - 1, physical, role)
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
+        gmsh.write(str(path))
+    finally:
+        gmsh.finalize()

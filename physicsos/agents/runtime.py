@@ -19,20 +19,13 @@ def _instantiate_backend(backend_type: type, runtime: object | None = None, **kw
 
 def _build_filesystem_backend(runtime: object | None = None) -> Any:
     try:
-        from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+        from deepagents.backends import CompositeBackend, FilesystemBackend
     except ImportError as exc:
         raise RuntimeError("deepagents is required for enable_filesystem_backend=True") from exc
 
-    return CompositeBackend(
-        default=_instantiate_backend(StateBackend, runtime),
-        routes={
-            "/cases/": _instantiate_backend(StoreBackend, runtime),
-            "/datasets/": _instantiate_backend(StoreBackend, runtime),
-            "/models/": _instantiate_backend(StoreBackend, runtime),
-            "/reports/": _instantiate_backend(StoreBackend, runtime),
-            "/scratch/": _instantiate_backend(StateBackend, runtime),
-        },
-    )
+    from physicsos.config import runtime_paths
+    disk = _instantiate_backend(FilesystemBackend, runtime, root_dir=runtime_paths().workspace, virtual_mode=True)
+    return CompositeBackend(default=disk, routes={"/workspace/": disk})
 
 
 class DeepAgentsRuntimeConfig(StrictBaseModel):

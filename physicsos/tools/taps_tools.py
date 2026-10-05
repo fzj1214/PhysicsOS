@@ -7,6 +7,8 @@ import subprocess
 import sys
 from time import perf_counter
 from typing import Literal
+from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from pydantic import Field
@@ -879,6 +881,9 @@ class ExecuteTAPSKernelInput(StrictBaseModel):
     case_id: str
     kernel_uri: str | None = None
     timeout_seconds: int = 60
+    prepared_domain: ArtifactRef | None = None
+    controls: dict[str, Any] = Field(default_factory=dict)
+    field_name: str = "u"
 
 
 class ExecuteTAPSKernelOutput(StrictBaseModel):
@@ -892,9 +897,30 @@ class ExecuteTAPSKernelOutput(StrictBaseModel):
 
 def execute_taps_kernel(input: ExecuteTAPSKernelInput) -> ExecuteTAPSKernelOutput:
     """Execute the generated case-local TAPS kernel in a subprocess."""
+    if input.prepared_domain is not None:
+        from physicsos.runtime import CaseRuntime
+        from physicsos.schemas.case_runtime import ExecuteCaseInput
+        output = CaseRuntime().execute(ExecuteCaseInput(case_id=input.case_id, prepared_domain=input.prepared_domain, kernel_uri=input.kernel_uri, controls=input.controls, field_name=input.field_name, timeout_seconds=input.timeout_seconds))
+        run = output.run
+        planned = Path(run.working_case_dir) / "taps"
+        return ExecuteTAPSKernelOutput(
+            result=run.result, passes=run.result.status == "success",
+            solution=run.artifacts.get("solution") or _artifact(planned / "solution.npy", "solution"),
+            residual_history=run.artifacts.get("residual_history") or _artifact(planned / "residual_history.json", "residual_history"),
+            runtime_metadata=run.artifacts.get("runtime_metadata") or _artifact(planned / "runtime_metadata.json", "runtime_metadata"),
+            execution_log=run.artifacts["execution_log"],
+        )
     case_dir = _case_dir(input.case_id)
     taps_dir = case_dir / "taps"
     taps_dir.mkdir(parents=True, exist_ok=True)
+    # Compatibility path for specialized legacy kernels. Prior standard
+    # outputs are archived so an incomplete execution cannot reuse them.
+    previous = case_dir / "runs" / ("legacy-" + uuid4().hex)
+    for filename in ("solution.npy", "residual_history.json", "runtime_metadata.json", "solution_summary.json"):
+        path = taps_dir / filename
+        if path.exists():
+            previous.mkdir(parents=True, exist_ok=True)
+            path.replace(previous / filename)
     kernel_path = resolve_workspace_path(input.kernel_uri or f"/workspace/cases/{input.case_id}/taps/kernel.py", workspace=_workspace())
     shim_dir = _ensure_workspace_path_shim(case_dir)
     env = os.environ.copy()
@@ -902,9 +928,16 @@ def execute_taps_kernel(input: ExecuteTAPSKernelInput) -> ExecuteTAPSKernelOutpu
     env["PHYSICSOS_WORKSPACE"] = str(_workspace())
     env["PYTHONPATH"] = str(shim_dir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     started = perf_counter()
+    from physicsos.runtime.artifacts import write_json
+    worker = Path(__file__).parents[1] / "runtime" / "kernel_worker.py"
+    config_path = taps_dir / "kernel_runtime_config.json"
+    response_path = taps_dir / "kernel_worker_response.json"
+    response_path.unlink(missing_ok=True)
+    write_json(config_path, {**input.controls, "case_id": input.case_id, "case_dir": str(case_dir), "output_dir": str(taps_dir), "controls": input.controls, "legacy_unprepared_execution": True})
+    command = [sys.executable, str(worker), "--kernel", str(kernel_path), "--config", str(config_path), "--response", str(response_path)]
     try:
         completed = subprocess.run(
-            [sys.executable, str(kernel_path)],
+            command,
             cwd=str(case_dir),
             env=env,
             capture_output=True,

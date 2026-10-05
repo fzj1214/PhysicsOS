@@ -24,6 +24,8 @@ from physicsos.model_config import (
     uses_openai_model,
 )
 from physicsos.settings import ModelSettingsScreen
+from physicsos.config import runtime_paths
+from physicsos.workbench import WorkbenchScreen
 
 
 class PhysicsOSApp(cli_app.DeepAgentsApp):
@@ -33,13 +35,16 @@ class PhysicsOSApp(cli_app.DeepAgentsApp):
     #physicsos-toolbar { height: 3; padding: 0 1; background: $panel; }
     #physicsos-current-model { width: 1fr; height: 3; content-align: left middle; }
     #physicsos-settings { min-width: 20; height: 3; }
+    #physicsos-workbench { min-width: 18; height: 3; margin-right: 1; }
     """
-    BINDINGS = [Binding("f2", "physicsos_settings", "模型设置", priority=True)]
+    BINDINGS = [Binding("f2", "physicsos_settings", "模型设置", priority=True),
+                Binding("f3", "physicsos_workbench", "仿真工作台", priority=True)]
 
     def compose(self):
         spec = (self._server_kwargs or {}).get("model_name") or model_settings().spec
         with Horizontal(id="physicsos-toolbar"):
             yield Static(f"PhysicsOS · {spec}", id="physicsos-current-model", markup=False)
+            yield Button("仿真工作台 / F3", id="physicsos-workbench")
             yield Button("模型设置 / F2", id="physicsos-settings")
         yield from super().compose()
 
@@ -77,6 +82,23 @@ class PhysicsOSApp(cli_app.DeepAgentsApp):
     @on(Button.Pressed, "#physicsos-settings")
     def open_settings(self) -> None:
         self.action_physicsos_settings()
+
+    @on(Button.Pressed, "#physicsos-workbench")
+    def open_workbench(self) -> None:
+        self.action_physicsos_workbench()
+
+    def _workbench_mutations_allowed(self) -> bool:
+        return not (self._agent_running or self._shell_running or self._connecting or self._thread_switching or self._startup_sequence_running)
+
+    @work(group="physicsos-workbench")
+    async def action_physicsos_workbench(self, active_tab: str = "wb-cases") -> None:
+        if isinstance(self.screen, (WorkbenchScreen, ModelSettingsScreen)) or getattr(self, "_physicsos_workbench_open", False):
+            return
+        self._physicsos_workbench_open = True
+        try:
+            await self.push_screen_wait(WorkbenchScreen(runtime_paths().workspace, active_tab=active_tab, mutations_allowed=self._workbench_mutations_allowed))
+        finally:
+            self._physicsos_workbench_open = False
 
     @work(group="physicsos-settings")
     async def action_physicsos_settings(self) -> None:
@@ -131,11 +153,14 @@ class PhysicsOSApp(cli_app.DeepAgentsApp):
 
     async def _handle_command(self, command: str) -> None:
         cmd = command.strip().lower()
+        if cmd in {"/workbench", "/rsi"}:
+            self.action_physicsos_workbench("wb-rsi" if cmd == "/rsi" else "wb-cases")
+            return
         if cmd in {"/settings", "/config", "/model"}:
             self.action_physicsos_settings()
             return
         if cmd == "/help":
-            await self._mount_message(AppMessage("PhysicsOS 设置：点击顶部「模型设置」、按 F2 或输入 /settings。\n可配置服务商、API 地址、API Key、模型和 API 类型；退出后也可运行 physicsos config。"))
+            await self._mount_message(AppMessage("PhysicsOS 设置：点击顶部「模型设置」、按 F2 或输入 /settings。\n仿真工作台：顶部按钮、F3 或 /workbench；/rsi 直接打开策略与自动修订页。\n可查看真实运行与验证证据，设置修订预算并启动评估、晋升或回滚。"))
         await super()._handle_command(command)
 
 
@@ -153,9 +178,15 @@ def install_settings_ui() -> None:
     command_registry.SLASH_COMMANDS.append(entry.to_entry())
     command_registry.IMMEDIATE_UI |= {"/settings", "/config"}
     command_registry.ALL_CLASSIFIED |= {"/settings", "/config"}
+    workbench = command_registry.SlashCommand(name="/workbench", description="案例、RSI 策略与验证证据 / Simulation workbench", bypass_tier=command_registry.BypassTier.IMMEDIATE_UI, aliases=("/rsi",))
+    command_registry.COMMANDS += (workbench,)
+    command_registry.SLASH_COMMANDS.append(workbench.to_entry())
+    command_registry.IMMEDIATE_UI |= {"/workbench", "/rsi"}
+    command_registry.ALL_CLASSIFIED |= {"/workbench", "/rsi"}
     welcome._TIPS = [
         "模型与 API Key 设置：点击顶部按钮、按 F2 或输入 /settings",
         "退出后也可运行 physicsos config 修改模型配置",
         "输入物理问题开始仿真；使用 @ 引用几何、材料或其他输入文件",
+        "仿真与 RSI 工作台：顶部按钮、F3 或 /workbench",
     ]
     cli_app.DeepAgentsApp = PhysicsOSApp

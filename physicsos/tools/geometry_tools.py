@@ -11,6 +11,7 @@ from pydantic import Field
 
 from physicsos.agents.structured import CoreAgentLLMConfig, StructuredLLMClient, call_structured_agent
 from physicsos.backends.geometry_mesh import generate_mesh_backend, import_geometry_backend
+from physicsos.backends.geometry_repair import run_pamo_repair
 from physicsos.config import project_root
 from physicsos.paths import resolve_workspace_path
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
@@ -31,6 +32,7 @@ from physicsos.schemas.geometry import (
     RegionSpec,
 )
 from physicsos.schemas.knowledge import KnowledgeContext
+from physicsos.schemas.geometry_repair import RepairGeometryInput, RepairGeometryOutput
 from physicsos.schemas.mesh import MeshPolicy, MeshQualityReport, MeshSpec
 from physicsos.schemas.operators import PhysicsDomain, PhysicsSpec
 from physicsos.schemas.problem import PhysicsProblem
@@ -53,34 +55,13 @@ def import_geometry(input: ImportGeometryInput) -> ImportGeometryOutput:
     return ImportGeometryOutput(geometry=geometry, artifacts=artifacts)
 
 
-class RepairGeometryInput(StrictBaseModel):
-    geometry: GeometrySpec
-    repair_policy: str = "conservative"
-
-
-class RepairGeometryOutput(StrictBaseModel):
-    geometry: GeometrySpec
-    changes: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-
-
 def repair_geometry(input: RepairGeometryInput) -> RepairGeometryOutput:
-    """Repair invalid, non-manifold, open, or self-intersecting geometry."""
-    transforms = [
-        *input.geometry.transforms,
-        GeometryTransform(kind="repair", description="No-op scaffold repair; geometry remains not_repaired and requires confirmation."),
-    ]
-    geometry = input.geometry.model_copy(
-        update={
-            "quality": GeometryQualityReport(
-                passes=False,
-                unresolved_regions=["not_repaired"],
-                issues=["No-op scaffold repair did not modify geometry."],
-            ),
-            "transforms": transforms,
-        }
-    )
-    return RepairGeometryOutput(geometry=geometry, changes=["No-op scaffold repair."])
+    """Repair an asset with PaMO in a CUDA Python environment or Docker.
+
+    Returns checked surface artifacts and invalidates old encodings/bindings.
+    Backend availability and repair failure are explicit statuses, never passes.
+    """
+    return run_pamo_repair(input)
 
 
 class LabelRegionsInput(StrictBaseModel):
@@ -206,7 +187,7 @@ def build_geometry_mesh_contract(input: BuildGeometryMeshContractInput) -> Build
             entity_ids=boundary.entity_ids,
             confidence=boundary.confidence,
             source=_semantic_source(geometry),  # type: ignore[arg-type]
-            metadata={"boundary_kind": boundary.kind},
+            metadata={"boundary_kind": boundary.kind, **({"gmsh_physical_tag": int(boundary.id.rsplit(":", 1)[-1])} if boundary.id.startswith("boundary:physical:") and boundary.id.rsplit(":", 1)[-1].isdigit() else {})},
         )
         for boundary in geometry.boundaries
     ]
@@ -1273,10 +1254,13 @@ def _triangle_quality(points: list[list[float]], cell: list[int]) -> tuple[float
     if len(cell) < 3:
         return None
     p0, p1, p2 = (points[int(cell[0])], points[int(cell[1])], points[int(cell[2])])
-    x0, y0 = float(p0[0]), float(p0[1])
-    x1, y1 = float(p1[0]), float(p1[1])
-    x2, y2 = float(p2[0]), float(p2[1])
-    jacobian = abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))
+    edge1 = [float(p1[i]) - float(p0[i]) for i in range(3)]
+    edge2 = [float(p2[i]) - float(p0[i]) for i in range(3)]
+    jacobian = math.sqrt(sum(value * value for value in [
+        edge1[1] * edge2[2] - edge1[2] * edge2[1],
+        edge1[2] * edge2[0] - edge1[0] * edge2[2],
+        edge1[0] * edge2[1] - edge1[1] * edge2[0],
+    ]))
     area = jacobian / 2.0
     if area <= 0.0:
         return None
@@ -1295,56 +1279,8 @@ def _triangle_quality(points: list[list[float]], cell: list[int]) -> tuple[float
 
 
 def _mesh_quality_from_msh(mesh: MeshSpec) -> MeshQualityReport | None:
-    msh_artifact = next((artifact for artifact in mesh.files if artifact.format == "msh"), None)
-    if msh_artifact is None:
-        return None
-    try:
-        import meshio
-    except ImportError:
-        return MeshQualityReport(passes=False, issues=["meshio is not installed; mesh quality could not be recomputed from .msh."])
-
-    raw_mesh = meshio.read(msh_artifact.uri)
-    points = [[float(coord) for coord in point[:3]] for point in raw_mesh.points]
-    jacobians: list[float] = []
-    aspect_ratios: list[float] = []
-    skewness: list[float] = []
-    unsupported_cell_types: set[str] = set()
-    for block in raw_mesh.cells:
-        if "triangle" not in block.type.lower():
-            unsupported_cell_types.add(block.type)
-            continue
-        for raw_cell in block.data.tolist():
-            quality = _triangle_quality(points, [int(node) for node in raw_cell])
-            if quality is None:
-                jacobians.append(0.0)
-                continue
-            jacobian, aspect_ratio, skewness_proxy = quality
-            jacobians.append(jacobian)
-            aspect_ratios.append(aspect_ratio)
-            skewness.append(skewness_proxy)
-
-    issues: list[str] = []
-    min_jacobian = min(jacobians) if jacobians else None
-    max_skewness = max(skewness) if skewness else None
-    aspect_ratio_p95 = _percentile(aspect_ratios, 0.95)
-    if min_jacobian is None:
-        issues.append("No triangle cells found for current local mesh quality evaluator.")
-    elif min_jacobian <= 1e-14:
-        issues.append("Degenerate triangle cell detected.")
-    if aspect_ratio_p95 is not None and aspect_ratio_p95 > 25.0:
-        issues.append(f"High triangle aspect ratio p95={aspect_ratio_p95:.3g}.")
-    if max_skewness is not None and max_skewness > 0.95:
-        issues.append(f"High triangle skewness proxy max={max_skewness:.3g}.")
-    if unsupported_cell_types and not jacobians:
-        issues.append(f"Unsupported cell types for local evaluator: {', '.join(sorted(unsupported_cell_types))}.")
-    passes = not issues
-    return MeshQualityReport(
-        min_jacobian=min_jacobian,
-        max_skewness=max_skewness,
-        aspect_ratio_p95=aspect_ratio_p95,
-        passes=passes,
-        issues=issues,
-    )
+    from physicsos.backends.mesh_quality import assess_mesh_backend
+    return assess_mesh_backend(mesh)
 
 
 class GenerateGeometryEncodingInput(StrictBaseModel):
@@ -2040,9 +1976,9 @@ class AssessMeshQualityOutput(StrictBaseModel):
 def assess_mesh_quality(input: AssessMeshQualityInput) -> AssessMeshQualityOutput:
     """Evaluate mesh quality for selected physics and backend."""
     computed = _mesh_quality_from_msh(input.mesh)
-    report = computed or input.mesh.quality
+    report = computed or MeshQualityReport(passes=False, issues=["Mesh quality evidence is unavailable."])
     issues = list(report.issues)
-    if input.backend in {"taps", "taps:mesh_fem_poisson"} and not any("triangle" in cell_type.lower() for cell_type in input.mesh.topology.cell_types):
+    if input.backend == "taps:mesh_fem_poisson" and not any("triangle" in cell_type.lower() for cell_type in input.mesh.topology.cell_types):
         issues.append("TAPS mesh FEM path expects triangle cells in the current local assembler.")
     passes = report.passes and not issues
     report = report.model_copy(update={"passes": passes, "issues": sorted(set(issues))})

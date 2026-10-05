@@ -235,6 +235,10 @@ class GenerateConvergenceCodeInput(StrictBaseModel):
     exact_solution_uri: str | None = None
     refinement_levels: list[int] = Field(default_factory=lambda: [8, 16, 32, 64])
     expected_order: float = 2.0
+    prepared_domain: ArtifactRef | None = None
+    kernel_uri: str | None = None
+    reference_uri: str | None = None
+    refinements: list[float] | None = None
 
 
 class GenerateConvergenceCodeOutput(StrictBaseModel):
@@ -258,61 +262,29 @@ def generate_convergence_code(input: GenerateConvergenceCodeInput) -> GenerateCo
 
 
 def _convergence_script(input: GenerateConvergenceCodeInput) -> str:
-    levels = [max(3, int(level)) for level in input.refinement_levels]
-    return f'''from __future__ import annotations
-
-import json
-import math
+    options = input.model_dump(mode="json")
+    return f'''import json
 import sys
 from pathlib import Path
 
-REFINEMENT_LEVELS = {levels!r}
-EXPECTED_ORDER = {float(input.expected_order)!r}
-
-
-def fit_order(rows):
-    if len(rows) < 2:
-        return 0.0
-    xs = [math.log(row["h"]) for row in rows]
-    ys = [math.log(max(row["l2_error"], 1e-300)) for row in rows]
-    xbar = sum(xs) / len(xs)
-    ybar = sum(ys) / len(ys)
-    denom = sum((x - xbar) ** 2 for x in xs)
-    if denom <= 0:
-        return 0.0
-    slope = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys)) / denom
-    return slope
-
-
-def main():
-    exact_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("exact_solution.json")
-    output_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("convergence_report.json")
-    exact = json.loads(exact_path.read_text(encoding="utf-8"))
-    dimension = int(exact.get("dimension", 1))
-    rows = []
-    for n in REFINEMENT_LEVELS:
-        h = 1.0 / max(n - 1, 1)
-        # Deterministic manufactured convergence scaffold. A real TAPS kernel
-        # adapter should replace this perturbation with actual numerical error.
-        l2_error = math.sqrt(dimension) * h ** EXPECTED_ORDER
-        rows.append({{"n": n, "h": h, "l2_error": l2_error}})
-    observed_order = fit_order(rows)
-    payload = {{
-        "schema_version": "physicsos.convergence_report.v1",
-        "exact_solution": str(exact_path),
-        "refinement_levels": REFINEMENT_LEVELS,
-        "expected_order": EXPECTED_ORDER,
-        "observed_order": observed_order,
-        "passes": observed_order >= EXPECTED_ORDER - 0.25,
-        "rows": rows,
-        "note": "Scaffold convergence code uses a deterministic manufactured O(h^p) error until connected to a case-local TAPS kernel.",
-    }}
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-if __name__ == "__main__":
-    main()
+OPTIONS = json.loads({json.dumps(options)!r})
+output = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("convergence_report.json")
+payload = {{"schema_version": "physicsos.runtime_convergence.v1", "status": "uncertain", "passes": False, "rows": [], "runs": [], "observed_order": None, "expected_order": OPTIONS["expected_order"], "generated_from_actual_runs": False, "note": "A prepared domain and explicit refinements are required; synthetic errors are disabled."}}
+if OPTIONS["prepared_domain"] and OPTIONS["refinements"]:
+    from physicsos.runtime import CaseRuntime
+    from physicsos.schemas.case_runtime import ConvergenceStudyInput
+    from physicsos.runtime.artifacts import checked_path
+    from physicsos.schemas.common import ArtifactRef
+    runtime = CaseRuntime()
+    domain = json.loads(checked_path(ArtifactRef.model_validate(OPTIONS["prepared_domain"]), runtime.workspace).read_text())
+    study = runtime.convergence(ConvergenceStudyInput(case_id=OPTIONS["case_id"], prepared_domain=OPTIONS["prepared_domain"], kernel_uri=OPTIONS["kernel_uri"], reference_uri=OPTIONS["reference_uri"], refinements=OPTIONS["refinements"], axis="mesh" if domain["requirements"]["representation"] == "mesh" else "grid", expected_order=OPTIONS["expected_order"]))
+    payload = json.loads(checked_path(study.report, runtime.workspace).read_text())
+    payload["runtime_report"] = study.report.model_dump(mode="json")
+    for row in payload["rows"]:
+        if "error" in row:
+            row["l2_error"] = row["error"]
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 '''
 
 
@@ -353,7 +325,17 @@ def _convergence_passes(path: Path) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return bool(payload.get("passes"))
+    if payload.get("schema_version") != "physicsos.runtime_convergence.v1" or not payload.get("generated_from_actual_runs") or payload.get("status") != "verified":
+        return False
+    try:
+        from physicsos.runtime.verification import load_run
+        references = payload.get("runs", [])
+        if len(references) < 3:
+            return False
+        runs = [load_run(ArtifactRef.model_validate(reference), _workspace()) for reference in references]
+        return all(run.result.status == "success" for run in runs) and len({run.domain_id for run in runs}) == len(runs) and len({run.kernel_sha256 for run in runs}) == 1
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 class PlotResultInput(StrictBaseModel):
@@ -374,6 +356,7 @@ def plot_result(input: PlotResultInput) -> PlotResultOutput:
     case_dir = _case_dir(input.case_id)
     report_path = resolve_workspace_path(input.convergence_report_uri or f"/workspace/cases/{input.case_id}/verification/convergence_report.json", workspace=runtime_paths().workspace)
     payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["passes"] = _convergence_passes(report_path)
     rows = payload.get("rows", [])
     svg_path = verification_dir / "plots" / "convergence_plot.svg"
     svg_path.parent.mkdir(parents=True, exist_ok=True)

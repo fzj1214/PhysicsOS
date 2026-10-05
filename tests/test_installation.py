@@ -103,6 +103,59 @@ def test_installed_config_status_does_not_expose_api_key(
     assert key not in result.stdout + result.stderr
 
 
+def test_installed_geometry_repair_cli_and_worker_are_available(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    help_result = run(console_script(installed_package), "geometry", "repair", "--help", cwd=tmp_path, env=installed_env)
+    assert "--executor" in help_result.stdout and "--target-faces" in help_result.stdout
+    worker = installed_package / "physicsos" / "backends" / "pamo_worker.py"
+    assert worker.exists()
+    assert worker.with_name("surface_mesh.py").exists()
+    # The standalone CLI imports no torch/CUDA code just to show help.
+    run(sys.executable, str(worker), "--help", cwd=tmp_path, env=installed_env)
+    source = tmp_path / "original.stl"
+    source.write_text("solid original\nendsolid original\n")
+    result = subprocess.run([
+        console_script(installed_package), "geometry", "repair", str(source),
+        "--python", str(tmp_path / "missing-python"),
+    ], cwd=tmp_path, env=installed_env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["status"] == "backend_unavailable"
+    assert source.read_text() == "solid original\nendsolid original\n"
+
+
+def test_installed_case_runtime_is_exposed_without_model_credentials(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    result = run(console_script(installed_package), "runtime", "--help", cwd=tmp_path, env=installed_env)
+    assert "prepare" in result.stdout and "convergence" in result.stdout
+    run(sys.executable, str(installed_package / "physicsos" / "runtime" / "kernel_worker.py"), "--help", cwd=tmp_path, env=installed_env)
+    run(sys.executable, "-c", "from physicsos.runtime import CaseRuntime; print(CaseRuntime.__name__)", cwd=tmp_path, env=installed_env)
+
+
+def test_installed_rsi_cli_and_registry_need_no_model_credentials(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    help_result = run(console_script(installed_package), "rsi", "--help", cwd=tmp_path, env=installed_env)
+    assert "register-strategy" in help_result.stdout and "evaluate" in help_result.stdout and "rollback" in help_result.stdout and "bind-context" in help_result.stdout
+    assert "register-revision-provider" in help_result.stdout and "improve" in help_result.stdout
+    request = tmp_path / "assessment.json"
+    request.write_text(json.dumps({"scope": {"problem_family": "poisson-dirichlet", "physics_domains": ["thermal"], "dimension": 3, "representation": "mesh"}}))
+    result = run(console_script(installed_package), "rsi", "assess", str(request), cwd=tmp_path, env=installed_env)
+    payload = json.loads(result.stdout)
+    assert payload["confidence"] == "unknown"
+    assert payload["independent_problems"] == 0
+    run(sys.executable, "-c", "from physicsos.tools.registry import TOOL_REGISTRY; assert 'evaluate_rsi_candidates' in TOOL_REGISTRY", cwd=tmp_path, env=installed_env)
+
+
+def test_installed_workbench_entry_and_tui_need_no_model_credentials(
+    installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
+) -> None:
+    result = run(console_script(installed_package), "workbench", "--help", cwd=tmp_path, env=installed_env)
+    assert "--workspace" in result.stdout
+    run(sys.executable, "-c", "from physicsos.workbench import WorkbenchApp; from physicsos.tui import PhysicsOSApp; print(WorkbenchApp.__name__)", cwd=tmp_path, env=installed_env)
+
+
 def test_installed_paths_use_callers_workspace(
     installed_package: Path, installed_env: dict[str, str], tmp_path: Path,
 ) -> None:

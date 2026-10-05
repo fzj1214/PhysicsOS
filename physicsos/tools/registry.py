@@ -98,6 +98,8 @@ from physicsos.tools.verification_chain_tools import (
     generate_exact_sol_code,
     plot_result,
 )
+from physicsos.tools.case_runtime_tools import CASE_RUNTIME_TOOLS, execute_case_kernel, prepare_simulation_domain, run_case_convergence, search_runtime_history, verify_case_solution
+from physicsos.tools.rsi_tools import RSI_TOOLS, assess_rsi_capability, bind_rsi_case_context, register_rsi_strategy, register_rsi_benchmark_suite, register_rsi_revision_provider, improve_rsi_strategy, evaluate_rsi_candidates
 
 
 @dataclass(frozen=True)
@@ -290,9 +292,13 @@ def _unique_tools(*groups: list[Callable[..., Any]]) -> list[Callable[..., Any]]
 
 DEEPAGENTS_MAIN_BRIDGE_TOOLS = _unique_tools(
     PHYSICSOS_CASE_TOOLS,
+    CASE_RUNTIME_TOOLS,
+    RSI_TOOLS,
 )
 
 PHYSICSOS_WORKFLOW_NODE_CAPABILITIES = _unique_tools(
+    CASE_RUNTIME_TOOLS,
+    RSI_TOOLS,
     GEOMETRY_MESH_TOOLS,
     TAPS_TOOLS,
     VERIFICATION_TOOLS,
@@ -302,12 +308,12 @@ PHYSICSOS_WORKFLOW_NODE_CAPABILITIES = _unique_tools(
 
 DEEPAGENTS_SUBAGENT_TOOL_GROUPS = {
     "analysis-file-agent": _unique_tools(
-        [update_case_stage_status],
-        [search_knowledge_base, build_knowledge_context, search_case_memory, read_case_memory_events],
+        [update_case_stage_status, assess_rsi_capability, bind_rsi_case_context],
+        [search_knowledge_base, build_knowledge_context, search_case_memory, read_case_memory_events, search_runtime_history],
     ),
     "geometry-embedding-agent": _unique_tools(
-        [update_case_stage_status],
-        GEOMETRY_EMBEDDING_TOOLS,
+        [update_case_stage_status, prepare_simulation_domain, assess_rsi_capability, bind_rsi_case_context, register_rsi_strategy],
+        GEOMETRY_MESH_TOOLS,
         [search_knowledge_base, build_knowledge_context],
     ),
     "materials-preprocess-agent": _unique_tools(
@@ -397,7 +403,7 @@ DEEPAGENTS_SUBAGENT_TOOL_GROUPS = {
         ],
     ),
     "taps-implementation-agent": _unique_tools(
-        [update_case_stage_status],
+        [update_case_stage_status, execute_case_kernel, assess_rsi_capability, bind_rsi_case_context, register_rsi_strategy, register_rsi_revision_provider],
         [
             build_knowledge_context,
             formulate_taps_equation,
@@ -409,7 +415,7 @@ DEEPAGENTS_SUBAGENT_TOOL_GROUPS = {
         ],
     ),
     "verification-agent": _unique_tools(
-        [update_case_stage_status],
+        [update_case_stage_status, verify_case_solution, run_case_convergence, register_rsi_benchmark_suite, evaluate_rsi_candidates, improve_rsi_strategy],
         [
             generate_exact_sol_code,
             execute_exact_sol_code,
@@ -428,6 +434,8 @@ DEEPAGENTS_SUBAGENT_TOOL_GROUPS = {
     ),
     "knowledge-agent": _unique_tools(
         [
+            assess_rsi_capability,
+            search_runtime_history,
             load_taps_case_references,
             build_paper_context_window,
             build_knowledge_context,

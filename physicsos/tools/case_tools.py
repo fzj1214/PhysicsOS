@@ -13,6 +13,7 @@ from pydantic import Field
 from physicsos.config import runtime_paths
 from physicsos.paths import to_agent_path
 from physicsos.schemas.common import ArtifactRef, StrictBaseModel
+from physicsos.schemas.rsi import AssessCapabilityInput, BindCaseStrategyInput
 
 
 CASE_STAGE_ORDER = [
@@ -374,6 +375,7 @@ class BuildTAPSDerivationPromptInput(StrictBaseModel):
     case_id: str
     problem_statement_uri: str | None = None
     geometry_embedding_uri: str | None = None
+    rsi_assessment: AssessCapabilityInput | None = None
 
 
 class BuildTAPSDerivationPromptOutput(StrictBaseModel):
@@ -389,6 +391,7 @@ def build_taps_derivation_prompt(input: BuildTAPSDerivationPromptInput) -> Build
     problem_statement = input.problem_statement_uri or "/".join(["/workspace", "cases", input.case_id, "problem", "problem_statement.md"])
     geometry_embedding = input.geometry_embedding_uri or "/".join(["/workspace", "cases", input.case_id, "geometry", "geometry_embedding.md"])
     context_window = "/".join(["/workspace", "cases", input.case_id, "context", "context_window.md"])
+    learned_context, rsi_warnings = _refresh_rsi_context(case_dir, input.rsi_assessment)
     required = [
         context_window,
         problem_statement,
@@ -396,7 +399,9 @@ def build_taps_derivation_prompt(input: BuildTAPSDerivationPromptInput) -> Build
         f"/workspace/cases/{input.case_id}/references/taps_matrix_definitions.md",
         f"/workspace/cases/{input.case_id}/references/taps_cot_outline.md",
     ]
-    warnings = []
+    if learned_context is not None:
+        required.append(to_agent_path(case_dir / "context" / "rsi_strategy.md", workspace=_workspace()))
+    warnings = list(rsi_warnings)
     for item in required:
         path = _workspace() / Path(*item.removeprefix("/workspace/").split("/")) if item.startswith("/workspace/") else Path(item)
         if not path.exists():
@@ -467,6 +472,8 @@ For STL/3D geometry, explicitly show how `phi(x)`, `chi(x)=H(-phi(x))`, normals,
 - End with a short checklist of generated equations, matrices, required artifacts, and unresolved assumptions.
 """
     prompt_path = case_dir / "taps" / "derivation_prompt.md"
+    if learned_context is not None:
+        prompt_text += "\n## Learned strategy evidence\n\n" + learned_context + "\n"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt_text, encoding="utf-8")
     _append_event(case_dir, "taps_derivation_prompt_built", {"prompt": to_agent_path(prompt_path, workspace=_workspace())})
@@ -482,6 +489,7 @@ class BuildPaperContextWindowInput(StrictBaseModel):
     user_prompt: str | None = None
     include_geometry_embedding: bool = True
     include_ks_dft_materials: bool = False
+    rsi_assessment: AssessCapabilityInput | None = None
 
 
 class BuildPaperContextWindowOutput(StrictBaseModel):
@@ -500,6 +508,26 @@ def _context_artifact(section: str, path: Path, description: str) -> ContextWind
     )
 
 
+def _refresh_rsi_context(case_dir: Path, assessment: AssessCapabilityInput | None = None):
+    binding_path = case_dir / "context" / "rsi_binding.json"
+    if assessment is None and not binding_path.exists():
+        return None, []
+    from physicsos.rsi import RSIRuntime
+    from physicsos.runtime.artifacts import checked_path, write_json
+    try:
+        binding = BindCaseStrategyInput(case_id=case_dir.name, assessment=assessment) if assessment else BindCaseStrategyInput.model_validate_json(binding_path.read_text())
+        if binding.case_id != case_dir.name:
+            raise ValueError("RSI binding belongs to a different case.")
+        result = RSIRuntime(_workspace()).bind_context(binding)
+        return checked_path(result.guidance, _workspace()).read_text(), result.warnings
+    except (ValueError, OSError, KeyError) as exc:
+        message = "Learned strategy context needs review: " + str(exc)
+        write_json(case_dir / "context" / "rsi_strategy.json", {"status": "needs_review", "diagnostic": message})
+        guidance = "# Learned runtime strategy\n\nStatus: needs_review\n\n" + message + "\n"
+        (case_dir / "context" / "rsi_strategy.md").write_text(guidance, encoding="utf-8")
+        return guidance, [message]
+
+
 def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPaperContextWindowOutput:
     """Assemble the paper's context-window module as case-local prompt context.
 
@@ -509,6 +537,7 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
     case_dir = _case_dir(input.case_id)
     context_dir = case_dir / "context"
     context_dir.mkdir(parents=True, exist_ok=True)
+    learned_context, rsi_warnings = _refresh_rsi_context(case_dir, input.rsi_assessment)
 
     references = [
         case_dir / "references" / "taps_template_eq5.md",
@@ -526,6 +555,11 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
         _context_artifact("analysis files", case_dir / "problem" / "problem.json", "Structured problem facts when available."),
         _context_artifact("analysis files", case_dir / "problem" / "open_questions.md", "Missing inputs and assumptions requiring user or agent resolution."),
     ]
+    if learned_context is not None:
+        sections.extend([
+            _context_artifact("learned strategy", context_dir / "rsi_strategy.md", "Current scoped strategy guidance, confidence and failure actions."),
+            _context_artifact("learned strategy", context_dir / "rsi_strategy.json", "Current strategy revision, generation and numerical/preparation policy."),
+        ])
     if input.include_geometry_embedding:
         sections.extend(
             [
@@ -568,7 +602,7 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
         ]
     )
 
-    warnings = [f"Context input is not present yet: {item.path}" for item in sections if not item.exists]
+    warnings = [*rsi_warnings, *(f"Context input is not present yet: {item.path}" for item in sections if not item.exists)]
     manifest_payload = {
         "schema_version": "physicsos.paper_context_window.v1",
         "case_id": input.case_id,
@@ -607,11 +641,13 @@ def build_paper_context_window(input: BuildPaperContextWindowInput) -> BuildPape
     ]
     if input.user_prompt:
         lines.extend(["User prompt:", input.user_prompt, ""])
+    if learned_context is not None:
+        lines.extend([learned_context, ""])
 
     grouped: dict[str, list[ContextWindowArtifact]] = {}
     for section in sections:
         grouped.setdefault(section.section, []).append(section)
-    for name in ["analysis files", "tools", "online/local resources", "context examples"]:
+    for name in ["analysis files", "tools", "online/local resources", "context examples", "learned strategy"]:
         lines.extend([name.title(), ""])
         for artifact in grouped.get(name, []):
             status = "present" if artifact.exists else "missing"

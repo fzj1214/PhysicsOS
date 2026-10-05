@@ -258,7 +258,26 @@ Geometry helper:
 
 ```bash
 physicsos geometry apply-boundary-labels geometry.json labeling_artifact.json --output confirmed.json
+physicsos geometry repair asset.stl --executor docker --case-id repaired-asset --output repaired-geometry.json
 ```
+
+Surface repair uses an isolated PaMO CUDA worker and records topology, quality,
+and shape-deviation evidence. Docker setup and the repair/meshing handoff are
+documented in [the PaMO runner guide](runners/pamo/README.md).
+
+The shared [CaseRuntime](docs/case_runtime.md) prepares versioned geometry and
+meshes, runs `run_case(config)` in fresh workspaces, compares actual fields to
+independent references, and reruns frozen kernels for convergence studies.
+Use `physicsos runtime --help` for offline JSON-request commands.
+
+[RSIRuntime](docs/rsi.md) evaluates reusable geometry/solver strategy revisions
+through that same path, selects on development data, checks fresh holdouts,
+calibrates scoped capability and promotes or rolls back defaults.
+Use `physicsos rsi --help` for registration, evaluation and production commands.
+
+The [simulation workbench](docs/workbench.md) exposes cases, RSI campaigns and
+verification evidence in the TUI: toolbar button, F3, `/workbench` or `/rsi`.
+`physicsos workbench` opens it independently without model credentials.
 
 Pseudopotential helpers:
 
@@ -527,7 +546,16 @@ physicsos runner download-all JOB_ID
 
 ```bash
 physicsos geometry apply-boundary-labels geometry.json labeling_artifact.json --output confirmed.json
+physicsos geometry repair asset.stl --executor docker --case-id repaired-asset --output repaired-geometry.json
 ```
+
+表面修复通过独立 PaMO CUDA worker 执行，记录拓扑、质量与形状偏差检查；成功后重新绑定边界并生成网格或 TAPS 几何编码。Docker 配置见 [PaMO runner 说明](runners/pamo/README.md)。
+
+[CaseRuntime](docs/case_runtime.md) 将几何准备、自动建网格、质量与边界校验、case-local kernel 执行和真实收敛重跑接到同一运行链。每次运行保留独立产物和版本哈希；缺少独立参考或验证能力时返回 uncertain。使用 `physicsos runtime --help` 查看离线 JSON 请求命令。
+
+[RSIRuntime](docs/rsi.md) 复用该运行链评估可迁移的几何/求解策略版本：开发集选择候选，冻结保留集检查泛化，校准能力并晋升默认策略，生产失败时回滚。使用 `physicsos rsi --help` 查看注册、评估和生产运行命令。
+
+[仿真工作台](docs/workbench.md) 提供案例与运行、RSI 策略与修订、验证证据三个页签。点击顶部按钮、按 F3 或输入 `/workbench` 打开；`/rsi` 直接进入策略页。也可用 `physicsos workbench` 独立打开，无需模型 API Key。
 
 赝势辅助：
 

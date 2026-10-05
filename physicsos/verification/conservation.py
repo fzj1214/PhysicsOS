@@ -75,27 +75,43 @@ class ConservationChecker(Verifier):
             conserved.update(op.conserved_quantities)
 
         checks: list[ConservationResult] = []
+        missing = []
 
         # Check mass conservation
         if "mass" in conserved or "continuity" in conserved:
-            mass_check = self.check_mass_conservation(problem, result, self.mass_tol)
-            checks.append(mass_check)
+            if "mass_imbalance" not in result.residuals:
+                missing.append("mass_imbalance")
+            else:
+                checks.append(self.check_mass_conservation(problem, result, self.mass_tol))
 
         # Check momentum conservation
         if "momentum" in conserved:
-            momentum_check = self.check_momentum_conservation(problem, result, self.momentum_tol)
-            checks.append(momentum_check)
+            if "momentum_imbalance" not in result.residuals:
+                missing.append("momentum_imbalance")
+            else:
+                checks.append(self.check_momentum_conservation(problem, result, self.momentum_tol))
 
         # Check energy conservation
         if "energy" in conserved:
-            energy_check = self.check_energy_conservation(problem, result, self.energy_tol)
-            checks.append(energy_check)
+            if "energy_imbalance" not in result.residuals:
+                missing.append("energy_imbalance")
+            else:
+                checks.append(self.check_energy_conservation(problem, result, self.energy_tol))
 
         # Aggregate results
         all_passed = all(c.passed for c in checks)
-        status = VerificationStatus.VERIFIED if all_passed else VerificationStatus.FAILED
+        if not all_passed or result.status == "failed":
+            status = VerificationStatus.FAILED
+        elif missing or not checks:
+            status = VerificationStatus.UNCERTAIN
+        else:
+            status = VerificationStatus.VERIFIED
 
-        if all_passed:
+        if status == VerificationStatus.UNCERTAIN:
+            message = f"Conservation evidence is incomplete: {missing or 'no applicable checks'}"
+        elif result.status == "failed":
+            message = "Solver execution failed; conservation cannot establish a verified solution."
+        elif all_passed:
             message = f"All conservation checks passed ({len(checks)} checks)"
         else:
             failed = [c.quantity for c in checks if not c.passed]
@@ -109,6 +125,8 @@ class ConservationChecker(Verifier):
         details = {
             "checks": [c.model_dump() for c in checks],
             "conserved_quantities": list(conserved),
+            "missing_metrics": missing,
+            "method": "backend_reported_balance_thresholds",
         }
 
         compute_time = time.time() - start
@@ -153,8 +171,7 @@ class ConservationChecker(Verifier):
             total_mass = result.residuals.get("total_mass", 1.0)
         else:
             # Try to compute from field values if available
-            imbalance = 0.0  # Would compute from fields
-            total_mass = 1.0
+            raise ValueError("Mass balance evidence is missing.")
 
         relative_error = imbalance / max(total_mass, 1e-16)
         passed = relative_error < tol
@@ -187,8 +204,7 @@ class ConservationChecker(Verifier):
             imbalance = abs(result.residuals["momentum_imbalance"])
             total_momentum = result.residuals.get("total_momentum", 1.0)
         else:
-            imbalance = 0.0
-            total_momentum = 1.0
+            raise ValueError("Momentum balance evidence is missing.")
 
         relative_error = imbalance / max(total_momentum, 1e-16)
         passed = relative_error < tol
@@ -216,8 +232,7 @@ class ConservationChecker(Verifier):
             imbalance = abs(result.residuals["energy_imbalance"])
             total_energy = result.residuals.get("total_energy", 1.0)
         else:
-            imbalance = 0.0
-            total_energy = 1.0
+            raise ValueError("Energy balance evidence is missing.")
 
         relative_error = imbalance / max(total_energy, 1e-16)
         passed = relative_error < tol

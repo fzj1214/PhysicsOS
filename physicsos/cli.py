@@ -21,8 +21,8 @@ from physicsos.config import config_path, load_config, load_env_file, runtime_pa
 from physicsos.model_config import deepsearch_settings, model_settings, uses_openai_model
 from physicsos.events import PhysicsOSEventRenderer, collect_physicsos_events, read_physicsos_events
 from physicsos.schemas.common import ArtifactRef
-from physicsos.schemas.geometry import GeometrySpec
-from physicsos.tools.geometry_tools import ApplyBoundaryLabelingArtifactInput, apply_boundary_labeling_artifact
+from physicsos.schemas.geometry import CoordinateSystem, GeometrySource, GeometrySpec
+from physicsos.tools.geometry_tools import ApplyBoundaryLabelingArtifactInput, RepairGeometryInput, apply_boundary_labeling_artifact, repair_geometry
 from physicsos.tools.pseudopotential_tools import (
     IndexVaspPawPbeLibraryInput,
     SelectPseudopotentialsForStructureInput,
@@ -33,7 +33,7 @@ from physicsos.tools.pseudopotential_tools import (
 
 BANNER = "PhysicsOS\nPhysicsOS"
 
-LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "geometry", "pseudopotentials", "pp", "legacy-repl", "config", "settings", "setup", "seed-kb"}
+LOCAL_COMMANDS = {"auth", "account", "paths", "runner", "runtime", "rsi", "workbench", "geometry", "pseudopotentials", "pp", "legacy-repl", "config", "settings", "setup", "seed-kb"}
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -955,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
   physicsos seed-kb        初始化本地知识库（首次安装后建议运行）
   physicsos auth login     登录云端 runner
   physicsos runner --help  查看云端任务命令
+  physicsos rsi --help     查看策略评估、能力校准和晋升/回滚命令
+  physicsos workbench      打开仿真与 RSI 工作台（无需模型 API Key）
 
 选项：
   --model PROVIDER:MODEL   指定本次使用的模型
@@ -1046,6 +1048,35 @@ def main(argv: list[str] | None = None) -> int:
     apply_labels.add_argument("labeling_artifact_json")
     apply_labels.add_argument("--output")
     apply_labels.add_argument("--replace-existing", action="store_true")
+    repair = geometry_sub.add_parser("repair", help="Repair a 3D asset surface with PaMO")
+    repair.add_argument("source", help="Asset file, or GeometrySpec JSON")
+    repair.add_argument("--executor", choices=["auto", "python", "docker"], default="auto")
+    repair.add_argument("--python", dest="python_executable")
+    repair.add_argument("--docker-image")
+    repair.add_argument("--case-id")
+    repair.add_argument("--units", default="m")
+    repair.add_argument("--policy", choices=["conservative", "balanced", "aggressive"], default="conservative")
+    repair_target = repair.add_mutually_exclusive_group()
+    repair_target.add_argument("--ratio", type=float)
+    repair_target.add_argument("--target-faces", type=int)
+    repair.add_argument("--max-relative-distance", type=float, default=0.01)
+    repair.add_argument("--timeout", type=int, default=600)
+    repair.add_argument("--output", help="Save returned GeometrySpec JSON")
+
+    runtime_parser = sub.add_parser("runtime", help="Prepare, execute and verify versioned cases")
+    runtime_sub = runtime_parser.add_subparsers(dest="runtime_command", required=True)
+    for operation in ("prepare", "execute", "verify", "convergence"):
+        command = runtime_sub.add_parser(operation)
+        command.add_argument("request", help="JSON request matching the operation's input schema")
+
+    workbench_parser = sub.add_parser("workbench", help="Open the simulation/RSI workbench without a model server")
+    workbench_parser.add_argument("--workspace", help="Inspect a different PhysicsOS workspace")
+
+    rsi_parser = sub.add_parser("rsi", help="Evaluate and improve reusable runtime strategies")
+    rsi_sub = rsi_parser.add_subparsers(dest="rsi_command", required=True)
+    for operation in ("register-strategy", "register-suite", "register-revision-provider", "improve", "evaluate", "assess", "bind-context", "solve", "promote", "rollback"):
+        command = rsi_sub.add_parser(operation)
+        command.add_argument("request", help="JSON request matching the operation's input schema")
 
     runner = sub.add_parser("runner")
     runner_sub = runner.add_subparsers(dest="runner_command", required=True)
@@ -1067,6 +1098,43 @@ def main(argv: list[str] | None = None) -> int:
     download_all.add_argument("--output-dir", default=".")
 
     args = parser.parse_args(argv)
+
+    if args.command == "workbench":
+        from physicsos.workbench import WorkbenchApp
+        WorkbenchApp(args.workspace or runtime_paths().workspace).run()
+        return 0
+
+    if args.command == "rsi":
+        from physicsos.rsi import RSIRuntime
+        from physicsos.schemas.rsi import AssessCapabilityInput, BenchmarkSuiteInput, BindCaseStrategyInput, EvaluateStrategiesInput, PromoteStrategyInput, RollbackStrategyInput, SolveWithStrategyInput, StrategySpec, RevisionProviderSpec, ImproveStrategiesInput
+        from physicsos.paths import resolve_workspace_path
+        schema = {"register-strategy": StrategySpec, "register-suite": BenchmarkSuiteInput, "evaluate": EvaluateStrategiesInput,
+                  "register-revision-provider": RevisionProviderSpec, "improve": ImproveStrategiesInput,
+                  "assess": AssessCapabilityInput, "bind-context": BindCaseStrategyInput, "solve": SolveWithStrategyInput, "promote": PromoteStrategyInput, "rollback": RollbackStrategyInput}[args.rsi_command]
+        request = schema.model_validate_json(resolve_workspace_path(args.request, workspace=runtime_paths().workspace).read_text(encoding="utf-8"))
+        result = getattr(RSIRuntime(), args.rsi_command.replace("-", "_"))(request)
+        _print_json(result.model_dump(mode="json"))
+        status = getattr(result, "status", None)
+        return 0 if status is None or status in {"promoted", "eligible", "verified", "rolled_back", "available"} else 2
+
+    if args.command == "runtime":
+        from physicsos.runtime import CaseRuntime
+        from physicsos.schemas.case_runtime import ConvergenceStudyInput, ExecuteCaseInput, PrepareDomainInput, VerifyCaseInput
+        from physicsos.paths import resolve_workspace_path
+        schema = {"prepare": PrepareDomainInput, "execute": ExecuteCaseInput, "verify": VerifyCaseInput, "convergence": ConvergenceStudyInput}[args.runtime_command]
+        request_path = resolve_workspace_path(args.request, workspace=runtime_paths().workspace)
+        request = schema.model_validate_json(request_path.read_text(encoding="utf-8"))
+        result = getattr(CaseRuntime(), args.runtime_command)(request)
+        _print_json(result.model_dump(mode="json"))
+        if args.runtime_command == "prepare":
+            passed = result.domain.status == "ready"
+        elif args.runtime_command == "execute":
+            passed = result.run.result.status == "success"
+        elif args.runtime_command == "verify":
+            passed = result.report.overall_status.value == "verified"
+        else:
+            passed = result.status == "verified"
+        return 0 if passed else 2
 
     if args.command == "legacy-repl":
         return _interactive()
@@ -1177,6 +1245,34 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     if args.command == "geometry":
+        if args.geometry_command == "repair":
+            from physicsos.paths import resolve_workspace_path
+
+            source_path = resolve_workspace_path(args.source, workspace=runtime_paths().workspace)
+            if source_path.suffix.lower() == ".json":
+                geometry_spec = GeometrySpec.model_validate_json(source_path.read_text(encoding="utf-8"))
+            else:
+                suffix = source_path.suffix.lower()
+                kind = "cad_step" if suffix in {".step", ".stp"} else "cad_iges" if suffix in {".iges", ".igs"} else "stl" if suffix == ".stl" else "mesh_file"
+                geometry_spec = GeometrySpec(
+                    id=f"geometry:{source_path.stem}", source=GeometrySource(kind=kind, uri=str(source_path)),
+                    dimension=3, coordinate_system=CoordinateSystem(units=args.units),
+                )
+            output_path = resolve_workspace_path(args.output, workspace=runtime_paths().workspace) if args.output else None
+            original_asset = resolve_workspace_path(geometry_spec.source.uri, workspace=runtime_paths().workspace) if geometry_spec.source.uri else None
+            if output_path is not None and output_path in {source_path, original_asset}:
+                parser.error("--output must preserve the original asset and GeometrySpec JSON")
+            result = repair_geometry(RepairGeometryInput(
+                geometry=geometry_spec, executor=args.executor, python_executable=args.python_executable,
+                docker_image=args.docker_image, case_id=args.case_id, repair_policy=args.policy,
+                simplification_ratio=args.ratio, target_faces=args.target_faces,
+                max_relative_surface_distance=args.max_relative_distance, timeout_seconds=args.timeout,
+            ))
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(result.geometry.model_dump_json(indent=2), encoding="utf-8")
+            _print_json(result.model_dump(mode="json"))
+            return 0 if result.status == "repaired" else 2
         if args.geometry_command == "apply-boundary-labels":
             geometry_path = Path(args.geometry_json)
             labeling_path = Path(args.labeling_artifact_json)
